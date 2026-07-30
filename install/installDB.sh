@@ -25,6 +25,24 @@ say() { echo "${GREEN}→${NC} $*"; }
 warn() { echo "${YELLOW}!${NC} $*"; }
 die() { echo "${RED}ERROR:${NC} $*" >&2; exit 1; }
 
+# curl|bash leaves stdin as the pipe — prompts must use the real terminal.
+can_prompt() {
+  [[ "$SKIP_CONNECT" != "1" ]] && [[ -r /dev/tty ]]
+}
+ask() {
+  # usage: ask VAR "prompt" [default]
+  local __var="$1" __prompt="$2" __def="${3:-}" __ans=""
+  if [[ -n "$__def" ]]; then
+    printf "%s" "$__prompt" > /dev/tty
+    read -r __ans < /dev/tty || true
+    __ans=${__ans:-$__def}
+  else
+    printf "%s" "$__prompt" > /dev/tty
+    read -r __ans < /dev/tty || true
+  fi
+  printf -v "$__var" '%s' "$__ans"
+}
+
 auth_curl() {
   if [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]]; then
     curl -fsSL -H "Authorization: Bearer ${GH_TOKEN:-$GITHUB_TOKEN}" "$@"
@@ -60,24 +78,23 @@ resolve_listen_mode() {
   mode=$(echo "$mode" | tr '[:upper:]' '[:lower:]')
 
   if [[ -z "$mode" ]]; then
-    if [[ -t 0 ]]; then
+    if can_prompt; then
       echo ""
       echo "${BOLD}Where should Mongo / enroll / orchestrator listen?${NC}"
-      echo "  1) LO   — only this machine (127.0.0.1)"
-      echo "  2) LAN  — local network (${lan})"
+      echo "  1) LO   - only this machine (127.0.0.1)"
+      echo "  2) LAN  - local network (${lan})"
       if [[ -n "$wan" ]]; then
-        echo "  3) WAN  — internet / public IP (${wan})"
+        echo "  3) WAN  - internet / public IP (${wan})"
       else
-        echo "  3) WAN  — internet / public IP (enter manually)"
+        echo "  3) WAN  - internet / public IP (enter manually)"
       fi
       echo "  4) Custom host/IP"
-      read -r -p "Choice [1/2/3/4] (default 2=LAN): " ans || ans=2
-      ans=${ans:-2}
+      ask ans "Choice [1/2/3/4] (default 2=LAN): " "2"
       case "$ans" in
         1|lo|LO) mode=lo ;;
         3|wan|WAN) mode=wan ;;
         4|custom|CUSTOM)
-          read -r -p "Advertise host/IP: " custom
+          ask custom "Advertise host/IP: "
           [[ -n "$custom" ]] || die "empty custom host"
           HERMES_ADVERTISE_HOST="$custom"
           mode=custom
@@ -86,7 +103,7 @@ resolve_listen_mode() {
       esac
     else
       mode=lan
-      warn "Non-interactive — default listen mode: LAN (${lan}). Set HERMES_LISTEN_MODE=lo|lan|wan"
+      warn "No TTY — default listen mode: LAN (${lan}). Set HERMES_LISTEN_MODE=lo|lan|wan"
     fi
   fi
 
@@ -110,16 +127,16 @@ resolve_listen_mode() {
         ADVERTISE_HOST="$HERMES_ADVERTISE_HOST"
       elif [[ -n "$wan" ]]; then
         ADVERTISE_HOST="$wan"
-        if [[ -t 0 ]]; then
-          read -r -p "Public IP to advertise [${wan}]: " custom || custom=""
-          ADVERTISE_HOST="${custom:-$wan}"
+        if can_prompt; then
+          ask custom "Public IP to advertise [${wan}]: " "$wan"
+          ADVERTISE_HOST="$custom"
         fi
       else
-        [[ -t 0 ]] || die "WAN mode needs HERMES_ADVERTISE_HOST=…"
-        read -r -p "Public IP / DNS to advertise: " ADVERTISE_HOST
+        can_prompt || die "WAN mode needs HERMES_ADVERTISE_HOST=..."
+        ask ADVERTISE_HOST "Public IP / DNS to advertise: "
         [[ -n "$ADVERTISE_HOST" ]] || die "empty WAN host"
       fi
-      LISTEN_HINT="WAN (${ADVERTISE_HOST}) — open firewall 27017,8743,8744"
+      LISTEN_HINT="WAN (${ADVERTISE_HOST}) - open firewall 27017,8743,8744"
       ;;
     custom)
       MODE=custom
@@ -255,18 +272,20 @@ echo "  Orchestrator : https://${ADVERTISE_HOST}:8744  (mTLS)"
 echo "  Status       : systemctl --user status hermes-mongod hermes-enroll hermes-orchestrator"
 echo ""
 
-if [[ "$SKIP_CONNECT" == "1" ]] || [[ ! -t 0 ]]; then
+if [[ "$SKIP_CONNECT" == "1" ]]; then
   echo "Next: $HERMES_DB_HOME/agent-add"
   exit 0
 fi
 
-read -r -p "Connect an agent PC now (one-time code & wait)? [Y/n] " ans || ans=Y
-ans=${ans:-Y}
+if ! can_prompt; then
+  warn "No TTY for prompts — run: $HERMES_DB_HOME/agent-add"
+  exit 0
+fi
+
+ask ans "Connect an agent PC now (one-time code & wait)? [Y/n] " "Y"
 if [[ "$ans" =~ ^[Yy] ]]; then
-  read -r -p "Optional PC name (e.g. home-pc): " pcname || pcname=""
-  systemctl --user stop hermes-enroll.service 2>/dev/null || true
+  ask pcname "Optional PC name (e.g. home-pc): "
   bash "$HERMES_DB_HOME/scripts/agent-add.sh" ${pcname:+"$pcname"} || true
-  systemctl --user start hermes-enroll.service 2>/dev/null || true
   exit 0
 fi
 

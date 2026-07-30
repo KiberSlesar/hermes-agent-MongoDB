@@ -14,11 +14,25 @@ from urllib.request import Request, urlopen
 
 
 def _prompt(label: str, default: str = "") -> str:
+    """Prompt on the real terminal — stdin may be a curl|bash pipe."""
     suffix = f" [{default}]" if default else ""
+    prompt = f"{label}{suffix}: "
     try:
-        value = input(f"{label}{suffix}: ").strip()
-    except EOFError:
+        tty = open("/dev/tty", "r+", encoding="utf-8", errors="replace")
+    except OSError:
+        tty = None
+    try:
+        if tty is not None:
+            tty.write(prompt)
+            tty.flush()
+            value = tty.readline().strip()
+        else:
+            value = input(prompt).strip()
+    except (EOFError, OSError):
         value = ""
+    finally:
+        if tty is not None:
+            tty.close()
     return value or default
 
 

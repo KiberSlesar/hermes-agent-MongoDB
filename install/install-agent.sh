@@ -49,6 +49,22 @@ say() { echo "${GREEN}→${NC} $*"; }
 warn() { echo "${YELLOW}!${NC} $*"; }
 die() { echo "${RED}ERROR:${NC} $*" >&2; exit 1; }
 
+can_prompt() {
+  [[ "$SKIP_CONNECT" != "1" ]] && [[ -r /dev/tty ]]
+}
+ask() {
+  local __var="$1" __prompt="$2" __def="${3:-}" __ans=""
+  if [[ -n "$__def" ]]; then
+    printf "%s" "$__prompt" > /dev/tty
+    read -r __ans < /dev/tty || true
+    __ans=${__ans:-$__def}
+  else
+    printf "%s" "$__prompt" > /dev/tty
+    read -r __ans < /dev/tty || true
+  fi
+  printf -v "$__var" '%s' "$__ans"
+}
+
 auth_curl() {
   if [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]]; then
     curl -fsSL -H "Authorization: Bearer ${GH_TOKEN:-$GITHUB_TOKEN}" "$@"
@@ -170,18 +186,18 @@ if [[ "$SKIP_CONNECT" == "1" && "$FORCE_CONNECT" -eq 0 ]]; then
   exit 0
 fi
 
-if [[ ! -t 0 && "$FORCE_CONNECT" -eq 0 ]]; then
-  warn "Non-interactive — run: hermes db connect"
-  exit 0
-fi
-
 if [[ "$FORCE_CONNECT" -eq 1 ]]; then
   do_connect "" ""
   exit 0
 fi
 
-read -r -p "Connect this PC to Hermes DB now? [Y/n] " ans || ans=Y
-ans=${ans:-Y}
+if ! can_prompt; then
+  warn "No TTY for prompts — run: hermes db connect"
+  echo "  Example: hermes db connect --host 192.168.88.44:8743 --code ABCD-EFGH"
+  exit 0
+fi
+
+ask ans "Connect this PC to Hermes DB now? [Y/n] " "Y"
 if [[ "$ans" =~ ^[Yy] ]]; then
   echo "Enter values from the DB server (installDB / agent-add):"
   do_connect "" ""
