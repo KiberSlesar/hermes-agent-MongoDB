@@ -138,25 +138,53 @@ ensure_uv() {
   command -v uv >/dev/null 2>&1
 }
 
+py_majmin() {
+  "$1" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "0.0"
+}
+
+# Prefer a supported interpreter when system Python is 3.14+ (many deps lag).
+pick_python() {
+  local sysver want
+  sysver="$(py_majmin python3)"
+  # 3.11–3.13 are safest; 3.14 allowed in metadata but use 3.12 via uv when possible
+  if python3 -c "import sys; raise SystemExit(0 if sys.version_info < (3,14) else 1)" 2>/dev/null; then
+    echo "python3"
+    return 0
+  fi
+  if ensure_uv; then
+    say "System Python is ${sysver} — installing CPython 3.12 via uv…"
+    uv python install 3.12 >/dev/null 2>&1 || uv python install 3.12
+    want="$(uv python find 3.12 2>/dev/null || true)"
+    if [[ -n "$want" && -x "$want" ]]; then
+      echo "$want"
+      return 0
+    fi
+  fi
+  echo "python3"
+}
+
 say "Installing Mongo fork into a dedicated venv…"
 rm -rf "$AGENT_DIR/.venv" 2>/dev/null || true
+
+PY_BASE="$(pick_python)"
+say "Using interpreter: $PY_BASE ($(py_majmin "$PY_BASE"))"
 
 if [[ -n "$UPSTREAM_VENV" ]]; then
   "$UPSTREAM_VENV/bin/pip" install -e "$AGENT_DIR" -q || \
     "$UPSTREAM_VENV/bin/pip" install -e "$AGENT_DIR"
   PY="$UPSTREAM_VENV/bin/python"
 elif ensure_uv; then
-  (cd "$AGENT_DIR" && uv venv .venv && uv pip install -e .)
+  (cd "$AGENT_DIR" && uv venv .venv --python "$PY_BASE" && uv pip install -e .)
   PY="$AGENT_DIR/.venv/bin/python"
-elif ensure_venv_support && python3 -m venv "$AGENT_DIR/.venv"; then
+elif ensure_venv_support && "$PY_BASE" -m venv "$AGENT_DIR/.venv"; then
   "$AGENT_DIR/.venv/bin/pip" install -U pip -q
   "$AGENT_DIR/.venv/bin/pip" install -e "$AGENT_DIR"
   PY="$AGENT_DIR/.venv/bin/python"
 else
-  warn "venv unavailable — installing with pip --user into system Python"
-  python3 -m pip install -U pip --user -q || true
-  python3 -m pip install -e "$AGENT_DIR" --user
-  PY="$(command -v python3)"
+  warn "venv unavailable — installing with pip --user"
+  "$PY_BASE" -m pip install -U pip --user -q || true
+  "$PY_BASE" -m pip install -e "$AGENT_DIR" --user
+  PY="$PY_BASE"
 fi
 
 [[ -x "$PY" ]] || die "No working Python for Hermes ($PY)"
