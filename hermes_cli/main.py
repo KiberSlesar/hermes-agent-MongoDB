@@ -4637,15 +4637,24 @@ def cmd_cluster(args):
         return
     if sub == "prune":
         older = float(getattr(args, "older_than", None) or 300)
-        deleted = storage.cluster.prune_stale_nodes(
-            older_than_s=older,
-            keep_node_id=storage.node_id,
-        )
+        force = bool(getattr(args, "force", False))
+        if force:
+            # Drop every node except this process — ignores heartbeat quirks
+            result = storage.shared_db["cluster_nodes"].delete_many(
+                {"node_id": {"$ne": storage.node_id}}
+            )
+            deleted = int(result.deleted_count or 0)
+        else:
+            deleted = storage.cluster.prune_stale_nodes(
+                older_than_s=older,
+                keep_node_id=storage.node_id,
+            )
         storage.register_presence()
         print(_json.dumps({
             "ok": True,
             "deleted": deleted,
             "older_than_s": older,
+            "force": force,
             "kept": storage.node_id,
         }, indent=2))
         return

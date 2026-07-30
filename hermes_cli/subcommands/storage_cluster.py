@@ -68,6 +68,11 @@ def build_cluster_parser(subparsers, *, cmd_cluster: Callable) -> None:
         default=300,
         help="Seconds since last heartbeat (default 300)",
     )
+    prune.add_argument(
+        "--force",
+        action="store_true",
+        help="Delete ALL nodes except this machine (ignore heartbeat)",
+    )
     prune.set_defaults(func=cmd_cluster)
 
 
