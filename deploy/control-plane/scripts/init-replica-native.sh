@@ -18,70 +18,100 @@ if [[ -z "$APP_PASS" ]]; then
   APP_PASS=$(openssl rand -hex 16)
 fi
 
-HOST_FOR_RS="${HERMES_MONGO_RS_HOST:-127.0.0.1:${PORT}}"
+# Advertise this to agents (LAN). Bootstrap always initiates on loopback first,
+# then reconfigs — avoids "No host … maps to this node" when mongod was local-only.
+PUBLIC_HOST="${HERMES_MONGO_RS_HOST:-127.0.0.1:${PORT}}"
+LOCAL_HOST="127.0.0.1:${PORT}"
 
-mongosh_eval() {
-  if [[ "$BOOTSTRAP" -eq 1 ]]; then
-    mongosh --quiet --port "$PORT" --eval "$1"
-  else
-    mongosh --quiet -u "$ROOT_USER" -p "$ROOT_PASS" --authenticationDatabase admin \
-      --port "$PORT" --eval "$1"
-  fi
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+mongosh_boot() {
+  mongosh --quiet --port "$PORT" --eval "$1"
 }
 
-echo "→ Initiating replica set rs0 (single node: $HOST_FOR_RS)…"
+mongosh_auth() {
+  mongosh --quiet -u "$ROOT_USER" -p "$ROOT_PASS" --authenticationDatabase admin \
+    --port "$PORT" --eval "$1"
+}
+
+wait_primary() {
+  local i state
+  echo "→ Waiting for PRIMARY…"
+  for i in $(seq 1 90); do
+    if [[ "$BOOTSTRAP" -eq 1 ]]; then
+      state=$(mongosh_boot 'try{rs.isMaster().ismaster}catch(e){false}' 2>/dev/null || echo false)
+    else
+      state=$(mongosh_auth 'try{rs.isMaster().ismaster}catch(e){false}' 2>/dev/null || echo false)
+    fi
+    [[ "$state" == "true" ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+echo "→ Initiating replica set rs0 (advertise: $PUBLIC_HOST)…"
+
 if [[ "$BOOTSTRAP" -eq 1 ]]; then
-  mongosh --quiet --port "$PORT" --eval "
+  # 1) Initiate on loopback so this process always maps to the member host
+  mongosh_boot "
 try {
-  rs.status();
-  print('replica set already initiated');
+  const s = rs.status();
+  print('replica set already initiated: ' + s.set);
 } catch (e) {
-  rs.initiate({ _id: 'rs0', members: [ { _id: 0, host: '$HOST_FOR_RS' } ] });
-  print('replica set initiated');
+  rs.initiate({ _id: 'rs0', members: [ { _id: 0, host: '${LOCAL_HOST}' } ] });
+  print('replica set initiated on ${LOCAL_HOST}');
 }
-" || true
+" || die "rs.initiate failed"
 else
-  mongosh_eval "
-try { rs.status(); print('ok'); } catch (e) {
-  rs.initiate({ _id: 'rs0', members: [ { _id: 0, host: '$HOST_FOR_RS' } ] });
+  mongosh_auth "
+try { rs.status(); print('replica set already initiated'); }
+catch (e) {
+  rs.initiate({ _id: 'rs0', members: [ { _id: 0, host: '${LOCAL_HOST}' } ] });
+  print('replica set initiated on ${LOCAL_HOST}');
 }
-" || true
+" || die "rs.initiate failed (auth)"
 fi
 
-echo "→ Waiting for PRIMARY…"
-for i in $(seq 1 60); do
-  STATE=$(mongosh --quiet --port "$PORT" --eval 'try{rs.isMaster().ismaster}catch(e){false}' 2>/dev/null || echo false)
-  if [[ "$BOOTSTRAP" -ne 1 ]]; then
-    STATE=$(mongosh --quiet -u "$ROOT_USER" -p "$ROOT_PASS" --authenticationDatabase admin --port "$PORT" \
-      --eval 'try{rs.isMaster().ismaster}catch(e){false}' 2>/dev/null || echo false)
+wait_primary || die "replica set did not become PRIMARY"
+
+# 2) Reconfig to LAN / public host if different (needed for remote agents)
+if [[ "$PUBLIC_HOST" != "$LOCAL_HOST" ]]; then
+  echo "→ Reconfig member host → $PUBLIC_HOST"
+  RECONFIG="
+cfg = rs.conf();
+cfg.members[0].host = '${PUBLIC_HOST}';
+try { rs.reconfig(cfg); print('reconfig ok'); }
+catch (e) { rs.reconfig(cfg, { force: true }); print('reconfig force ok'); }
+"
+  if [[ "$BOOTSTRAP" -eq 1 ]]; then
+    mongosh_boot "$RECONFIG" || die "rs.reconfig failed"
+  else
+    mongosh_auth "$RECONFIG" || die "rs.reconfig failed"
   fi
-  [[ "$STATE" == "true" ]] && break
-  sleep 1
-done
+  wait_primary || die "not PRIMARY after reconfig"
+fi
 
 if [[ "$BOOTSTRAP" -eq 1 ]]; then
   echo "→ Creating root + app users…"
-  mongosh --quiet --port "$PORT" --eval "
+  mongosh_boot "
 const admin = db.getSiblingDB('admin');
-try {
-  admin.createUser({ user: '$ROOT_USER', pwd: '$ROOT_PASS', roles: [ { role: 'root', db: 'admin' } ] });
+if (admin.getUser('${ROOT_USER}')) {
+  print('root already exists');
+} else {
+  admin.createUser({ user: '${ROOT_USER}', pwd: '${ROOT_PASS}', roles: [ { role: 'root', db: 'admin' } ] });
   print('created root');
-} catch (e) { print('root: ' + e.message); }
-" || true
+}
+" || die "create root user failed"
 fi
 
-# App user + shared DB seed (authenticated)
-AUTH_ARGS=()
-if [[ "$BOOTSTRAP" -eq 1 ]]; then
-  # After creating root, use it
-  sleep 1
-fi
-mongosh --quiet -u "$ROOT_USER" -p "$ROOT_PASS" --authenticationDatabase admin --port "$PORT" --eval "
+mongosh_auth "
 const admin = db.getSiblingDB('admin');
-try {
+if (admin.getUser('${APP_USER}')) {
+  print('app user already exists');
+} else {
   admin.createUser({
-    user: '$APP_USER',
-    pwd: '$APP_PASS',
+    user: '${APP_USER}',
+    pwd: '${APP_PASS}',
     roles: [
       { role: 'readWrite', db: 'hermes_shared' },
       { role: 'dbAdmin', db: 'hermes_shared' },
@@ -92,7 +122,7 @@ try {
     ]
   });
   print('created app user');
-} catch (e) { print('app: ' + e.message); }
+}
 db.getSiblingDB('hermes_shared').cluster_state.updateOne(
   { _id: 'default' },
   { \$setOnInsert: {
@@ -106,7 +136,7 @@ db.getSiblingDB('hermes_shared').cluster_state.updateOne(
   { upsert: true }
 );
 print('hermes_shared ready');
-" || true
+" || die "app user / seed failed"
 
 umask 077
 cat > "$ROOT/certs/app-credentials.txt" <<EOF
@@ -117,4 +147,4 @@ MONGO_ROOT_PASSWORD=$ROOT_PASS
 EOF
 chmod 600 "$ROOT/certs/app-credentials.txt"
 
-echo "✓ Replica set / users ready (native)."
+echo "✓ Replica set / users ready (native). Advertise: $PUBLIC_HOST"

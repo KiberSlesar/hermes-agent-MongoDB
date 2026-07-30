@@ -103,6 +103,18 @@ EOF
 NEEDS_BOOTSTRAP=0
 if [[ ! -f "$ROOT/certs/app-credentials.txt" ]]; then
   NEEDS_BOOTSTRAP=1
+else
+  # Credentials from a failed prior run → refuse to pretend we're fine
+  # shellcheck disable=SC1091
+  set -a && source "$ROOT/certs/app-credentials.txt" && set +a
+  if ! mongosh --quiet -u "${MONGO_ROOT_USER}" -p "${MONGO_ROOT_PASSWORD}" \
+      --authenticationDatabase admin --port "${HERMES_MONGO_PORT:-27017}" \
+      --eval 'db.runCommand({ping:1}).ok' >/dev/null 2>&1; then
+    die "Broken previous bootstrap (auth failed). Reset then re-run:
+  systemctl --user stop hermes-mongod
+  rm -rf \"$DATA\" \"$ROOT/certs/app-credentials.txt\"
+  # keep .env and CA certs, then: bash $ROOT/scripts/install-mongo-native.sh"
+  fi
 fi
 
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
@@ -130,6 +142,7 @@ EOF
 if [[ "$NEEDS_BOOTSTRAP" -eq 1 ]]; then
   say "First-time bootstrap (create users)…"
   BOOT_CONF="$ROOT/mongod.bootstrap.conf"
+  # Bind all interfaces so rs.reconfig(LAN IP) maps to this node.
   cat > "$BOOT_CONF" <<EOF
 storage:
   dbPath: ${DATA}
@@ -139,7 +152,7 @@ systemLog:
   logAppend: true
 net:
   port: ${PORT}
-  bindIp: 127.0.0.1
+  bindIp: 0.0.0.0
 replication:
   replSetName: rs0
 processManagement:
@@ -158,7 +171,11 @@ EOF
     fi
     sleep 1
   done
-  bash "$ROOT/scripts/init-replica-native.sh" --bootstrap
+  if ! bash "$ROOT/scripts/init-replica-native.sh" --bootstrap; then
+    kill "$BOOT_PID" 2>/dev/null || true
+    wait "$BOOT_PID" 2>/dev/null || true
+    die "bootstrap failed — wipe $DATA and certs/app-credentials.txt then re-run"
+  fi
   kill "$BOOT_PID" 2>/dev/null || true
   wait "$BOOT_PID" 2>/dev/null || true
   sleep 1
@@ -192,8 +209,10 @@ for i in $(seq 1 60); do
   fi
 done
 
-# Ensure RS + users exist even if credentials already present
-bash "$ROOT/scripts/init-replica-native.sh" || true
+# Re-run init only if credentials exist (auth path); fail loud
+if [[ -f "$ROOT/certs/app-credentials.txt" ]]; then
+  bash "$ROOT/scripts/init-replica-native.sh"
+fi
 
 echo "✓ Native MongoDB listening on ${BIND}:${PORT}"
 echo "  conf: $CONF"
