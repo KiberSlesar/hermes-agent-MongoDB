@@ -113,21 +113,56 @@ for cand in /usr/local/lib/hermes-agent/venv "$HOME/.local/lib/hermes-agent/venv
   [[ -x "$cand/bin/python" ]] && UPSTREAM_VENV="$cand" && break
 done
 
+ensure_venv_support() {
+  if python3 -c "import ensurepip" 2>/dev/null; then
+    return 0
+  fi
+  say "Installing python3-venv (ensurepip missing)…"
+  . /etc/os-release 2>/dev/null || true
+  local ver
+  ver="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq "python${ver}-venv" python3-venv python3-pip || \
+      sudo apt-get install -y -qq python3-venv python3-pip || true
+  fi
+  python3 -c "import ensurepip" 2>/dev/null || return 1
+  return 0
+}
+
+ensure_uv() {
+  command -v uv >/dev/null 2>&1 && return 0
+  say "Installing uv…"
+  curl -fsSL https://astral.sh/uv/install.sh | sh || return 1
+  export PATH="$HOME/.local/bin:$PATH"
+  command -v uv >/dev/null 2>&1
+}
+
 say "Installing Mongo fork into a dedicated venv…"
+rm -rf "$AGENT_DIR/.venv" 2>/dev/null || true
+
 if [[ -n "$UPSTREAM_VENV" ]]; then
-  # Install editable into upstream venv so imports resolve
   "$UPSTREAM_VENV/bin/pip" install -e "$AGENT_DIR" -q || \
     "$UPSTREAM_VENV/bin/pip" install -e "$AGENT_DIR"
   PY="$UPSTREAM_VENV/bin/python"
-elif command -v uv >/dev/null 2>&1; then
+elif ensure_uv; then
   (cd "$AGENT_DIR" && uv venv .venv && uv pip install -e .)
   PY="$AGENT_DIR/.venv/bin/python"
-else
-  python3 -m venv "$AGENT_DIR/.venv"
+elif ensure_venv_support && python3 -m venv "$AGENT_DIR/.venv"; then
   "$AGENT_DIR/.venv/bin/pip" install -U pip -q
   "$AGENT_DIR/.venv/bin/pip" install -e "$AGENT_DIR"
   PY="$AGENT_DIR/.venv/bin/python"
+else
+  warn "venv unavailable — installing with pip --user into system Python"
+  python3 -m pip install -U pip --user -q || true
+  python3 -m pip install -e "$AGENT_DIR" --user
+  PY="$(command -v python3)"
 fi
+
+[[ -x "$PY" ]] || die "No working Python for Hermes ($PY)"
+"$PY" -c "import hermes_cli" 2>/dev/null || \
+  PYTHONPATH="$AGENT_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PY" -c "import hermes_cli" || \
+  die "hermes_cli import failed after install"
 
 # Force hermes launcher to Mongo fork (upstream binary has no `db connect`)
 install_mongo_launcher() {
