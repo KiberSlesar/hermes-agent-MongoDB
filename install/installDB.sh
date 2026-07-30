@@ -253,13 +253,17 @@ bash "$HERMES_DB_HOME/scripts/install-services.sh"
 
 cat > "$HERMES_DB_HOME/agent-add" <<'EOF'
 #!/usr/bin/env bash
-exec "$(cd "$(dirname "$0")" && pwd)/scripts/agent-add.sh" "$@"
+SELF="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+ROOT="$(cd "$(dirname "$SELF")" && pwd)"
+exec "$ROOT/scripts/agent-add.sh" "$@"
 EOF
 chmod +x "$HERMES_DB_HOME/agent-add"
 
 cat > "$HERMES_DB_HOME/agents" <<'EOF'
 #!/usr/bin/env bash
-exec "$(cd "$(dirname "$0")" && pwd)/scripts/agents.sh" "$@"
+SELF="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+ROOT="$(cd "$(dirname "$SELF")" && pwd)"
+exec "$ROOT/scripts/agents.sh" "$@"
 EOF
 chmod +x "$HERMES_DB_HOME/agents"
 
