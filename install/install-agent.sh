@@ -1,6 +1,6 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # ============================================================================
-# Hermes Agent (Mongo) — curl installer
+# Hermes Agent (Mongo) вЂ” curl installer
 # ============================================================================
 # Installs the Mongo fork and forces `hermes` on PATH to that checkout
 # (upstream /usr/local/bin/hermes has no `db connect`).
@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'; BOLD=$'\033[1m'; NC=$'\033[0m'
-say() { echo "${GREEN}→${NC} $*" >&2; }
+say() { echo "${GREEN}в†’${NC} $*" >&2; }
 warn() { echo "${YELLOW}!${NC} $*" >&2; }
 die() { echo "${RED}ERROR:${NC} $*" >&2; exit 1; }
 
@@ -78,12 +78,12 @@ command -v python3 >/dev/null || die "python3 is required"
 mkdir -p "$HERMES_HOME_DIR/certs"
 export HERMES_HOME="$HERMES_HOME_DIR"
 
-# Optional base deps (browser tools etc.) — ignore if hermes already present
+# Optional base deps (browser tools etc.) вЂ” ignore if hermes already present
 if [[ $SKIP_HERMES_BASE -eq 0 ]] && ! command -v hermes >/dev/null 2>&1; then
-  say "Installing Hermes base runtime (for deps)…"
+  say "Installing Hermes base runtime (for deps)вЂ¦"
   curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup || \
     curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --skip-setup || \
-    warn "Base installer failed — continuing with Mongo overlay only"
+    warn "Base installer failed вЂ” continuing with Mongo overlay only"
   export PATH="${HOME}/.local/bin:${PATH}"
 fi
 
@@ -91,7 +91,7 @@ AGENT_DIR="$HERMES_HOME_DIR/hermes-agent"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-say "Downloading Mongo fork (${REPO}@${REF})…"
+say "Downloading Mongo fork (${REPO}@${REF})вЂ¦"
 if ! auth_curl -L "https://api.github.com/repos/${REPO}/tarball/${REF}" -o "$TMP/src.tgz"; then
   die "Could not download ${REPO}. Set GH_TOKEN for a private repo."
 fi
@@ -117,7 +117,7 @@ ensure_venv_support() {
   if python3 -c "import ensurepip" 2>/dev/null; then
     return 0
   fi
-  say "Installing python3-venv (ensurepip missing)…"
+  say "Installing python3-venv (ensurepip missing)вЂ¦"
   . /etc/os-release 2>/dev/null || true
   local ver
   ver="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
@@ -133,7 +133,7 @@ ensure_venv_support() {
 ensure_uv() {
   export PATH="${HOME}/.local/bin:${PATH}"
   command -v uv >/dev/null 2>&1 && return 0
-  say "Installing uv…"
+  say "Installing uvвЂ¦"
   # Must not leak installer text into command substitutions (pick_python).
   if ! curl -fsSL https://astral.sh/uv/install.sh | sh >/dev/null 2>&1; then
     curl -fsSL https://astral.sh/uv/install.sh | sh >&2 || return 1
@@ -160,8 +160,8 @@ pick_python() {
     return 0
   fi
   if ensure_uv; then
-    say "System Python is ${sysver} — installing CPython 3.12 via uv…"
-    uv python install 3.12 >/dev/null 2>&1 || uv python install 3.12 >&2
+    say "System Python is ${sysver} вЂ” installing CPython 3.12 via uvвЂ¦"
+    uv python install 3.12 >/dev/null >&2
     want="$(uv python find 3.12 2>/dev/null | tail -n1 | tr -d '\r')"
     if [[ -n "$want" && -x "$want" ]]; then
       echo "$want"
@@ -171,7 +171,7 @@ pick_python() {
   echo "python3"
 }
 
-say "Installing Mongo fork into a dedicated venv…"
+say "Installing Mongo fork into a dedicated venvвЂ¦"
 rm -rf "$AGENT_DIR/.venv" 2>/dev/null || true
 
 # Install uv once up-front (logs on stderr only)
@@ -193,7 +193,7 @@ elif ensure_venv_support && "$PY_BASE" -m venv "$AGENT_DIR/.venv"; then
   "$AGENT_DIR/.venv/bin/pip" install -e "$AGENT_DIR"
   PY="$AGENT_DIR/.venv/bin/python"
 else
-  warn "venv unavailable — installing with pip --user"
+  warn "venv unavailable вЂ” installing with pip --user"
   "$PY_BASE" -m pip install -U pip --user -q || true
   "$PY_BASE" -m pip install -e "$AGENT_DIR" --user
   PY="$PY_BASE"
@@ -212,7 +212,7 @@ install_mongo_launcher() {
   tmp="$(mktemp)"
   cat > "$tmp" <<EOF
 #!/usr/bin/env bash
-# Hermes Mongo fork launcher — replaces upstream hermes
+# Hermes Mongo fork launcher вЂ” replaces upstream hermes
 export HERMES_HOME="\${HERMES_HOME:-$HERMES_HOME_DIR}"
 cd "$AGENT_DIR" || exit 1
 export PYTHONPATH="$AGENT_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
@@ -271,7 +271,7 @@ verify_db_connect() {
 }
 
 if ! "$PY" -c "import hermes_cli.main, hermes_storage" 2>/dev/null; then
-  die "Mongo packages failed to import via $PY — pip install -e likely failed"
+  die "Mongo packages failed to import via $PY вЂ” pip install -e likely failed"
 fi
 
 if ! verify_db_connect; then
@@ -280,7 +280,7 @@ if ! verify_db_connect; then
   echo "  which hermes = $(command -v hermes || echo none)"
   echo "  hermes --help (first lines):"
   hermes --help 2>&1 | head -20 || true
-  die "hermes db connect still missing after install — this is a bug, installer aborting"
+  die "hermes db connect still missing after install вЂ” this is a bug, installer aborting"
 fi
 
 say "Verified: hermes db connect works"
@@ -297,7 +297,7 @@ curl_enroll() {
   local host="$1" code="$2" name
   host="${host#http://}"; host="${host#https://}"
   name=$(hostname -s 2>/dev/null || hostname || echo agent)
-  say "Redeeming code via enroll API (curl fallback)…"
+  say "Redeeming code via enroll API (curl fallback)вЂ¦"
   auth_curl -X POST "http://${host}/enroll" \
     -H "Content-Type: application/json" \
     -d "{\"code\":\"${code}\",\"name\":\"${name}\"}" \
@@ -361,7 +361,7 @@ if [[ "$FORCE_CONNECT" -eq 1 ]]; then
 fi
 
 if ! can_prompt; then
-  warn "No TTY — run: hermes db connect --host IP:8743 --code ABCD-EFGH"
+  warn "No TTY вЂ” run: hermes db connect --host IP:8743 --code ABCD-EFGH"
   echo "  Launcher: $HERMES_HOME_DIR/bin/hermes"
   exit 0
 fi
