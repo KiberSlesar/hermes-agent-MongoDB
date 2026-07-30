@@ -540,13 +540,24 @@ class MongoClusterStore(ClusterStore):
             {"$set": {"status": "offline", "updated_at": utcnow()}},
         )
 
-    def prune_stale_nodes(self, *, older_than_s: float = 300.0) -> int:
-        """Delete nodes whose last heartbeat is older than the cutoff."""
-        cutoff = utcnow() - timedelta(seconds=older_than_s)
-        result = self._nodes.delete_many({
-            "$or": [
-                {"heartbeat_at": {"$lt": cutoff}},
-                {"heartbeat_at": {"$exists": False}},
-            ]
-        })
-        return int(result.deleted_count or 0)
+    def prune_stale_nodes(
+        self,
+        *,
+        older_than_s: float = 300.0,
+        keep_node_id: Optional[str] = None,
+    ) -> int:
+        """Delete nodes that look offline. Prefer keep_node_id (this process)."""
+        # Use list_nodes() so timezone / string heartbeat quirks are handled in Python
+        nodes = self.list_nodes(online_within_s=older_than_s)
+        deleted = 0
+        for node in nodes:
+            nid = node.get("node_id")
+            if not nid:
+                continue
+            if keep_node_id and nid == keep_node_id:
+                continue
+            if node.get("online"):
+                continue
+            self._nodes.delete_one({"node_id": nid})
+            deleted += 1
+        return deleted

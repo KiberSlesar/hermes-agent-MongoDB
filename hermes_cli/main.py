@@ -4637,10 +4637,17 @@ def cmd_cluster(args):
         return
     if sub == "prune":
         older = float(getattr(args, "older_than", None) or 300)
-        deleted = storage.cluster.prune_stale_nodes(older_than_s=older)
-        # Keep this process's node registered
+        deleted = storage.cluster.prune_stale_nodes(
+            older_than_s=older,
+            keep_node_id=storage.node_id,
+        )
         storage.register_presence()
-        print(_json.dumps({"ok": True, "deleted": deleted, "older_than_s": older}, indent=2))
+        print(_json.dumps({
+            "ok": True,
+            "deleted": deleted,
+            "older_than_s": older,
+            "kept": storage.node_id,
+        }, indent=2))
         return
     print("usage: hermes cluster <status|activate|prune>")
 
