@@ -38,8 +38,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'; BOLD=$'\033[1m'; NC=$'\033[0m'
-say() { echo "${GREEN}→${NC} $*"; }
-warn() { echo "${YELLOW}!${NC} $*"; }
+say() { echo "${GREEN}→${NC} $*" >&2; }
+warn() { echo "${YELLOW}!${NC} $*" >&2; }
 die() { echo "${RED}ERROR:${NC} $*" >&2; exit 1; }
 
 can_prompt() {
@@ -131,30 +131,38 @@ ensure_venv_support() {
 }
 
 ensure_uv() {
+  export PATH="${HOME}/.local/bin:${PATH}"
   command -v uv >/dev/null 2>&1 && return 0
   say "Installing uv…"
-  curl -fsSL https://astral.sh/uv/install.sh | sh || return 1
-  export PATH="$HOME/.local/bin:$PATH"
+  # Must not leak installer text into command substitutions (pick_python).
+  if ! curl -fsSL https://astral.sh/uv/install.sh | sh >/dev/null 2>&1; then
+    curl -fsSL https://astral.sh/uv/install.sh | sh >&2 || return 1
+  fi
+  export PATH="${HOME}/.local/bin:${PATH}"
+  # shellcheck disable=SC1090
+  [[ -f "$HOME/.local/bin/env" ]] && source "$HOME/.local/bin/env" 2>/dev/null || true
   command -v uv >/dev/null 2>&1
 }
 
 py_majmin() {
-  "$1" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "0.0"
+  local bin="$1"
+  [[ -n "$bin" ]] || { echo "0.0"; return 0; }
+  "$bin" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "0.0"
 }
 
 # Prefer a supported interpreter when system Python is 3.14+ (many deps lag).
+# ONLY the interpreter path is printed on stdout.
 pick_python() {
   local sysver want
   sysver="$(py_majmin python3)"
-  # 3.11–3.13 are safest; 3.14 allowed in metadata but use 3.12 via uv when possible
   if python3 -c "import sys; raise SystemExit(0 if sys.version_info < (3,14) else 1)" 2>/dev/null; then
     echo "python3"
     return 0
   fi
   if ensure_uv; then
     say "System Python is ${sysver} — installing CPython 3.12 via uv…"
-    uv python install 3.12 >/dev/null 2>&1 || uv python install 3.12
-    want="$(uv python find 3.12 2>/dev/null || true)"
+    uv python install 3.12 >/dev/null 2>&1 || uv python install 3.12 >&2
+    want="$(uv python find 3.12 2>/dev/null | tail -n1 | tr -d '\r')"
     if [[ -n "$want" && -x "$want" ]]; then
       echo "$want"
       return 0
@@ -166,14 +174,18 @@ pick_python() {
 say "Installing Mongo fork into a dedicated venv…"
 rm -rf "$AGENT_DIR/.venv" 2>/dev/null || true
 
-PY_BASE="$(pick_python)"
+# Install uv once up-front (logs on stderr only)
+ensure_uv || true
+
+PY_BASE="$(pick_python | tail -n1 | tr -d '\r')"
+[[ -n "$PY_BASE" ]] || PY_BASE="python3"
 say "Using interpreter: $PY_BASE ($(py_majmin "$PY_BASE"))"
 
 if [[ -n "$UPSTREAM_VENV" ]]; then
   "$UPSTREAM_VENV/bin/pip" install -e "$AGENT_DIR" -q || \
     "$UPSTREAM_VENV/bin/pip" install -e "$AGENT_DIR"
   PY="$UPSTREAM_VENV/bin/python"
-elif ensure_uv; then
+elif command -v uv >/dev/null 2>&1; then
   (cd "$AGENT_DIR" && uv venv .venv --python "$PY_BASE" && uv pip install -e .)
   PY="$AGENT_DIR/.venv/bin/python"
 elif ensure_venv_support && "$PY_BASE" -m venv "$AGENT_DIR/.venv"; then
