@@ -23,7 +23,33 @@ if ! command -v mongod >/dev/null 2>&1; then
   sudo apt-get install -y -qq gnupg curl ca-certificates
   curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc |
     sudo gpg -o /usr/share/keyrings/mongodb-server-7.0.gpg --dearmor
-  CODENAME="${VERSION_CODENAME:-jammy}"
+
+  # MongoDB apt only ships a few distro codenames. Newer Ubuntu (e.g. resolute)
+  # has no Release file yet — fall back to the newest supported one.
+  pick_mongo_codename() {
+    local distro="$1" want="$2" c
+    local -a candidates=()
+    [[ -n "$want" ]] && candidates+=("$want")
+    if [[ "$distro" == "ubuntu" ]]; then
+      candidates+=(noble jammy focal)
+    else
+      candidates+=(bookworm bullseye)
+    fi
+    for c in "${candidates[@]}"; do
+      if curl -fsI "https://repo.mongodb.org/apt/${distro}/dists/${c}/mongodb-org/7.0/Release" >/dev/null 2>&1; then
+        echo "$c"
+        return 0
+      fi
+    done
+    return 1
+  }
+
+  CODENAME="$(pick_mongo_codename "${ID}" "${VERSION_CODENAME:-}")" \
+    || die "No MongoDB 7.0 apt repo for ${ID} (tried ${VERSION_CODENAME:-?} + fallbacks)"
+  if [[ "${CODENAME}" != "${VERSION_CODENAME:-}" ]]; then
+    say "MongoDB has no packages for '${VERSION_CODENAME:-unknown}' — using '${CODENAME}' packages"
+  fi
+
   echo "deb [ signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/${ID} ${CODENAME}/mongodb-org/7.0 multiverse" |
     sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list >/dev/null
   sudo apt-get update -qq
