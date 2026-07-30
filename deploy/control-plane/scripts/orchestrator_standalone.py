@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-hosted orchestrator — mTLS HTTPS on :8744 (no Docker, pymongo only)."""
+"""Self-hosted orchestrator ? mTLS HTTPS on :8744 (no Docker, pymongo only)."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 CONTROL = Path(os.environ.get("HERMES_CONTROL_DIR", Path(__file__).resolve().parents[1])).resolve()
 PORT = int(os.environ.get("HERMES_ORCHESTRATOR_PORT", "8744"))
+BIND = os.environ.get("HERMES_LISTEN_BIND", "0.0.0.0").strip() or "0.0.0.0"
 CERTS = CONTROL / "certs"
 SERVER_PEM = Path(os.environ.get("HERMES_ORCH_SERVER_PEM", str(CERTS / "mongo-server.pem")))
 CA_CRT = Path(os.environ.get("HERMES_ORCH_CA", str(CERTS / "ca.crt")))
@@ -196,9 +197,9 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     if not SERVER_PEM.is_file() or not CA_CRT.is_file():
         raise SystemExit(f"Missing TLS files: {SERVER_PEM} / {CA_CRT}")
-    httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    httpd = ThreadingHTTPServer((BIND, PORT), Handler)
     httpd.socket = ssl_ctx().wrap_socket(httpd.socket, server_side=True)
-    print(f"Orchestrator mTLS on :{PORT}  control={CONTROL}")
+    print(f"Orchestrator mTLS on {BIND}:{PORT}  control={CONTROL}")
     httpd.serve_forever()
 
 

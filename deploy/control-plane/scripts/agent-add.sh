@@ -21,8 +21,9 @@ guess_ip() {
   echo "${ip:-127.0.0.1}"
 }
 
-LAN=$(guess_ip)
-HOSTS="${HERMES_MONGO_HOSTS:-${LAN}:27017,${LAN}:27018,${LAN}:27019}"
+ADVERTISE="${HERMES_ADVERTISE_HOST:-$(guess_ip)}"
+HOSTS="${HERMES_MONGO_HOSTS:-${ADVERTISE}:27017}"
+LISTEN_BIND="${HERMES_LISTEN_BIND:-${HERMES_MONGO_BIND:-0.0.0.0}}"
 
 # Persist hosts for agents
 if grep -q '^HERMES_MONGO_HOSTS=' "$ROOT/.env" 2>/dev/null; then
@@ -37,22 +38,24 @@ CODE=$(HERMES_CONTROL_DIR="$ROOT" python3 "$ROOT/scripts/enroll_standalone.py" "
 
 echo ""
 echo "========================================================"
-echo "  Hermes DB — connect an agent PC"
+echo "  Hermes DB ? connect an agent PC"
 echo "========================================================"
 echo "  Code     :  $CODE"
-echo "  Address  :  ${LAN}:${PORT}"
+echo "  Address  :  ${ADVERTISE}:${PORT}"
+echo "  Mode     :  ${HERMES_LISTEN_MODE:-?}  bind=${LISTEN_BIND}"
 echo "  Valid    :  $((TTL/60)) min"
 echo ""
 echo "  On the agent PC run:"
 echo "    curl -fsSL \$INSTALL_AGENT_URL | bash"
 echo "    # then answer Yes to connect, or: hermes db connect"
-echo "    Address: ${LAN}:${PORT}"
+echo "    Address: ${ADVERTISE}:${PORT}"
 echo "    Code:    $CODE"
 echo "========================================================"
 echo ""
-echo "Waiting for PC to connect (Ctrl+C to stop listener)…"
+echo "Waiting for PC to connect (Ctrl+C to stop listener)?"
 
 export HERMES_CONTROL_DIR="$ROOT"
 export HERMES_ENROLL_PORT="$PORT"
+export HERMES_LISTEN_BIND="$LISTEN_BIND"
 export HERMES_MONGO_HOSTS="$HOSTS"
 exec python3 "$ROOT/scripts/enroll_standalone.py" serve

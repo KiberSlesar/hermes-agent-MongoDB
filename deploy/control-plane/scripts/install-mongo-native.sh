@@ -152,7 +152,7 @@ systemLog:
   logAppend: true
 net:
   port: ${PORT}
-  bindIp: 0.0.0.0
+  bindIp: ${BIND}
 replication:
   replSetName: rs0
 processManagement:

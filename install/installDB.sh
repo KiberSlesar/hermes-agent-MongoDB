@@ -7,10 +7,11 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB-private/main/install/installDB.sh | bash
 #
-# Env:
-#   HERMES_DB_HOME          default ~/hermes-db
-#   HERMES_MONGO_HOSTS      public host:27017 (single node)
-#   HERMES_SKIP_CONNECT=1   skip agent connect prompt
+# Env (non-interactive):
+#   HERMES_LISTEN_MODE=lo|lan|wan     where to listen / advertise
+#   HERMES_ADVERTISE_HOST=1.2.3.4     override advertised IP/DNS
+#   HERMES_DB_HOME=~/hermes-db
+#   HERMES_SKIP_CONNECT=1
 # ============================================================================
 set -euo pipefail
 
@@ -32,13 +33,106 @@ auth_curl() {
   fi
 }
 
-guess_ip() {
+guess_lan_ip() {
   local ip=""
   if command -v ip >/dev/null 2>&1; then
     ip=$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)
   fi
   [[ -z "$ip" ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
   echo "${ip:-127.0.0.1}"
+}
+
+guess_wan_ip() {
+  local ip=""
+  ip=$(curl -4 -fsS --max-time 4 https://ifconfig.me/ip 2>/dev/null || true)
+  [[ -z "$ip" ]] && ip=$(curl -4 -fsS --max-time 4 https://api.ipify.org 2>/dev/null || true)
+  [[ -z "$ip" ]] && ip=$(curl -4 -fsS --max-time 4 https://icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)
+  echo "${ip}"
+}
+
+# Sets: MODE, BIND_IP, ADVERTISE_HOST, LISTEN_HINT
+resolve_listen_mode() {
+  local lan wan mode ans custom
+  lan=$(guess_lan_ip)
+  wan=$(guess_wan_ip)
+
+  mode="${HERMES_LISTEN_MODE:-}"
+  mode=$(echo "$mode" | tr '[:upper:]' '[:lower:]')
+
+  if [[ -z "$mode" ]]; then
+    if [[ -t 0 ]]; then
+      echo ""
+      echo "${BOLD}Where should Mongo / enroll / orchestrator listen?${NC}"
+      echo "  1) LO   — only this machine (127.0.0.1)"
+      echo "  2) LAN  — local network (${lan})"
+      if [[ -n "$wan" ]]; then
+        echo "  3) WAN  — internet / public IP (${wan})"
+      else
+        echo "  3) WAN  — internet / public IP (enter manually)"
+      fi
+      echo "  4) Custom host/IP"
+      read -r -p "Choice [1/2/3/4] (default 2=LAN): " ans || ans=2
+      ans=${ans:-2}
+      case "$ans" in
+        1|lo|LO) mode=lo ;;
+        3|wan|WAN) mode=wan ;;
+        4|custom|CUSTOM)
+          read -r -p "Advertise host/IP: " custom
+          [[ -n "$custom" ]] || die "empty custom host"
+          HERMES_ADVERTISE_HOST="$custom"
+          mode=custom
+          ;;
+        *) mode=lan ;;
+      esac
+    else
+      mode=lan
+      warn "Non-interactive — default listen mode: LAN (${lan}). Set HERMES_LISTEN_MODE=lo|lan|wan"
+    fi
+  fi
+
+  case "$mode" in
+    lo|localhost|local)
+      MODE=lo
+      BIND_IP=127.0.0.1
+      ADVERTISE_HOST="${HERMES_ADVERTISE_HOST:-127.0.0.1}"
+      LISTEN_HINT="localhost only"
+      ;;
+    lan|localnet)
+      MODE=lan
+      BIND_IP=0.0.0.0
+      ADVERTISE_HOST="${HERMES_ADVERTISE_HOST:-$lan}"
+      LISTEN_HINT="LAN (${ADVERTISE_HOST})"
+      ;;
+    wan|public|internet)
+      MODE=wan
+      BIND_IP=0.0.0.0
+      if [[ -n "${HERMES_ADVERTISE_HOST:-}" ]]; then
+        ADVERTISE_HOST="$HERMES_ADVERTISE_HOST"
+      elif [[ -n "$wan" ]]; then
+        ADVERTISE_HOST="$wan"
+        if [[ -t 0 ]]; then
+          read -r -p "Public IP to advertise [${wan}]: " custom || custom=""
+          ADVERTISE_HOST="${custom:-$wan}"
+        fi
+      else
+        [[ -t 0 ]] || die "WAN mode needs HERMES_ADVERTISE_HOST=…"
+        read -r -p "Public IP / DNS to advertise: " ADVERTISE_HOST
+        [[ -n "$ADVERTISE_HOST" ]] || die "empty WAN host"
+      fi
+      LISTEN_HINT="WAN (${ADVERTISE_HOST}) — open firewall 27017,8743,8744"
+      ;;
+    custom)
+      MODE=custom
+      BIND_IP=0.0.0.0
+      ADVERTISE_HOST="${HERMES_ADVERTISE_HOST}"
+      LISTEN_HINT="custom (${ADVERTISE_HOST})"
+      ;;
+    *)
+      die "Unknown HERMES_LISTEN_MODE='$mode' (use lo|lan|wan)"
+      ;;
+  esac
+
+  say "Listen mode: ${MODE} — bind ${BIND_IP}, advertise ${ADVERTISE_HOST}"
 }
 
 echo ""
@@ -50,6 +144,8 @@ command -v python3 >/dev/null || die "python3 required"
 command -v curl >/dev/null || die "curl required"
 command -v systemctl >/dev/null || die "systemd required"
 command -v sudo >/dev/null || die "sudo required (to apt-install mongodb-org)"
+
+resolve_listen_mode
 
 # --- Fetch control-plane scripts into HERMES_DB_HOME ---
 SRC=""
@@ -86,27 +182,50 @@ mkdir -p "$HERMES_DB_HOME/certs" "$HERMES_DB_HOME/bundles" "$HERMES_DB_HOME/enro
   "$HERMES_DB_HOME/data" "$HERMES_DB_HOME/logs"
 chmod +x "$HERMES_DB_HOME/scripts/"*.sh 2>/dev/null || true
 
-LAN=$(guess_ip)
+upsert_env() {
+  local f="$1" k="$2" v="$3"
+  if grep -q "^${k}=" "$f" 2>/dev/null; then
+    sed -i.bak "s|^${k}=.*|${k}=${v}|" "$f"
+  else
+    echo "${k}=${v}" >> "$f"
+  fi
+  rm -f "${f}.bak"
+}
+
+write_env_listen_vars() {
+  local f="$HERMES_DB_HOME/.env"
+  upsert_env "$f" HERMES_LISTEN_MODE "$MODE"
+  upsert_env "$f" HERMES_MONGO_BIND "$BIND_IP"
+  upsert_env "$f" HERMES_LISTEN_BIND "$BIND_IP"
+  upsert_env "$f" HERMES_ADVERTISE_HOST "$ADVERTISE_HOST"
+  upsert_env "$f" HERMES_MONGO_HOSTS "${ADVERTISE_HOST}:27017"
+  upsert_env "$f" HERMES_MONGO_RS_HOST "${ADVERTISE_HOST}:27017"
+  upsert_env "$f" HERMES_ORCHESTRATOR_URL "https://${ADVERTISE_HOST}:8744"
+  upsert_env "$f" HERMES_MONGO_PORT "27017"
+}
+
 if [[ ! -f "$HERMES_DB_HOME/.env" ]]; then
   cat > "$HERMES_DB_HOME/.env" <<EOF
 MONGO_ROOT_USER=hermesRoot
 MONGO_ROOT_PASSWORD=$(openssl rand -hex 16)
 HERMES_ENROLL_TOKEN=$(openssl rand -hex 24)
-HERMES_MONGO_PORT=27017
-HERMES_MONGO_HOSTS=${HERMES_MONGO_HOSTS:-${LAN}:27017}
-HERMES_MONGO_RS_HOST=${LAN}:27017
-HERMES_ORCHESTRATOR_URL=https://${LAN}:8744
 HERMES_REPLICA_SET=rs0
 EOF
   chmod 600 "$HERMES_DB_HOME/.env"
   say "Wrote $HERMES_DB_HOME/.env"
 else
-  say "Using existing $HERMES_DB_HOME/.env"
+  say "Using existing $HERMES_DB_HOME/.env (updating listen/advertise)"
 fi
+write_env_listen_vars
 set -a && source "$HERMES_DB_HOME/.env" && set +a
 
 say "Generating CA / server certificates…"
-export HERMES_CERT_EXTRA_SAN="IP:${LAN}"
+export HERMES_CERT_EXTRA_SAN="IP:${ADVERTISE_HOST}"
+# Also include LAN if advertise is WAN
+LAN_IP=$(guess_lan_ip)
+if [[ "$ADVERTISE_HOST" != "$LAN_IP" && "$ADVERTISE_HOST" != "127.0.0.1" ]]; then
+  export HERMES_CERT_EXTRA_SAN="IP:${ADVERTISE_HOST},IP:${LAN_IP}"
+fi
 bash "$HERMES_DB_HOME/scripts/gen-ca.sh"
 
 say "Installing native MongoDB…"
@@ -121,14 +240,18 @@ exec "$(cd "$(dirname "$0")" && pwd)/scripts/agent-add.sh" "$@"
 EOF
 chmod +x "$HERMES_DB_HOME/agent-add"
 
-# Open firewall hint
-warn "If agents are remote, open ports 27017, 8743, 8744 (ufw allow …)."
+if [[ "$MODE" != "lo" ]]; then
+  warn "If agents are remote, open ports 27017, 8743, 8744 (ufw allow …)."
+fi
 
 echo ""
 echo "${GREEN}✓ Hermes DB self-hosted${NC}  →  $HERMES_DB_HOME"
-echo "  Mongo        : ${HERMES_MONGO_HOSTS}  (native mongod, no Docker)"
-echo "  Enroll       : http://${LAN}:8743"
-echo "  Orchestrator : https://${LAN}:8744  (mTLS)"
+echo "  Mode         : ${MODE} — ${LISTEN_HINT}"
+echo "  Bind         : ${BIND_IP}"
+echo "  Advertise    : ${ADVERTISE_HOST}"
+echo "  Mongo        : ${HERMES_MONGO_HOSTS}"
+echo "  Enroll       : http://${ADVERTISE_HOST}:8743"
+echo "  Orchestrator : https://${ADVERTISE_HOST}:8744  (mTLS)"
 echo "  Status       : systemctl --user status hermes-mongod hermes-enroll hermes-orchestrator"
 echo ""
 
@@ -141,7 +264,6 @@ read -r -p "Connect an agent PC now (one-time code & wait)? [Y/n] " ans || ans=Y
 ans=${ans:-Y}
 if [[ "$ans" =~ ^[Yy] ]]; then
   read -r -p "Optional PC name (e.g. home-pc): " pcname || pcname=""
-  # Stop persistent enroll service while interactive wait owns :8743
   systemctl --user stop hermes-enroll.service 2>/dev/null || true
   bash "$HERMES_DB_HOME/scripts/agent-add.sh" ${pcname:+"$pcname"} || true
   systemctl --user start hermes-enroll.service 2>/dev/null || true

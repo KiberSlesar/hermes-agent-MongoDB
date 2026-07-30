@@ -30,6 +30,7 @@ ALPHABET = (string.ascii_uppercase + string.digits).replace("O", "").replace("0"
 SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 CONTROL = Path(os.environ.get("HERMES_CONTROL_DIR", Path(__file__).resolve().parents[1])).resolve()
 PORT = int(os.environ.get("HERMES_ENROLL_PORT", "8743"))
+BIND = os.environ.get("HERMES_LISTEN_BIND", "0.0.0.0").strip() or "0.0.0.0"
 HOSTS = os.environ.get("HERMES_MONGO_HOSTS", "").strip()
 REPLICA = os.environ.get("HERMES_REPLICA_SET", "rs0").strip() or "rs0"
 PENDING = CONTROL / "enroll_pending"
@@ -188,8 +189,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"Enroll listening on :{PORT}  control={CONTROL}")
+    server = ThreadingHTTPServer((BIND, PORT), Handler)
+    print(f"Enroll listening on {BIND}:{PORT}  control={CONTROL}")
     server.serve_forever()
 
 
