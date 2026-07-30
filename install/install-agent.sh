@@ -2,21 +2,14 @@
 # ============================================================================
 # Hermes Agent (Mongo) — curl installer
 # ============================================================================
-# No git clone. Installs Hermes with Mongo remote storage, then offers
-# to connect this PC to the DB (one-time code from installDB / agent-add).
+# Installs the Mongo fork and forces `hermes` on PATH to that checkout
+# (upstream /usr/local/bin/hermes has no `db connect`).
 #
-#   curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/install/install-agent.sh | bash
-#
-# Private repo:
-#   curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-#     https://raw.githubusercontent.com/<user>/<repo>/main/install/install-agent.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB-private/main/install/install-agent.sh | bash
 #
 # Env / flags:
 #   HERMES_HOME              (default: ~/.hermes)
-#   HERMES_MONGO_REPO        (default: KiberSlesar/hermes-agent-MongoDB-private)
-#   HERMES_MONGO_REF         (default: main)
 #   HERMES_SKIP_CONNECT=1    skip connect prompt
-#   bash -s -- --connect     force connect wizard after install
 #   bash -s -- --host IP:8743 --code ABCD-EFGH
 # ============================================================================
 set -euo pipefail
@@ -38,7 +31,7 @@ while [[ $# -gt 0 ]]; do
     --skip-base) SKIP_HERMES_BASE=1; shift ;;
     --hermes-home) HERMES_HOME_DIR="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,30p' "$0" 2>/dev/null || true
+      sed -n '2,20p' "$0" 2>/dev/null || true
       exit 0 ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
@@ -74,28 +67,26 @@ auth_curl() {
 }
 
 echo ""
-echo "${BOLD}⚕ Hermes Agent installer (Mongo)${NC}"
+echo "${BOLD}Hermes Agent installer (Mongo)${NC}"
 echo "  HERMES_HOME=$HERMES_HOME_DIR"
 echo ""
 
 command -v curl >/dev/null || die "curl is required"
 command -v tar >/dev/null || die "tar is required"
+command -v python3 >/dev/null || die "python3 is required"
 
 mkdir -p "$HERMES_HOME_DIR/certs"
 export HERMES_HOME="$HERMES_HOME_DIR"
 
-# --- Base Hermes runtime (uv / launcher) if missing ---
+# Optional base deps (browser tools etc.) — ignore if hermes already present
 if [[ $SKIP_HERMES_BASE -eq 0 ]] && ! command -v hermes >/dev/null 2>&1; then
-  say "Installing Hermes base runtime…"
+  say "Installing Hermes base runtime (for deps)…"
   curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup || \
     curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --skip-setup || \
     warn "Base installer failed — continuing with Mongo overlay only"
-  # reload PATH hints
   export PATH="${HOME}/.local/bin:${PATH}"
-  [[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc" 2>/dev/null || true
 fi
 
-# --- Overlay: this MongoDB fork checkout ---
 AGENT_DIR="$HERMES_HOME_DIR/hermes-agent"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -109,53 +100,103 @@ tar -xzf "$TMP/src.tgz" -C "$TMP/out"
 SRC=$(find "$TMP/out" -mindepth 1 -maxdepth 1 -type d | head -1)
 [[ -n "$SRC" ]] || die "empty archive"
 
-# Preserve local bootstrap/certs; replace agent source
-mkdir -p "$AGENT_DIR"
-# Move aside old tree
-if [[ -d "$AGENT_DIR/.git" ]] || [[ -f "$AGENT_DIR/pyproject.toml" ]]; then
+if [[ -d "$AGENT_DIR" ]]; then
   say "Replacing existing checkout at $AGENT_DIR"
   rm -rf "$AGENT_DIR"
 fi
 mkdir -p "$(dirname "$AGENT_DIR")"
 mv "$SRC" "$AGENT_DIR"
 
-say "Installing Python package (editable)…"
-if command -v uv >/dev/null 2>&1; then
-  (cd "$AGENT_DIR" && uv pip install -e ".[all]" 2>/dev/null || uv pip install -e .) || \
-    (cd "$AGENT_DIR" && python3 -m pip install -e .)
-elif command -v python3 >/dev/null 2>&1; then
-  (cd "$AGENT_DIR" && python3 -m pip install -e .)
+# Prefer upstream sealed venv if present (has deps); else create local venv
+UPSTREAM_VENV=""
+for cand in /usr/local/lib/hermes-agent/venv "$HOME/.local/lib/hermes-agent/venv"; do
+  [[ -x "$cand/bin/python" ]] && UPSTREAM_VENV="$cand" && break
+done
+
+say "Installing Mongo fork into a dedicated venv…"
+if [[ -n "$UPSTREAM_VENV" ]]; then
+  # Install editable into upstream venv so imports resolve
+  "$UPSTREAM_VENV/bin/pip" install -e "$AGENT_DIR" -q || \
+    "$UPSTREAM_VENV/bin/pip" install -e "$AGENT_DIR"
+  PY="$UPSTREAM_VENV/bin/python"
+elif command -v uv >/dev/null 2>&1; then
+  (cd "$AGENT_DIR" && uv venv .venv && uv pip install -e .)
+  PY="$AGENT_DIR/.venv/bin/python"
 else
-  die "python3/uv required"
+  python3 -m venv "$AGENT_DIR/.venv"
+  "$AGENT_DIR/.venv/bin/pip" install -U pip -q
+  "$AGENT_DIR/.venv/bin/pip" install -e "$AGENT_DIR"
+  PY="$AGENT_DIR/.venv/bin/python"
 fi
 
-# Ensure hermes on PATH points at this install when possible
-if [[ -x "$AGENT_DIR/.venv/bin/hermes" ]]; then
-  mkdir -p "$HOME/.local/bin"
-  ln -sfn "$AGENT_DIR/.venv/bin/hermes" "$HOME/.local/bin/hermes"
-  export PATH="$HOME/.local/bin:$PATH"
-fi
+# Force hermes launcher to Mongo fork (upstream binary has no `db connect`)
+install_mongo_launcher() {
+  local dest="$1"
+  mkdir -p "$(dirname "$dest")"
+  cat > "$dest" <<EOF
+#!/usr/bin/env bash
+# Hermes Mongo fork launcher — do not replace with upstream hermes
+export HERMES_HOME="\${HERMES_HOME:-$HERMES_HOME_DIR}"
+export PYTHONPATH="$AGENT_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
+exec "$PY" -m hermes_cli.main "\$@"
+EOF
+  chmod +x "$dest"
+}
 
-echo ""
-echo "${GREEN}✓ Agent installed${NC}"
-echo "  Source: $AGENT_DIR"
-echo ""
+mkdir -p "$HOME/.local/bin"
+install_mongo_launcher "$HOME/.local/bin/hermes"
+install_mongo_launcher "$HERMES_HOME_DIR/bin/hermes"
+export PATH="$HOME/.local/bin:$HERMES_HOME_DIR/bin:$PATH"
 
-do_connect() {
-  local host="$1" code="$2"
-  if command -v hermes >/dev/null 2>&1 && hermes db connect --help >/dev/null 2>&1; then
-    if [[ -n "$host" && -n "$code" ]]; then
-      hermes db connect --host "$host" --code "$code"
+# Shadow /usr/local/bin/hermes when we can (upstream installs there)
+if [[ -w /usr/local/bin ]] || command -v sudo >/dev/null 2>&1; then
+  if [[ -e /usr/local/bin/hermes ]] && [[ ! -e /usr/local/bin/hermes.upstream ]]; then
+    say "Backing up upstream hermes → /usr/local/bin/hermes.upstream"
+    if [[ -w /usr/local/bin ]]; then
+      cp -a /usr/local/bin/hermes /usr/local/bin/hermes.upstream 2>/dev/null || true
     else
-      hermes db connect
+      sudo cp -a /usr/local/bin/hermes /usr/local/bin/hermes.upstream 2>/dev/null || true
     fi
-    return
   fi
-  # Fallback: pure curl enroll (no hermes CLI yet)
-  [[ -n "$host" && -n "$code" ]] || die "Need --host and --code (hermes CLI not ready)"
-  say "Redeeming code via enroll API…"
-  local name
+  if [[ -w /usr/local/bin ]]; then
+    install_mongo_launcher /usr/local/bin/hermes
+  else
+    sudo tee /usr/local/bin/hermes >/dev/null <<EOF
+#!/usr/bin/env bash
+export HERMES_HOME="\${HERMES_HOME:-$HERMES_HOME_DIR}"
+export PYTHONPATH="$AGENT_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
+exec "$PY" -m hermes_cli.main "\$@"
+EOF
+    sudo chmod +x /usr/local/bin/hermes
+  fi
+fi
+
+hash -r 2>/dev/null || true
+
+# Verify Mongo commands exist
+if ! "$PY" -m hermes_cli.main db --help >/dev/null 2>&1; then
+  die "Mongo hermes_cli failed to load from $AGENT_DIR"
+fi
+say "hermes → Mongo fork ($AGENT_DIR)"
+echo "  which hermes: $(command -v hermes || echo missing)"
+if hermes db --help >/dev/null 2>&1; then
+  say "Verified: hermes db connect is available"
+else
+  warn "PATH still points at old hermes — use: $HERMES_HOME_DIR/bin/hermes db connect"
+  export PATH="$HERMES_HOME_DIR/bin:$HOME/.local/bin:$PATH"
+fi
+
+echo ""
+echo "${GREEN}OK Agent installed${NC}"
+echo "  Source: $AGENT_DIR"
+echo "  Launcher: $(command -v hermes)"
+echo ""
+
+curl_enroll() {
+  local host="$1" code="$2" name
+  host="${host#http://}"; host="${host#https://}"
   name=$(hostname -s 2>/dev/null || hostname || echo agent)
+  say "Redeeming code via enroll API (curl fallback)…"
   auth_curl -X POST "http://${host}/enroll" \
     -H "Content-Type: application/json" \
     -d "{\"code\":\"${code}\",\"name\":\"${name}\"}" \
@@ -164,15 +205,41 @@ do_connect() {
   tar -xzf "$TMP/bundle.tar.gz" -C "$TMP/bundle"
   local bdir
   bdir=$(find "$TMP/bundle" -mindepth 1 -maxdepth 1 -type d | head -1)
+  [[ -n "$bdir" ]] || die "empty enroll bundle"
   cp "$bdir/bootstrap.yaml" "$HERMES_HOME_DIR/bootstrap.yaml"
   mkdir -p "$HERMES_HOME_DIR/certs"
   cp -f "$bdir/certs/"* "$HERMES_HOME_DIR/certs/" 2>/dev/null || true
   chmod 600 "$HERMES_HOME_DIR/bootstrap.yaml" "$HERMES_HOME_DIR/certs/agent.pem" 2>/dev/null || true
   say "Wrote bootstrap + certs to $HERMES_HOME_DIR"
-  if command -v hermes >/dev/null 2>&1; then
-    hermes storage status || true
-    hermes storage seed || hermes storage migrate || true
+  # seed if CLI works
+  if hermes storage seed >/dev/null 2>&1; then
+    hermes storage seed || true
+  elif "$PY" -m hermes_cli.main storage seed >/dev/null 2>&1; then
+    "$PY" -m hermes_cli.main storage seed || true
   fi
+  hermes storage status 2>/dev/null || "$PY" -m hermes_cli.main storage status || true
+}
+
+do_connect() {
+  local host="$1" code="$2"
+  export PATH="$HERMES_HOME_DIR/bin:$HOME/.local/bin:$PATH"
+  hash -r 2>/dev/null || true
+
+  if [[ -z "$host" ]] && can_prompt; then
+    ask host "Control-plane address (IP:8743): " "127.0.0.1:8743"
+  fi
+  if [[ -z "$code" ]] && can_prompt; then
+    ask code "One-time code: "
+  fi
+  [[ -n "$host" && -n "$code" ]] || die "Need host and code (or run interactively on a TTY)"
+
+  if hermes db connect --help >/dev/null 2>&1; then
+    hermes db connect --host "$host" --code "$code" && return 0
+  fi
+  if "$PY" -m hermes_cli.main db connect --help >/dev/null 2>&1; then
+    "$PY" -m hermes_cli.main db connect --host "$host" --code "$code" && return 0
+  fi
+  curl_enroll "$host" "$code"
 }
 
 if [[ -n "$ENROLL_HOST" || -n "$ENROLL_CODE" ]]; then
@@ -183,6 +250,7 @@ fi
 
 if [[ "$SKIP_CONNECT" == "1" && "$FORCE_CONNECT" -eq 0 ]]; then
   echo "Next: hermes db connect"
+  echo "  or: $HERMES_HOME_DIR/bin/hermes db connect"
   exit 0
 fi
 
@@ -192,16 +260,17 @@ if [[ "$FORCE_CONNECT" -eq 1 ]]; then
 fi
 
 if ! can_prompt; then
-  warn "No TTY for prompts — run: hermes db connect"
-  echo "  Example: hermes db connect --host 192.168.88.44:8743 --code ABCD-EFGH"
+  warn "No TTY — run: hermes db connect --host IP:8743 --code ABCD-EFGH"
+  echo "  Launcher: $HERMES_HOME_DIR/bin/hermes"
   exit 0
 fi
 
 ask ans "Connect this PC to Hermes DB now? [Y/n] " "Y"
 if [[ "$ans" =~ ^[Yy] ]]; then
-  echo "Enter values from the DB server (installDB / agent-add):"
+  echo "Enter values from the DB server (agent-add):"
   do_connect "" ""
 else
   echo "Later: hermes db connect"
+  echo "  $HERMES_HOME_DIR/bin/hermes db connect"
 fi
 echo ""
