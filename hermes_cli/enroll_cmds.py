@@ -231,6 +231,39 @@ def cmd_db_connect(args: Any) -> None:
         storage.client.admin.command("ping")
         storage.register_presence()
         print(f"✓ Mongo OK  (machine_id={storage.machine_id})")
+
+        # First agent to connect seeds shared skills + profile from local install
+        try:
+            from hermes_storage.skills_sync import (
+                seed_profile_defaults_if_empty,
+                seed_shared_skills_if_empty,
+                sync_skills_from_mongo,
+            )
+
+            skill_seed = seed_shared_skills_if_empty(storage, home=hermes_home)
+            if skill_seed.get("uploaded"):
+                print(
+                    f"✓ Seeded {skill_seed['uploaded']} skills → Mongo "
+                    f"(from {skill_seed['source']})"
+                )
+            else:
+                print(
+                    f"✓ Skills already in Mongo ({skill_seed.get('existing', 0)}) "
+                    "— materializing local cache"
+                )
+            sync_skills_from_mongo()
+            prof = seed_profile_defaults_if_empty(storage, home=hermes_home)
+            if not prof.get("skipped"):
+                print(
+                    f"✓ Profile seeded to Mongo "
+                    f"(config={prof.get('config', 0)}, soul={prof.get('soul', 0)}, "
+                    f"secrets={prof.get('secrets', 0)})"
+                )
+            print("  Canonical state is Mongo; ~/.hermes/skills is only a cache/staging.")
+        except Exception as seed_exc:
+            print(f"! Seed/migrate warning: {seed_exc}")
+            print("  Run later: hermes storage migrate")
+
         print("  Next: hermes cluster status")
     except Exception as exc:
         print(f"Bootstrap installed, but Mongo ping failed: {exc}")

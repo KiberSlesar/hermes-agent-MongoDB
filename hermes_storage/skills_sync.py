@@ -63,3 +63,84 @@ def upload_local_skill_tree(skill_dir: Path, *, name: Optional[str] = None) -> N
         {"name": skill_name, "skill_md": body, "path": skill_name},
         files=files,
     )
+
+
+def _iter_skill_dirs(root: Path) -> list[Path]:
+    if not root.is_dir():
+        return []
+    found: list[Path] = []
+    for skill_md in root.rglob("SKILL.md"):
+        found.append(skill_md.parent)
+    return found
+
+
+def seed_shared_skills_if_empty(
+    storage: Optional[object] = None,
+    *,
+    home: Optional[Path] = None,
+) -> dict[str, int]:
+    """If Mongo has zero skills, push from local ~/.hermes/skills then bundled tree.
+
+    Returns counts: {existing, uploaded, source}.
+    """
+    from hermes_constants import get_hermes_home
+    from hermes_storage import require_storage
+
+    st = storage or require_storage()
+    existing = len(st.skills.list_skills())
+    if existing > 0:
+        return {"existing": existing, "uploaded": 0, "source": "mongo"}
+
+    home = Path(home) if home else get_hermes_home()
+    uploaded = 0
+    source = "none"
+
+    local_root = home / "skills"
+    dirs = _iter_skill_dirs(local_root)
+    if dirs:
+        source = str(local_root)
+        for d in dirs:
+            upload_local_skill_tree(d, name=d.name)
+            uploaded += 1
+    else:
+        # Fall back to checkout / package bundled skills
+        candidates = [
+            home / "hermes-agent" / "skills",
+            Path(__file__).resolve().parents[1] / "skills",
+        ]
+        for cand in candidates:
+            dirs = _iter_skill_dirs(cand)
+            if not dirs:
+                continue
+            source = str(cand)
+            for d in dirs:
+                upload_local_skill_tree(d, name=d.name)
+                uploaded += 1
+            break
+
+    return {"existing": 0, "uploaded": uploaded, "source": source}
+
+
+def seed_profile_defaults_if_empty(
+    storage: Optional[object] = None,
+    *,
+    home: Optional[Path] = None,
+) -> dict[str, int]:
+    """Push local config/soul/memories/secrets into Mongo when profile is empty."""
+    from hermes_constants import get_hermes_home
+    from hermes_storage import require_storage
+    from hermes_storage.local.migrate import export_local_home, import_payload_to_storage
+
+    st = storage or require_storage()
+    home = Path(home) if home else get_hermes_home()
+
+    # Only import "identity" bits if profile looks empty
+    cfg = st.load_profile_config() or {}
+    soul = st.load_soul() or ""
+    if cfg or soul.strip():
+        return {"skipped": 1, "reason": "profile_already_set"}
+
+    payload = export_local_home(home)
+    # Don't re-upload skills here (handled separately); still OK if duplicated
+    counts = import_payload_to_storage(st, payload)
+    return counts

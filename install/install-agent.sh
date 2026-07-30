@@ -155,6 +155,7 @@ do_connect() {
   say "Wrote bootstrap + certs to $HERMES_HOME_DIR"
   if command -v hermes >/dev/null 2>&1; then
     hermes storage status || true
+    hermes storage seed || hermes storage migrate || true
   fi
 }
 
