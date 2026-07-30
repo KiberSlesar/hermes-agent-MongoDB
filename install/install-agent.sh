@@ -133,62 +133,88 @@ fi
 install_mongo_launcher() {
   local dest="$1"
   mkdir -p "$(dirname "$dest")"
-  cat > "$dest" <<EOF
+  local tmp
+  tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
 #!/usr/bin/env bash
-# Hermes Mongo fork launcher — do not replace with upstream hermes
+# Hermes Mongo fork launcher — replaces upstream hermes
 export HERMES_HOME="\${HERMES_HOME:-$HERMES_HOME_DIR}"
+cd "$AGENT_DIR" || exit 1
 export PYTHONPATH="$AGENT_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
 exec "$PY" -m hermes_cli.main "\$@"
 EOF
-  chmod +x "$dest"
+  chmod +x "$tmp"
+  if [[ -w "$(dirname "$dest")" ]] || [[ -w "$dest" ]]; then
+    mv -f "$tmp" "$dest"
+  else
+    sudo mv -f "$tmp" "$dest"
+    sudo chmod +x "$dest"
+  fi
 }
 
-mkdir -p "$HOME/.local/bin"
+mkdir -p "$HOME/.local/bin" "$HERMES_HOME_DIR/bin"
 install_mongo_launcher "$HOME/.local/bin/hermes"
 install_mongo_launcher "$HERMES_HOME_DIR/bin/hermes"
-export PATH="$HOME/.local/bin:$HERMES_HOME_DIR/bin:$PATH"
 
-# Shadow /usr/local/bin/hermes when we can (upstream installs there)
-if [[ -w /usr/local/bin ]] || command -v sudo >/dev/null 2>&1; then
-  if [[ -e /usr/local/bin/hermes ]] && [[ ! -e /usr/local/bin/hermes.upstream ]]; then
-    say "Backing up upstream hermes → /usr/local/bin/hermes.upstream"
-    if [[ -w /usr/local/bin ]]; then
-      cp -a /usr/local/bin/hermes /usr/local/bin/hermes.upstream 2>/dev/null || true
-    else
-      sudo cp -a /usr/local/bin/hermes /usr/local/bin/hermes.upstream 2>/dev/null || true
+# Always overwrite the PATH-winning hermes (usually /usr/local/bin/hermes)
+HERMES_ON_PATH="$(command -v hermes 2>/dev/null || true)"
+if [[ -n "$HERMES_ON_PATH" ]]; then
+  if [[ "$HERMES_ON_PATH" != "$HOME/.local/bin/hermes" && "$HERMES_ON_PATH" != "$HERMES_HOME_DIR/bin/hermes" ]]; then
+    say "Replacing PATH hermes at $HERMES_ON_PATH with Mongo launcher"
+    if [[ -e "${HERMES_ON_PATH}.upstream" ]]; then
+      :
+    elif [[ -e "$HERMES_ON_PATH" ]]; then
+      if [[ -w "$(dirname "$HERMES_ON_PATH")" ]]; then
+        cp -a "$HERMES_ON_PATH" "${HERMES_ON_PATH}.upstream" 2>/dev/null || true
+      else
+        sudo cp -a "$HERMES_ON_PATH" "${HERMES_ON_PATH}.upstream" 2>/dev/null || true
+      fi
     fi
-  fi
-  if [[ -w /usr/local/bin ]]; then
-    install_mongo_launcher /usr/local/bin/hermes
-  else
-    sudo tee /usr/local/bin/hermes >/dev/null <<EOF
-#!/usr/bin/env bash
-export HERMES_HOME="\${HERMES_HOME:-$HERMES_HOME_DIR}"
-export PYTHONPATH="$AGENT_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
-exec "$PY" -m hermes_cli.main "\$@"
-EOF
-    sudo chmod +x /usr/local/bin/hermes
+    install_mongo_launcher "$HERMES_ON_PATH"
   fi
 fi
+# Also force /usr/local/bin/hermes even if not currently on PATH resolution quirks
+if [[ -e /usr/local/bin/hermes ]] || [[ -d /usr/local/bin ]]; then
+  install_mongo_launcher /usr/local/bin/hermes || true
+fi
 
+# If we installed into upstream venv, replace its entrypoint too
+if [[ -n "$UPSTREAM_VENV" && -d "$UPSTREAM_VENV/bin" ]]; then
+  install_mongo_launcher "$UPSTREAM_VENV/bin/hermes"
+fi
+
+export PATH="$HERMES_HOME_DIR/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
 hash -r 2>/dev/null || true
 
-# Verify Mongo commands exist
-if ! "$PY" -m hermes_cli.main db --help >/dev/null 2>&1; then
-  die "Mongo hermes_cli failed to load from $AGENT_DIR"
-fi
-say "hermes → Mongo fork ($AGENT_DIR)"
-echo "  which hermes: $(command -v hermes || echo missing)"
-if hermes db --help >/dev/null 2>&1; then
-  say "Verified: hermes db connect is available"
-else
-  warn "PATH still points at old hermes — use: $HERMES_HOME_DIR/bin/hermes db connect"
-  export PATH="$HERMES_HOME_DIR/bin:$HOME/.local/bin:$PATH"
+# HARD REQUIREMENT: hermes db connect must work after this installer
+verify_db_connect() {
+  "$HERMES_HOME_DIR/bin/hermes" db connect --help >/dev/null 2>&1 && return 0
+  "$HOME/.local/bin/hermes" db connect --help >/dev/null 2>&1 && return 0
+  hermes db connect --help >/dev/null 2>&1 && return 0
+  "$PY" -m hermes_cli.main db connect --help >/dev/null 2>&1 && return 0
+  return 1
+}
+
+if ! "$PY" -c "import hermes_cli.main, hermes_storage" 2>/dev/null; then
+  die "Mongo packages failed to import via $PY — pip install -e likely failed"
 fi
 
+if ! verify_db_connect; then
+  echo ""
+  echo "DEBUG:"
+  echo "  which hermes = $(command -v hermes || echo none)"
+  echo "  hermes --help (first lines):"
+  hermes --help 2>&1 | head -20 || true
+  die "hermes db connect still missing after install — this is a bug, installer aborting"
+fi
+
+say "Verified: hermes db connect works"
+echo "  which hermes: $(command -v hermes)"
+echo "  try: hermes db connect --help"
+
 echo ""
-echo "${GREEN}OK Agent installed${NC}"
-echo "  Source: $AGENT_DIR"
+echo "${GREEN}OK Agent installed (Mongo)${NC}"
+echo "  Source:   $AGENT_DIR"
 echo "  Launcher: $(command -v hermes)"
 echo ""
 
