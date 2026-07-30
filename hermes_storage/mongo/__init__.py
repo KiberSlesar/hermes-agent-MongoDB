@@ -98,7 +98,7 @@ def ensure_indexes(shared_db: Any, profile_db: Any) -> None:
     try:
         shared_db["cluster_nodes"].create_index("node_id", unique=True)
         shared_db["cluster_nodes"].create_index("heartbeat_at")
-        shared_db["cluster_state"].create_index("_id", unique=True)
+        # _id is already uniquely indexed by Mongo — do not create_index("_id")
         shared_db["skills"].create_index("name", unique=True)
         shared_db["settings"].create_index("key", unique=True)
         shared_db["knowledge"].create_index("key", unique=True)
