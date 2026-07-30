@@ -4609,37 +4609,7 @@ def cmd_storage(args):
         print(_json.dumps(counts, indent=2))
         return
 
-    if sub == "seed":
-        if not is_mongo_mode():
-            print("Error: enable Mongo mode first (hermes db connect / bootstrap.yaml)")
-            raise SystemExit(1)
-        from hermes_storage.skills_sync import (
-            seed_profile_defaults_if_empty,
-            seed_shared_skills_if_empty,
-            sync_skills_from_mongo,
-        )
-
-        storage = get_storage(force=True)
-        home = get_hermes_home()
-        force = bool(getattr(args, "force", False))
-        if force:
-            # Force re-upload local skills even if Mongo already has some
-            from hermes_storage.local.migrate import export_local_home, import_payload_to_storage
-
-            payload = export_local_home(home)
-            counts = import_payload_to_storage(storage, payload)
-            print("Force-seeded from local home:")
-            print(_json.dumps(counts, indent=2))
-        else:
-            skills = seed_shared_skills_if_empty(storage, home=home)
-            print(_json.dumps({"skills": skills}, indent=2))
-            prof = seed_profile_defaults_if_empty(storage, home=home)
-            print(_json.dumps({"profile": prof}, indent=2, default=str))
-        sync_skills_from_mongo()
-        print(f"Cache: {get_hermes_home() / 'cache' / 'skills'}")
-        return
-
-    print("usage: hermes storage <status|migrate|seed|init-bootstrap>")
+    print("usage: hermes storage <status|migrate|init-bootstrap>")
 
 
 def cmd_cluster(args):
@@ -4665,7 +4635,14 @@ def cmd_cluster(args):
         state = storage.activate(args.target, reason=getattr(args, "reason", None) or "cli")
         print(_json.dumps({"ok": True, "state": state}, indent=2, default=str))
         return
-    print("usage: hermes cluster <status|activate>")
+    if sub == "prune":
+        older = float(getattr(args, "older_than", None) or 300)
+        deleted = storage.cluster.prune_stale_nodes(older_than_s=older)
+        # Keep this process's node registered
+        storage.register_presence()
+        print(_json.dumps({"ok": True, "deleted": deleted, "older_than_s": older}, indent=2))
+        return
+    print("usage: hermes cluster <status|activate|prune>")
 
 
 def cmd_machine(args):

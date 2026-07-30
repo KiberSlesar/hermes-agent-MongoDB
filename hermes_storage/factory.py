@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import socket
-import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -46,6 +45,11 @@ class HermesStorage:
         merged = deep_merge(merged, profile)
         overlay = self.machines.get_overlay(self.machine_id)
         return deep_merge(merged, overlay)
+
+    def load_profile_config(self) -> dict:
+        """Raw profile config document (no machine overlay)."""
+        doc = self.config.get("default") or {}
+        return doc if isinstance(doc, dict) else {}
 
     def save_profile_config(self, config: dict) -> None:
         from hermes_storage.overlay import strip_machine_local
@@ -136,7 +140,8 @@ def _build_storage(boot: BootstrapConfig) -> HermesStorage:
     ensure_indexes(shared, profile)
 
     machine_id = compute_machine_id(override=boot.machine_id)
-    node_id = f"{machine_id}-{uuid.uuid4().hex[:8]}"
+    # Stable per machine — random suffix caused duplicate ghost nodes on every restart
+    node_id = machine_id
 
     return HermesStorage(
         bootstrap=boot,

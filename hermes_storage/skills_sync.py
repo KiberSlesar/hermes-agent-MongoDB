@@ -135,9 +135,13 @@ def seed_profile_defaults_if_empty(
     home = Path(home) if home else get_hermes_home()
 
     # Only import "identity" bits if profile looks empty
-    cfg = st.load_profile_config() or {}
-    soul = st.load_soul() or ""
-    if cfg or soul.strip():
+    cfg = {}
+    if hasattr(st, "load_profile_config"):
+        cfg = st.load_profile_config() or {}
+    elif hasattr(st, "config"):
+        cfg = st.config.get("default") or {}
+    soul = st.load_soul() if hasattr(st, "load_soul") else ""
+    if cfg or (soul or "").strip():
         return {"skipped": 1, "reason": "profile_already_set"}
 
     payload = export_local_home(home)

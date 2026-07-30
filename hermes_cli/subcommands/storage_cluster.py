@@ -24,17 +24,6 @@ def build_storage_parser(subparsers, *, cmd_storage: Callable) -> None:
     )
     migrate.set_defaults(func=cmd_storage)
 
-    seed = storage_sub.add_parser(
-        "seed",
-        help="Seed Mongo from local install if shared skills/profile are empty",
-    )
-    seed.add_argument(
-        "--force",
-        action="store_true",
-        help="Re-upload everything from local $HERMES_HOME even if Mongo already has data",
-    )
-    seed.set_defaults(func=cmd_storage)
-
     status = storage_sub.add_parser("status", help="Show Mongo storage status")
     status.set_defaults(func=cmd_storage)
 
@@ -71,6 +60,15 @@ def build_cluster_parser(subparsers, *, cmd_cluster: Callable) -> None:
     act.add_argument("target", help="node_id, machine_id, or hostname")
     act.add_argument("--reason", default="cli")
     act.set_defaults(func=cmd_cluster)
+
+    prune = cluster_sub.add_parser("prune", help="Delete stale offline cluster nodes")
+    prune.add_argument(
+        "--older-than",
+        type=float,
+        default=300,
+        help="Seconds since last heartbeat (default 300)",
+    )
+    prune.set_defaults(func=cmd_cluster)
 
 
 def build_machine_parser(subparsers, *, cmd_machine: Callable) -> None:

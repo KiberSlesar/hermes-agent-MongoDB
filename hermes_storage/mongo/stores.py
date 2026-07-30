@@ -539,3 +539,14 @@ class MongoClusterStore(ClusterStore):
             {"node_id": node_id},
             {"$set": {"status": "offline", "updated_at": utcnow()}},
         )
+
+    def prune_stale_nodes(self, *, older_than_s: float = 300.0) -> int:
+        """Delete nodes whose last heartbeat is older than the cutoff."""
+        cutoff = utcnow() - timedelta(seconds=older_than_s)
+        result = self._nodes.delete_many({
+            "$or": [
+                {"heartbeat_at": {"$lt": cutoff}},
+                {"heartbeat_at": {"$exists": False}},
+            ]
+        })
+        return int(result.deleted_count or 0)
