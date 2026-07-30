@@ -32,7 +32,7 @@ if ! command -v mongod >/dev/null 2>&1; then
 fi
 
 command -v mongod >/dev/null || die "mongod not found after install"
-command -v mongosh >/dev/null || warn_mongosh() { echo "WARNING: mongosh missing — install mongodb-mongosh"; }
+command -v mongosh >/dev/null || echo "WARNING: mongosh missing — install mongodb-mongosh"
 
 # Data dirs under control-plane home (not /var — easier perms for hermes user)
 DATA="$ROOT/data/mongo"

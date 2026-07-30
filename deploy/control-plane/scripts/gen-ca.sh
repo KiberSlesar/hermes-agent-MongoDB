@@ -24,11 +24,13 @@ openssl req -new -key mongo-server.key \
   -subj "/O=Hermes/OU=Mongo/CN=hermes-mongo" \
   -out mongo-server.csr
 
-cat > mongo-server.ext <<'EOF'
+# Optional: HERMES_CERT_EXTRA_SAN="IP:10.0.0.5,DNS:db.lan"
+EXTRA_SAN="${HERMES_CERT_EXTRA_SAN:+,${HERMES_CERT_EXTRA_SAN}}"
+cat > mongo-server.ext <<EOF
 basicConstraints=CA:FALSE
 keyUsage=digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth,clientAuth
-subjectAltName=DNS:localhost,DNS:mongo1,DNS:mongo2,DNS:mongo3,DNS:hermes-mongo1,DNS:hermes-mongo2,DNS:hermes-mongo3,IP:127.0.0.1
+subjectAltName=DNS:localhost,DNS:hermes-mongo,IP:127.0.0.1${EXTRA_SAN}
 EOF
 
 openssl x509 -req -in mongo-server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \

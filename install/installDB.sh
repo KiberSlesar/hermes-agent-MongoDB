@@ -94,7 +94,7 @@ MONGO_ROOT_PASSWORD=$(openssl rand -hex 16)
 HERMES_ENROLL_TOKEN=$(openssl rand -hex 24)
 HERMES_MONGO_PORT=27017
 HERMES_MONGO_HOSTS=${HERMES_MONGO_HOSTS:-${LAN}:27017}
-HERMES_MONGO_RS_HOST=127.0.0.1:27017
+HERMES_MONGO_RS_HOST=${LAN}:27017
 HERMES_ORCHESTRATOR_URL=https://${LAN}:8744
 HERMES_REPLICA_SET=rs0
 EOF
@@ -105,14 +105,9 @@ else
 fi
 set -a && source "$HERMES_DB_HOME/.env" && set +a
 
-# Patch CA SAN for this LAN IP (regenerate if missing)
 say "Generating CA / server certificates…"
-# Expand SAN with LAN IP for preferTLS
-if [[ -f "$HERMES_DB_HOME/scripts/gen-ca.sh" ]]; then
-  # Force regen if no certs yet
-  bash "$HERMES_DB_HOME/scripts/gen-ca.sh"
-  # If LAN not in existing cert, leave as-is (preferTLS + allowConnectionsWithoutCertificates for local admin)
-fi
+export HERMES_CERT_EXTRA_SAN="IP:${LAN}"
+bash "$HERMES_DB_HOME/scripts/gen-ca.sh"
 
 say "Installing native MongoDB…"
 bash "$HERMES_DB_HOME/scripts/install-mongo-native.sh"
