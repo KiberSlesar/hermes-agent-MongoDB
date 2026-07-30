@@ -257,6 +257,12 @@ exec "$(cd "$(dirname "$0")" && pwd)/scripts/agent-add.sh" "$@"
 EOF
 chmod +x "$HERMES_DB_HOME/agent-add"
 
+cat > "$HERMES_DB_HOME/agents" <<'EOF'
+#!/usr/bin/env bash
+exec "$(cd "$(dirname "$0")" && pwd)/scripts/agents.sh" "$@"
+EOF
+chmod +x "$HERMES_DB_HOME/agents"
+
 if [[ "$MODE" != "lo" ]]; then
   warn "If agents are remote, open ports 27017, 8743, 8744 (ufw allow …)."
 fi
@@ -270,6 +276,7 @@ echo "  Mongo        : ${HERMES_MONGO_HOSTS}"
 echo "  Enroll       : http://${ADVERTISE_HOST}:8743"
 echo "  Orchestrator : https://${ADVERTISE_HOST}:8744  (mTLS)"
 echo "  Status       : systemctl --user status hermes-mongod hermes-enroll hermes-orchestrator"
+echo "  Agents       : $HERMES_DB_HOME/agents"
 echo ""
 
 if [[ "$SKIP_CONNECT" == "1" ]]; then
