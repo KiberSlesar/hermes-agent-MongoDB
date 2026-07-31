@@ -21,14 +21,15 @@ SKIP_CONNECT="${HERMES_SKIP_CONNECT:-0}"
 FORCE_CONNECT=0
 ENROLL_HOST=""
 ENROLL_CODE=""
-SKIP_HERMES_BASE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --connect) FORCE_CONNECT=1; shift ;;
     --host) ENROLL_HOST="$2"; shift 2 ;;
     --code) ENROLL_CODE="$2"; shift 2 ;;
-    --skip-base) SKIP_HERMES_BASE=1; shift ;;
+    # Kept as a compatibility no-op: this installer is self-contained and
+    # never invokes the upstream Hermes installer.
+    --skip-base) shift ;;
     --hermes-home) HERMES_HOME_DIR="$2"; shift 2 ;;
     -h|--help)
       sed -n '2,20p' "$0" 2>/dev/null || true
@@ -78,15 +79,6 @@ command -v python3 >/dev/null || die "python3 is required"
 mkdir -p "$HERMES_HOME_DIR/certs"
 export HERMES_HOME="$HERMES_HOME_DIR"
 
-# Optional base deps (browser tools etc.) вЂ” ignore if hermes already present
-if [[ $SKIP_HERMES_BASE -eq 0 ]] && ! command -v hermes >/dev/null 2>&1; then
-  say "Installing Hermes base runtime (for deps)вЂ¦"
-  curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup || \
-    curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --skip-setup || \
-    warn "Base installer failed вЂ” continuing with Mongo overlay only"
-  export PATH="${HOME}/.local/bin:${PATH}"
-fi
-
 AGENT_DIR="$HERMES_HOME_DIR/hermes-agent"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -106,12 +98,6 @@ if [[ -d "$AGENT_DIR" ]]; then
 fi
 mkdir -p "$(dirname "$AGENT_DIR")"
 mv "$SRC" "$AGENT_DIR"
-
-# Prefer upstream sealed venv if present (has deps); else create local venv
-UPSTREAM_VENV=""
-for cand in /usr/local/lib/hermes-agent/venv "$HOME/.local/lib/hermes-agent/venv"; do
-  [[ -x "$cand/bin/python" ]] && UPSTREAM_VENV="$cand" && break
-done
 
 ensure_venv_support() {
   if python3 -c "import ensurepip" 2>/dev/null; then
@@ -181,11 +167,7 @@ PY_BASE="$(pick_python | tail -n1 | tr -d '\r')"
 [[ -n "$PY_BASE" ]] || PY_BASE="python3"
 say "Using interpreter: $PY_BASE ($(py_majmin "$PY_BASE"))"
 
-if [[ -n "$UPSTREAM_VENV" ]]; then
-  "$UPSTREAM_VENV/bin/pip" install -e "$AGENT_DIR" -q || \
-    "$UPSTREAM_VENV/bin/pip" install -e "$AGENT_DIR"
-  PY="$UPSTREAM_VENV/bin/python"
-elif command -v uv >/dev/null 2>&1; then
+if command -v uv >/dev/null 2>&1; then
   (cd "$AGENT_DIR" && uv venv .venv --python "$PY_BASE" && uv pip install -e .)
   PY="$AGENT_DIR/.venv/bin/python"
 elif ensure_venv_support && "$PY_BASE" -m venv "$AGENT_DIR/.venv"; then
@@ -251,11 +233,6 @@ fi
 # Also force /usr/local/bin/hermes even if not currently on PATH resolution quirks
 if [[ -e /usr/local/bin/hermes ]] || [[ -d /usr/local/bin ]]; then
   install_mongo_launcher /usr/local/bin/hermes || true
-fi
-
-# If we installed into upstream venv, replace its entrypoint too
-if [[ -n "$UPSTREAM_VENV" && -d "$UPSTREAM_VENV/bin" ]]; then
-  install_mongo_launcher "$UPSTREAM_VENV/bin/hermes"
 fi
 
 export PATH="$HERMES_HOME_DIR/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
