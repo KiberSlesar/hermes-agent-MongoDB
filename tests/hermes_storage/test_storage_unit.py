@@ -270,6 +270,57 @@ def test_mongo_adapter_unknown_method_fail_loud():
         adapter.totally_fake_method_xyz()
 
 
+def test_mongo_adapter_cleans_only_empty_ended_sessions():
+    """The Dashboard empty-session controls must work in Mongo mode."""
+    from hermes_storage.session_bridge import MongoSessionAdapter
+
+    class Result:
+        deleted_count = 1
+
+    class Sessions:
+        def __init__(self):
+            self.updated = None
+            self.deleted = None
+
+        def aggregate(self, pipeline):
+            if pipeline[-1] == {"$count": "count"}:
+                return [{"count": 1}]
+            return [{"session_id": "empty-ended"}]
+
+        def update_many(self, query, update):
+            self.updated = (query, update)
+
+        def delete_many(self, query):
+            self.deleted = query
+            return Result()
+
+    class Messages:
+        name = "messages"
+
+        def __init__(self):
+            self.deleted = None
+
+        def delete_many(self, query):
+            self.deleted = query
+
+    class Store:
+        _sessions = Sessions()
+        _messages = Messages()
+
+    adapter = object.__new__(MongoSessionAdapter)
+    adapter._store = Store()
+
+    assert adapter.count_empty_sessions() == 1
+    assert adapter.delete_empty_sessions() == 1
+    assert adapter._store._sessions.updated == (
+        {"parent_session_id": {"$in": ["empty-ended"]}},
+        {"$set": {"parent_session_id": None}},
+    )
+    assert adapter._store._messages.deleted == {
+        "session_id": {"$in": ["empty-ended"]}
+    }
+
+
 def test_fail_hard_unreachable_uri(monkeypatch, tmp_path):
     from hermes_storage import MongoStorageError
     from hermes_storage.bootstrap import reset_bootstrap_cache

@@ -130,6 +130,75 @@ class MongoSessionAdapter:
             counts[src] = counts.get(src, 0) + 1
         return counts
 
+    def _empty_sessions_pipeline(self) -> List[Dict[str, Any]]:
+        """Build the Mongo aggregation shared by empty-session operations."""
+        message_collection = getattr(self._store._messages, "name", "messages")
+        return [
+            {
+                "$match": {
+                    "ended_at": {"$exists": True, "$ne": None},
+                    "archived": {"$ne": True},
+                }
+            },
+            {
+                "$lookup": {
+                    "from": message_collection,
+                    "let": {"session_id": "$session_id"},
+                    "pipeline": [
+                        {
+                            "$match": {
+                                "$expr": {
+                                    "$eq": ["$session_id", "$$session_id"]
+                                }
+                            }
+                        },
+                        {"$limit": 1},
+                    ],
+                    "as": "_messages",
+                }
+            },
+            {"$match": {"_messages": {"$eq": []}}},
+        ]
+
+    def _empty_session_ids(self) -> List[str]:
+        """Return ended, non-archived sessions without persisted messages."""
+        pipeline = self._empty_sessions_pipeline() + [
+            {"$project": {"_id": 0, "session_id": 1}},
+        ]
+        return [
+            str(row["session_id"])
+            for row in self._store._sessions.aggregate(pipeline)
+            if row.get("session_id")
+        ]
+
+    def count_empty_sessions(self) -> int:
+        """Count ended, non-archived sessions with no persisted messages."""
+        rows = self._store._sessions.aggregate(
+            self._empty_sessions_pipeline() + [{"$count": "count"}]
+        )
+        return int(next(iter(rows), {}).get("count", 0))
+
+    def delete_empty_sessions(self, sessions_dir: Optional[Path] = None) -> int:
+        """Delete empty ended sessions while preserving children and archives."""
+        session_ids = self._empty_session_ids()
+        if not session_ids:
+            return 0
+
+        # Keep descendants, matching SessionDB's bulk-delete semantics.
+        self._store._sessions.update_many(
+            {"parent_session_id": {"$in": session_ids}},
+            {"$set": {"parent_session_id": None}},
+        )
+        self._store._messages.delete_many({"session_id": {"$in": session_ids}})
+        result = self._store._sessions.delete_many(
+            {
+                "session_id": {"$in": session_ids},
+                "ended_at": {"$exists": True, "$ne": None},
+                "archived": {"$ne": True},
+            }
+        )
+        return int(result.deleted_count)
+
     def message_count(self, session_id: str = None) -> int:
         if session_id:
             return len(self._store.get_messages(session_id, include_inactive=True))

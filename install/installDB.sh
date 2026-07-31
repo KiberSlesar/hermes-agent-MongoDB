@@ -267,6 +267,24 @@ exec "$ROOT/scripts/agents.sh" "$@"
 EOF
 chmod +x "$HERMES_DB_HOME/agents"
 
+install_control_command() {
+  local name="$1" target="$2" destination="/usr/local/bin/$1"
+  if [[ -w /usr/local/bin ]]; then
+    ln -sfn "$target" "$destination"
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo ln -sfn "$target" "$destination"
+    return 0
+  fi
+  mkdir -p "$HOME/.local/bin"
+  ln -sfn "$target" "$HOME/.local/bin/$name"
+  warn "Installed $name in ~/.local/bin; add it to PATH before opening a new shell."
+}
+
+install_control_command agent-add "$HERMES_DB_HOME/agent-add"
+install_control_command agents "$HERMES_DB_HOME/agents"
+
 if [[ "$MODE" != "lo" ]]; then
   warn "If agents are remote, open ports 27017, 8743, 8744 (ufw allow …)."
 fi
@@ -280,16 +298,17 @@ echo "  Mongo        : ${HERMES_MONGO_HOSTS}"
 echo "  Enroll       : http://${ADVERTISE_HOST}:8743"
 echo "  Orchestrator : https://${ADVERTISE_HOST}:8744  (mTLS)"
 echo "  Status       : systemctl --user status hermes-mongod hermes-enroll hermes-orchestrator"
-echo "  Agents       : $HERMES_DB_HOME/agents"
+echo "  Agents       : agents"
+echo "  Add agent    : agent-add [name]"
 echo ""
 
 if [[ "$SKIP_CONNECT" == "1" ]]; then
-  echo "Next: $HERMES_DB_HOME/agent-add"
+  echo "Next: agent-add"
   exit 0
 fi
 
 if ! can_prompt; then
-  warn "No TTY for prompts — run: $HERMES_DB_HOME/agent-add"
+  warn "No TTY for prompts — run: agent-add"
   exit 0
 fi
 
@@ -300,5 +319,5 @@ if [[ "$ans" =~ ^[Yy] ]]; then
   exit 0
 fi
 
-echo "Later: $HERMES_DB_HOME/agent-add"
+echo "Later: agent-add"
 echo ""
