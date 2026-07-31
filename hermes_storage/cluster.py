@@ -221,6 +221,30 @@ def _maybe_handle_handoff(storage: Any) -> None:
             storage.cluster.rollback_messaging_handoff(reason=str(exc))
             return
         storage.cluster.mark_messaging_released(node_id)
+        state = storage.cluster.get_state()
+        handoff = state.get("handoff_state")
+
+    # Dead source never runs the release path — force-release so the target
+    # can acquire (VM powered off, process killed, etc.).
+    if handoff == "releasing":
+        source_id = state.get("handoff_from")
+        target_id = state.get("handoff_to")
+        if source_id and source_id != node_id:
+            nodes = {
+                n["node_id"]: n
+                for n in storage.cluster.list_nodes(online_within_s=45.0)
+            }
+            source = nodes.get(source_id) or {}
+            if not source.get("online"):
+                logger.warning(
+                    "Handoff source %s is offline; force-releasing messaging "
+                    "lease toward %s",
+                    source_id,
+                    target_id,
+                )
+                storage.cluster.mark_messaging_released(source_id)
+                state = storage.cluster.get_state()
+                handoff = state.get("handoff_state")
 
     if handoff == "acquiring" and state.get("handoff_to") == node_id:
         cb = _ACQUIRE_CB
@@ -293,6 +317,9 @@ def _maybe_failover(storage: Any) -> None:
             target["node_id"],
         )
         storage.cluster.set_active(target["node_id"], reason="failover")
+        # Failover uses set_active directly (not HermesStorage.activate), so
+        # kick the local gateway here — otherwise handoff stalls without CB.
+        ensure_local_gateway_service()
 
 
 def register_messaging_callbacks(

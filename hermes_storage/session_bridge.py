@@ -273,16 +273,79 @@ class MongoSessionAdapter:
         return messages
 
     def get_messages_as_conversation(self, session_id: str, **kwargs):
-        messages = self.get_messages(session_id)
+        include_ancestors = bool(kwargs.get("include_ancestors"))
+        repair_alternation = bool(kwargs.get("repair_alternation"))
+        include_row_ids = bool(kwargs.get("include_row_ids"))
+
+        session_ids = (
+            self._session_lineage_root_to_tip(session_id)
+            if include_ancestors
+            else [session_id]
+        )
         conversation = []
-        for m in messages:
-            item = {"role": m.get("role"), "content": m.get("content")}
-            if m.get("tool_calls"):
-                item["tool_calls"] = m["tool_calls"]
-            if m.get("tool_call_id"):
-                item["tool_call_id"] = m["tool_call_id"]
-            conversation.append(item)
+        for sid in session_ids:
+            for m in self.get_messages(sid):
+                item = {"role": m.get("role"), "content": m.get("content")}
+                if m.get("tool_calls"):
+                    item["tool_calls"] = m["tool_calls"]
+                if m.get("tool_call_id"):
+                    item["tool_call_id"] = m["tool_call_id"]
+                if m.get("name"):
+                    item["name"] = m["name"]
+                if m.get("reasoning"):
+                    item["reasoning"] = m["reasoning"]
+                if include_row_ids and m.get("id") is not None:
+                    item["_row_id"] = m["id"]
+                conversation.append(item)
+
+        if repair_alternation and conversation:
+            try:
+                from agent.agent_runtime_helpers import repair_message_sequence
+
+                repair_message_sequence(None, conversation)
+            except Exception:
+                logger.debug(
+                    "Mongo resume alternation repair skipped", exc_info=True
+                )
         return conversation
+
+    def _session_lineage_root_to_tip(self, session_id: str) -> List[str]:
+        """Walk parent_session_id links from tip up to root, return root→tip."""
+        if not session_id:
+            return [session_id]
+        chain: List[str] = []
+        current = session_id
+        seen = set()
+        for _ in range(64):
+            if not current or current in seen:
+                break
+            seen.add(current)
+            chain.append(current)
+            sess = self.get_session(current) or {}
+            parent = sess.get("parent_session_id")
+            if not parent:
+                break
+            current = str(parent)
+        chain.reverse()
+        return chain or [session_id]
+
+    def get_resume_conversations(self, session_id: str):
+        """Return ``(model_history, display_history)`` for CLI/TUI resume.
+
+        Matches ``SessionDB.get_resume_conversations`` contract used by
+        ``_preload_resumed_session``.
+        """
+        tip = self.resolve_resume_session_id(session_id) or session_id
+        model_history = self.get_messages_as_conversation(
+            tip, repair_alternation=True, include_row_ids=True
+        )
+        display_history = self.get_messages_as_conversation(
+            tip,
+            include_ancestors=True,
+            repair_alternation=False,
+            include_row_ids=True,
+        )
+        return model_history, display_history
 
     def get_messages_around(
         self, session_id: str, around_message_id: int, window: int = 10, **kwargs
@@ -484,9 +547,6 @@ class MongoSessionAdapter:
             if m:
                 max_num = max(max_num, int(m.group(1)))
         return f"{base} #{max_num + 1}" if existing else base
-
-    def get_resume_conversations(self, **kwargs) -> List[Dict[str, Any]]:
-        return self.list_sessions_rich(limit=kwargs.get("limit", 50))
 
     def get_telegram_topic_binding(self, *args, **kwargs) -> Optional[Dict[str, Any]]:
         key = ":".join(str(a) for a in args) if args else str(kwargs)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,6 +24,48 @@ def test_mongo_session_doc_uses_sessiondb_timestamp_shape():
     assert row["started_at"] == moment.timestamp()
     assert row["updated_at"] == moment.timestamp()
     assert row["last_active"] == moment.timestamp()
+
+
+def test_mongo_get_resume_conversations_accepts_session_id():
+    """CLI resume passes session_id positionally and unpacks a 2-tuple."""
+    from hermes_storage.session_bridge import MongoSessionAdapter
+
+    class _Store:
+        def get_session(self, session_id):
+            return {"session_id": session_id}
+
+        def get_messages(self, session_id, include_inactive=False):
+            return [
+                {
+                    "session_id": session_id,
+                    "role": "user",
+                    "content": "hi",
+                    "message_index": 0,
+                    "active": True,
+                },
+                {
+                    "session_id": session_id,
+                    "role": "assistant",
+                    "content": "hello",
+                    "message_index": 1,
+                    "active": True,
+                },
+            ]
+
+        def list_sessions(self, **_kwargs):
+            return []
+
+    adapter = MongoSessionAdapter.__new__(MongoSessionAdapter)
+    adapter._store = _Store()
+    adapter._storage = type("S", (), {})()
+    adapter._message_state_cache = {}
+    adapter._lock = threading.Lock()
+    adapter._mongo_mode = True
+
+    model_history, display_history = adapter.get_resume_conversations("sess-1")
+    assert isinstance(model_history, list) and isinstance(display_history, list)
+    assert model_history[0]["role"] == "user"
+    assert display_history[-1]["content"] == "hello"
 
 
 def test_peer_cert_cn():

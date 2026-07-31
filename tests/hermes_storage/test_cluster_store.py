@@ -244,3 +244,56 @@ def test_acquiring_without_gateway_callback_starts_service_and_waits(monkeypatch
     cluster_module._maybe_handle_handoff(storage)
 
     assert calls == ["start"]
+
+
+def test_force_release_when_handoff_source_is_offline(monkeypatch):
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def __init__(self):
+            self.state = {
+                "handoff_state": "releasing",
+                "handoff_from": "dead",
+                "handoff_to": "alive",
+            }
+            self.released = []
+
+        def get_state(self):
+            return dict(self.state)
+
+        def list_nodes(self, **_kwargs):
+            return [
+                {"node_id": "dead", "online": False},
+                {"node_id": "alive", "online": True},
+            ]
+
+        def mark_messaging_released(self, node_id):
+            self.released.append(node_id)
+            self.state = {
+                "handoff_state": "acquiring",
+                "handoff_from": "dead",
+                "handoff_to": "alive",
+                "messaging_owner": None,
+            }
+
+        def complete_messaging_handoff(self, node_id):
+            self.state = {
+                "handoff_state": "idle",
+                "messaging_owner": node_id,
+                "active_node_id": node_id,
+            }
+
+    cluster = Cluster()
+    monkeypatch.setattr(cluster_module, "_ACQUIRE_CB", lambda: True)
+    monkeypatch.setattr(cluster_module, "_RELEASE_CB", None)
+    monkeypatch.setattr(cluster_module, "_NOTIFY_CB", None)
+    storage = type("Storage", (), {
+        "node_id": "alive",
+        "machine_id": "alive-pc",
+        "cluster": cluster,
+    })()
+
+    cluster_module._maybe_handle_handoff(storage)
+
+    assert cluster.released == ["dead"]
+    assert cluster.state["messaging_owner"] == "alive"
