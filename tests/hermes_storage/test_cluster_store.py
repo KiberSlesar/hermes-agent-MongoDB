@@ -297,3 +297,57 @@ def test_force_release_when_handoff_source_is_offline(monkeypatch):
 
     assert cluster.released == ["dead"]
     assert cluster.state["messaging_owner"] == "alive"
+
+
+def test_reconcile_connects_when_owner_but_adapters_not_held(monkeypatch):
+    """Passive gateway that missed acquiring still connects once it is owner."""
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def get_state(self):
+            return {
+                "handoff_state": "idle",
+                "messaging_owner": "win",
+                "active_node_id": "win",
+            }
+
+    calls = []
+    monkeypatch.setattr(cluster_module, "_LOCAL_MESSAGING_HELD", False)
+    monkeypatch.setattr(cluster_module, "_ACQUIRE_CB", lambda: calls.append("acquire") or True)
+    monkeypatch.setattr(cluster_module, "_RELEASE_CB", None)
+    storage = type("Storage", (), {
+        "node_id": "win",
+        "machine_id": "win-pc",
+        "cluster": Cluster(),
+    })()
+
+    cluster_module._maybe_reconcile_messaging(storage)
+
+    assert calls == ["acquire"]
+    assert cluster_module._LOCAL_MESSAGING_HELD is True
+
+
+def test_reconcile_skips_when_not_owner(monkeypatch):
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def get_state(self):
+            return {
+                "handoff_state": "idle",
+                "messaging_owner": "linux",
+                "active_node_id": "linux",
+            }
+
+    calls = []
+    monkeypatch.setattr(cluster_module, "_LOCAL_MESSAGING_HELD", False)
+    monkeypatch.setattr(cluster_module, "_ACQUIRE_CB", lambda: calls.append("acquire") or True)
+    storage = type("Storage", (), {
+        "node_id": "win",
+        "machine_id": "win-pc",
+        "cluster": Cluster(),
+    })()
+
+    cluster_module._maybe_reconcile_messaging(storage)
+
+    assert calls == []
+    assert cluster_module._LOCAL_MESSAGING_HELD is False

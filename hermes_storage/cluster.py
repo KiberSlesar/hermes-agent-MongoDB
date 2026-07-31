@@ -17,6 +17,10 @@ _RUNTIME_STATE_CB: Optional[Callable[[], dict[str, Any]]] = None
 _RELEASE_CB: Optional[Callable[[], None]] = None
 _ACQUIRE_CB: Optional[Callable[[], bool]] = None
 _NOTIFY_CB: Optional[Callable[[str], None]] = None
+# True after a successful local acquire (or when release has not cleared it).
+# Used so a gateway that started deferred can connect once it becomes owner
+# even if handoff_state is already idle (missed the acquiring tick).
+_LOCAL_MESSAGING_HELD: bool = False
 
 # Platforms that stay up on every fleet node (not Telegram/Discord lease).
 NON_MESSAGING_PLATFORMS = frozenset({"api_server", "local", "webhook"})
@@ -170,6 +174,7 @@ def start_heartbeat_loop(
                 except Exception as orch_exc:
                     logger.debug("Orchestrator heartbeat skipped: %s", orch_exc)
                 _maybe_handle_handoff(storage)
+                _maybe_reconcile_messaging(storage)
                 _maybe_failover(storage)
             except Exception as exc:
                 logger.warning("Cluster heartbeat failed: %s", exc)
@@ -187,6 +192,7 @@ def stop_heartbeat_loop() -> None:
 
 def _maybe_handle_handoff(storage: Any) -> None:
     """Drive messaging lease release/acquire via gateway callbacks."""
+    global _LOCAL_MESSAGING_HELD
     state = storage.cluster.get_state()
     handoff = state.get("handoff_state")
     node_id = storage.node_id
@@ -209,6 +215,7 @@ def _maybe_handle_handoff(storage: Any) -> None:
         if cb is None:
             # No local gateway — treat messaging as already released so the
             # target can acquire.
+            _LOCAL_MESSAGING_HELD = False
             logger.info(
                 "No local messaging gateway; marking release complete for handoff"
             )
@@ -247,49 +254,96 @@ def _maybe_handle_handoff(storage: Any) -> None:
                 handoff = state.get("handoff_state")
 
     if handoff == "acquiring" and state.get("handoff_to") == node_id:
-        cb = _ACQUIRE_CB
-        if cb is None:
-            # Becoming active without a live gateway: start it and wait for
-            # the next heartbeat once acquire callbacks are registered.
-            info = ensure_local_gateway_service()
-            logger.info(
-                "Active agent handoff waiting for local gateway acquire "
-                "(auto-start=%s already_running=%s)",
-                info.get("started"),
-                info.get("already_running"),
-            )
-            return
-        ok = True
-        err = None
-        try:
-            ok = bool(cb())
-        except Exception as exc:
-            ok = False
-            err = str(exc)
-        if ok:
-            storage.cluster.complete_messaging_handoff(node_id)
-            notify = _NOTIFY_CB
-            if notify:
-                try:
-                    notify(
-                        f"Active Hermes agent switched to this machine "
-                        f"({storage.machine_id}). Messaging gateway is here now."
-                    )
-                except Exception:
-                    pass
-        else:
-            storage.cluster.rollback_messaging_handoff(
-                reason=err or "messaging health-check failed"
-            )
-            notify = _NOTIFY_CB
-            if notify:
-                try:
-                    notify(
-                        f"Failed to move messaging gateway here "
-                        f"({err or 'health-check failed'}). Rolled back."
-                    )
-                except Exception:
-                    pass
+        _run_acquire_for_handoff(storage, node_id)
+
+
+def _run_acquire_for_handoff(storage: Any, node_id: str) -> None:
+    """Complete an in-progress acquiring handoff via the gateway callback."""
+    global _LOCAL_MESSAGING_HELD
+    cb = _ACQUIRE_CB
+    if cb is None:
+        # Becoming active without a live gateway: start it and wait for
+        # the next heartbeat once acquire callbacks are registered.
+        info = ensure_local_gateway_service()
+        logger.info(
+            "Active agent handoff waiting for local gateway acquire "
+            "(auto-start=%s already_running=%s)",
+            info.get("started"),
+            info.get("already_running"),
+        )
+        return
+    ok = True
+    err = None
+    try:
+        ok = bool(cb())
+    except Exception as exc:
+        ok = False
+        err = str(exc)
+    if ok:
+        _LOCAL_MESSAGING_HELD = True
+        storage.cluster.complete_messaging_handoff(node_id)
+        notify = _NOTIFY_CB
+        if notify:
+            try:
+                notify(
+                    f"Active Hermes agent switched to this machine "
+                    f"({storage.machine_id}). Messaging gateway is here now."
+                )
+            except Exception:
+                pass
+    else:
+        _LOCAL_MESSAGING_HELD = False
+        storage.cluster.rollback_messaging_handoff(
+            reason=err or "messaging health-check failed"
+        )
+        notify = _NOTIFY_CB
+        if notify:
+            try:
+                notify(
+                    f"Failed to move messaging gateway here "
+                    f"({err or 'health-check failed'}). Rolled back."
+                )
+            except Exception:
+                pass
+
+
+def _maybe_reconcile_messaging(storage: Any) -> None:
+    """Connect messaging if we already own the lease but never acquired.
+
+    A gateway that started as passive prepares Telegram/Discord deferred.
+    If the lease lands here while handoff_state is already idle (missed
+    acquiring, presence claim, or complete without a live connect), the
+    acquiring branch never runs again — reconnect here.
+    """
+    global _LOCAL_MESSAGING_HELD
+    if _LOCAL_MESSAGING_HELD:
+        return
+    if not should_connect_messaging(storage):
+        return
+    state = storage.cluster.get_state() or {}
+    handoff = state.get("handoff_state") or "idle"
+    if handoff not in (None, "idle", "done"):
+        return
+    if state.get("messaging_owner") != storage.node_id:
+        return
+    cb = _ACQUIRE_CB
+    if cb is None:
+        return
+    logger.info(
+        "This node owns messaging lease but adapters are not held locally; "
+        "connecting deferred messaging platforms"
+    )
+    try:
+        ok = bool(cb())
+    except Exception as exc:
+        logger.warning("Messaging reconcile acquire failed: %s", exc)
+        return
+    if ok:
+        _LOCAL_MESSAGING_HELD = True
+    else:
+        logger.warning(
+            "Messaging reconcile acquire returned failure; will retry next heartbeat"
+        )
 
 
 def _maybe_failover(storage: Any) -> None:
@@ -330,11 +384,24 @@ def register_messaging_callbacks(
     runtime_state: Optional[Callable[[], dict[str, Any]]] = None,
 ) -> None:
     """Gateway registers stop/start/notify hooks for messaging handoff."""
-    global _RELEASE_CB, _ACQUIRE_CB, _NOTIFY_CB, _RUNTIME_STATE_CB
+    global _RELEASE_CB, _ACQUIRE_CB, _NOTIFY_CB, _RUNTIME_STATE_CB, _LOCAL_MESSAGING_HELD
     if on_release is not None:
-        _RELEASE_CB = on_release
+        def _wrapped_release() -> None:
+            global _LOCAL_MESSAGING_HELD
+            try:
+                on_release()
+            finally:
+                _LOCAL_MESSAGING_HELD = False
+
+        _RELEASE_CB = _wrapped_release
     if on_acquire is not None:
-        _ACQUIRE_CB = on_acquire
+        def _wrapped_acquire() -> bool:
+            global _LOCAL_MESSAGING_HELD
+            ok = bool(on_acquire())
+            _LOCAL_MESSAGING_HELD = bool(ok)
+            return ok
+
+        _ACQUIRE_CB = _wrapped_acquire
     if on_notify is not None:
         _NOTIFY_CB = on_notify
     if runtime_state is not None:

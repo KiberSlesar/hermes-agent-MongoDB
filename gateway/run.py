@@ -10253,6 +10253,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if storage is None:
                         return False
                     storage.client.admin.command("ping")
+                    # Allow reconnect after a deferred passive start.
+                    self._mongo_defer_messaging = False
                     any_messaging = False
                     connected_ok = True
                     for platform, platform_config in list(self.config.platforms.items()):
@@ -11041,16 +11043,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         pass
                     # Fall through to the normal "running" state — reconnect
                     # watcher takes it from here.
-                # All enabled platforms had no adapter (missing library or credentials).
-                # In fleet deployments the same config.yaml is shared across nodes that
-                # may only have credentials for a subset of platforms.  Rather than
-                # failing hard, degrade gracefully and allow cron jobs to run (#5196).
-                logger.warning(
-                    "No adapter could be created for any of the %d configured platform(s). "
-                    "Check that required dependencies are installed and credentials are set. "
-                    "Gateway will continue for cron job execution.",
-                    enabled_platform_count,
-                )
+                elif getattr(self, "_mongo_defer_messaging", False) and self.adapters:
+                    # Fleet standby: adapters exist but Telegram/Discord stay
+                    # offline until this node holds the messaging lease.
+                    logger.info(
+                        "Gateway standby — %d messaging adapter(s) deferred "
+                        "until this node is the cluster messaging owner "
+                        "(will connect on activate/failover without restart).",
+                        len(self.adapters),
+                    )
+                else:
+                    # All enabled platforms had no adapter (missing library or credentials).
+                    # In fleet deployments the same config.yaml is shared across nodes that
+                    # may only have credentials for a subset of platforms.  Rather than
+                    # failing hard, degrade gracefully and allow cron jobs to run (#5196).
+                    logger.warning(
+                        "No adapter could be created for any of the %d configured platform(s). "
+                        "Check that required dependencies are installed and credentials are set. "
+                        "Gateway will continue for cron job execution.",
+                        enabled_platform_count,
+                    )
             else:
                 logger.warning("No messaging platforms enabled.")
                 logger.info("Gateway will continue running for cron job execution.")
