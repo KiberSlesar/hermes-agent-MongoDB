@@ -446,6 +446,13 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
             # Skip child / delegation sessions
             if s.get("parent_session_id"):
                 continue
+            last_message_id = None
+            try:
+                msgs = db.get_messages(sid) or []
+                if msgs:
+                    last_message_id = msgs[-1].get("id")
+            except Exception:
+                logging.debug("browse last_message_id lookup failed for %s", sid, exc_info=True)
             results.append({
                 "session_id": sid,
                 "link": _session_link(sid, link_profile),
@@ -455,6 +462,7 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
                 "last_active": s.get("last_active", ""),
                 "message_count": s.get("message_count", 0),
                 "preview": s.get("preview", ""),
+                "last_message_id": last_message_id,
             })
             if len(results) >= limit:
                 break
@@ -464,11 +472,65 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
             "mode": "browse",
             "results": results,
             "count": len(results),
-            "message": f"Showing {len(results)} most recent sessions. Pass a query= to search, or session_id+around_message_id to scroll.",
+            "message": (
+                f"Showing {len(results)} most recent sessions. "
+                "To read a session's recent messages: session_search(session_id=\"...\") "
+                "or session_search(session_id=\"...\", around_message_id=0, window=5) "
+                "for the last N. To scroll the middle: pass a real last_message_id / "
+                "match_message_id as around_message_id."
+            ),
         }, ensure_ascii=False)
     except Exception as e:
         logging.error("Error listing recent sessions: %s", e, exc_info=True)
         return tool_error(f"Failed to list recent sessions: {e}", success=False)
+
+
+def _tail_session(
+    db,
+    session_id: str,
+    *,
+    limit: int = 5,
+    requested_around: int = 0,
+) -> str:
+    """Return the last ``limit`` messages of a session (tail sentinel path)."""
+    try:
+        session_meta = db.get_session(session_id) or {}
+    except Exception as e:
+        logging.debug("get_session failed for %s: %s", session_id, e, exc_info=True)
+        session_meta = {}
+    if not session_meta:
+        return tool_error(f"session_id not found: {session_id}", success=False)
+
+    try:
+        rows = db.get_messages(session_id) or []
+    except Exception as e:
+        logging.error("get_messages failed for tail %s: %s", session_id, e, exc_info=True)
+        return tool_error(f"failed to load messages: {e}", success=False)
+
+    limit = max(1, min(int(limit), 20))
+    tail = rows[-limit:]
+    anchor_id = tail[-1].get("id") if tail else requested_around
+    return json.dumps({
+        "success": True,
+        "mode": "scroll",
+        "session_id": session_id,
+        "around_message_id": requested_around,
+        "tail": True,
+        "session_meta": {
+            "when": _format_timestamp(session_meta.get("started_at")),
+            "source": session_meta.get("source"),
+            "model": session_meta.get("model"),
+            "title": session_meta.get("title"),
+        },
+        "window": limit,
+        "messages": [_shape_message(m, anchor_id=anchor_id) for m in tail],
+        "messages_before": max(0, len(rows) - len(tail)),
+        "messages_after": 0,
+        "message": (
+            f"around_message_id={requested_around} treated as end-of-session "
+            f"sentinel; showing last {len(tail)} message(s)."
+        ),
+    }, ensure_ascii=False)
 
 
 def _scroll(
@@ -483,6 +545,9 @@ def _scroll(
     No FTS5, no bookends — just the slice. The discovery shape's lineage
     fixup is preserved: if the anchor doesn't live in the named session
     but does live in a child session in the same lineage, rebind silently.
+
+    ``around_message_id <= 0`` is a tail sentinel (models often pass 0 when
+    they want the last N messages and have no real id yet).
     """
     if not isinstance(session_id, str) or not session_id.strip():
         return tool_error("scroll requires session_id", success=False)
@@ -500,6 +565,15 @@ def _scroll(
         except (TypeError, ValueError):
             window = 5
     window = max(1, min(window, 20))
+
+    # Sentinel: 0 / negative → last ``window`` messages (not a real row id).
+    if around_message_id <= 0:
+        return _tail_session(
+            db,
+            session_id,
+            limit=window,
+            requested_around=around_message_id,
+        )
 
     # Locate the anchor before applying the current-lineage guard. Discovery
     # intentionally surfaces two kinds of same-lineage history that are no
@@ -1011,19 +1085,23 @@ SESSION_SEARCH_SCHEMA = {
         "context than the ±5 default window.\n"
         "       - To scroll FORWARD: pass messages[-1].id back as around_message_id.\n"
         "       - To scroll BACKWARD: pass messages[0].id back as around_message_id.\n"
+        "       - around_message_id=0 (or any negative) means END of session: returns "
+        "the last `window` messages. Prefer this (or READ) for \"last N messages\".\n"
         "       - The boundary message appears in both windows — orientation marker.\n"
         "       - When messages_before or messages_after is < window, you're at the "
         "start or end of the session.\n\n"
         "  3) READ — pass `session_id` only (no around_message_id):\n"
-        "     session_search(session_id=\"...\", profile=\"work\")\n"
-        "     Dumps the whole session by id (first 20 + last 10 messages when "
-        "large). This is how you resolve an `@session:<profile>/<id>` link the "
-        "user dropped into the chat: split the value on `/` into profile + id "
-        "and call session_search(session_id=id, profile=profile).\n\n"
+        "     session_search(session_id=\"...\")\n"
+        "     Preferred for \"show recent messages from this session\": dumps the "
+        "session (first 20 + last 10 when large). Also used to resolve an "
+        "`@session:<profile>/<id>` link: split on `/` into profile + id and call "
+        "session_search(session_id=id, profile=profile).\n\n"
         "  4) BROWSE — no args:\n"
         "     session_search()\n"
-        "     Returns recent sessions chronologically: titles, previews, timestamps. "
-        "Use when the user asks \"what was I working on\" without naming a topic.\n\n"
+        "     Returns recent sessions chronologically: titles, previews, "
+        "last_message_id, timestamps. Use when the user asks \"what was I working "
+        "on\" without naming a topic. Then READ each session_id (or SCROLL with "
+        "around_message_id=0) — do not invent message ids.\n\n"
         "LINKING THE USER TO A SESSION\n\n"
         "  When you refer the user to a session, write its `link` value inline in "
         "your reply — every result carries one, e.g. "
@@ -1083,25 +1161,26 @@ SESSION_SEARCH_SCHEMA = {
             "session_id": {
                 "type": "string",
                 "description": (
-                    "Scroll shape. Session to read inside. Use the session_id returned "
-                    "from a prior discovery call. Must be paired with "
-                    "around_message_id."
+                    "Session to read. Alone → READ shape (full/head+tail dump). "
+                    "With around_message_id → SCROLL shape. Use a session_id from "
+                    "browse/discovery — never invent one."
                 ),
             },
             "around_message_id": {
                 "type": "integer",
                 "description": (
-                    "Scroll shape. Message id to center the window on. From a discovery "
-                    "result use match_message_id, or any id seen in a prior window. To "
-                    "scroll forward pass the last window message's id; to scroll "
-                    "backward pass the first."
+                    "Scroll shape. Real message id to center on (match_message_id / "
+                    "last_message_id / an id from a prior window). Pass 0 (or negative) "
+                    "for the last `window` messages at end of session. Do not invent "
+                    "other ids."
                 ),
             },
             "window": {
                 "type": "integer",
                 "description": (
-                    "Scroll shape only. Messages to return on each side of the anchor "
-                    "(anchor itself always included). Clamped to [1, 20]. Default 5."
+                    "Scroll shape. With a real anchor: messages on each side "
+                    "(anchor included). With around_message_id=0: how many trailing "
+                    "messages to return. Clamped to [1, 20]. Default 5."
                 ),
                 "default": 5,
             },

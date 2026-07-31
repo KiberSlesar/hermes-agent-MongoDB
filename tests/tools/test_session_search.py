@@ -230,6 +230,26 @@ class TestScrollPattern:
         assert last_id in [m["id"] for m in v1["messages"]]
         assert last_id in [m["id"] for m in v2["messages"]]
 
+    def test_around_message_id_zero_returns_session_tail(self, db):
+        """Models invent around_message_id=0 when they want the last N msgs."""
+        db.create_session("s_tail", source="cli")
+        for i in range(12):
+            db.append_message(
+                "s_tail",
+                role="user" if i % 2 == 0 else "assistant",
+                content=f"tail msg {i}",
+            )
+        result = json.loads(session_search(
+            session_id="s_tail", around_message_id=0, window=5, db=db,
+        ))
+        assert result["success"] is True
+        assert result["mode"] == "scroll"
+        assert result.get("tail") is True
+        assert len(result["messages"]) == 5
+        assert result["messages"][0]["content"] == "tail msg 7"
+        assert result["messages"][-1]["content"] == "tail msg 11"
+        assert result["messages_after"] == 0
+
 
 # =========================================================================
 # Shape precedence
