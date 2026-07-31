@@ -699,9 +699,14 @@ def _recover_renamed_skill(
     return None
 
 
-def sync_skills(quiet: bool = False) -> dict:
+def sync_skills(quiet: bool = False, *, mongo_commit: bool = True) -> dict:
     """
     Sync bundled skills into ~/.hermes/skills/ using the manifest.
+
+    ``mongo_commit``: when True (default) and Mongo mode is on, only skills
+    that were newly copied or updated this run are pushed to Mongo. A full
+    re-upload of the tree is never done here (that caused multi‑MB GridFS
+    traffic on every CLI start). Pass False when the caller seeds Mongo itself.
 
     Returns:
         dict with keys: copied (list), updated (list), skipped (int),
@@ -961,16 +966,34 @@ def sync_skills(quiet: bool = False) -> dict:
     _write_manifest(manifest)
     optional_provenance_backfilled = _backfill_optional_provenance(quiet=quiet)
 
-    try:
-        from hermes_storage.skills_sync import commit_all_skill_trees
+    # Mongo SoT: only push skills that actually changed this run — never
+    # re-upload the entire cache (was saturating the link on every hermes chat).
+    if mongo_commit and (copied or updated):
+        try:
+            from hermes_storage import is_mongo_mode
+            from hermes_storage.skills_sync import commit_skill_tree
 
-        commit_all_skill_trees(_skills_dir())
-    except Exception:
-        # Fail-hard only when mongo mode is on (commit_all raises there).
-        from hermes_storage import is_mongo_mode
+            if is_mongo_mode():
+                root = _skills_dir()
+                for skill_name in list(copied) + list(updated):
+                    # Prefer the relative dest used during sync when present
+                    dest = root / skill_name
+                    # Skills may live under category subdirs — locate SKILL.md
+                    if not (dest / "SKILL.md").is_file():
+                        matches = [
+                            p.parent
+                            for p in root.rglob("SKILL.md")
+                            if p.parent.name == skill_name
+                            and not any(part.startswith(".") for part in p.relative_to(root).parts)
+                        ]
+                        dest = matches[0] if matches else dest
+                    if (dest / "SKILL.md").is_file():
+                        commit_skill_tree(dest, name=skill_name)
+        except Exception:
+            from hermes_storage import is_mongo_mode
 
-        if is_mongo_mode():
-            raise
+            if is_mongo_mode():
+                raise
 
     return {
         "copied": copied,

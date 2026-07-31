@@ -5,9 +5,13 @@ from __future__ import annotations
 import logging
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+# Process-level fingerprint of the last successful Mongo→cache sync.
+# Avoids re-pulling GridFS on every get_skills_dir() within one process.
+_SYNC_ONCE: Optional[str] = None
 
 
 def mongo_skills_cache_dir() -> Path:
@@ -35,13 +39,57 @@ def writable_skills_dir() -> Path:
     return path
 
 
+def invalidate_skills_sync_cache() -> None:
+    """Force the next ``sync_skills_from_mongo`` to re-check the cache."""
+    global _SYNC_ONCE
+    _SYNC_ONCE = None
+
+
+def _fmt_updated_at(value: Any) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return str(value)
+
+
+def _skills_collection_fingerprint(listed: list[dict[str, Any]]) -> str:
+    parts = [
+        f"{s.get('name') or ''}:{_fmt_updated_at(s.get('updated_at'))}"
+        for s in listed
+        if s.get("name")
+    ]
+    return "|".join(sorted(parts))
+
+
+def _cache_looks_complete(dest: Path, listed: list[dict[str, Any]]) -> bool:
+    """True when every listed skill has a SKILL.md under the cache root."""
+    if not listed:
+        return True
+    for skill in listed:
+        name = skill.get("name")
+        if not name:
+            continue
+        if not (dest / name / "SKILL.md").is_file():
+            return False
+    return True
+
+
 def sync_skills_from_mongo() -> Optional[Path]:
-    """Materialize all remote skills into the local cache. Returns cache root.
+    """Materialize remote skills into the local cache. Returns cache root.
+
+    Incremental: skips skills whose local ``.mongo_updated_at`` matches Mongo,
+    and skips the whole pass when the collection fingerprint matches the
+    process memo or on-disk ``.mongo_skills_stamp``.
 
     In Mongo mode failures raise — never silently return the classic skills dir.
     If the shared skills collection is empty, seed bundled skills once, then
     materialize (so a freshly connected agent is never stuck with zero skills).
     """
+    global _SYNC_ONCE
     from hermes_storage import is_mongo_mode, require_storage
 
     if not is_mongo_mode():
@@ -49,6 +97,7 @@ def sync_skills_from_mongo() -> Optional[Path]:
     storage = require_storage()
 
     dest = mongo_skills_cache_dir()
+    stamp_path = dest / ".mongo_skills_stamp"
     try:
         listed = storage.skills.list_skills()
         if not listed:
@@ -63,14 +112,62 @@ def sync_skills_from_mongo() -> Optional[Path]:
             except Exception as seed_exc:
                 logger.warning("Auto-seed of Mongo skills failed: %s", seed_exc)
             listed = storage.skills.list_skills()
+
+        fingerprint = _skills_collection_fingerprint(listed)
+        if _SYNC_ONCE == fingerprint and _cache_looks_complete(dest, listed):
+            return dest
+        try:
+            if (
+                stamp_path.is_file()
+                and stamp_path.read_text(encoding="utf-8").strip() == fingerprint
+                and _cache_looks_complete(dest, listed)
+            ):
+                _SYNC_ONCE = fingerprint
+                return dest
+        except OSError:
+            pass
+
+        pulled = 0
+        skipped = 0
         for skill in listed:
             name = skill.get("name")
             if not name:
                 continue
+            remote_ts = _fmt_updated_at(skill.get("updated_at"))
+            skill_root = dest / name
+            local_stamp = skill_root / ".mongo_updated_at"
+            try:
+                if (
+                    (skill_root / "SKILL.md").is_file()
+                    and local_stamp.is_file()
+                    and local_stamp.read_text(encoding="utf-8").strip() == remote_ts
+                    and remote_ts
+                ):
+                    skipped += 1
+                    continue
+            except OSError:
+                pass
             try:
                 storage.skills.materialize(name, dest)
+                try:
+                    local_stamp.write_text(remote_ts, encoding="utf-8")
+                except OSError:
+                    pass
+                pulled += 1
             except Exception as exc:
                 logger.warning("Failed to materialize skill %s: %s", name, exc)
+        try:
+            stamp_path.write_text(fingerprint, encoding="utf-8")
+        except OSError:
+            pass
+        _SYNC_ONCE = fingerprint
+        if pulled:
+            logger.info(
+                "Mongo skills sync: pulled=%s skipped=%s total=%s",
+                pulled,
+                skipped,
+                len(listed),
+            )
     except Exception as exc:
         from hermes_storage.errors import raise_mongo_unavailable
         raise_mongo_unavailable(f"skills list failed: {exc}", cause=exc)
@@ -90,6 +187,11 @@ def upload_local_skill_tree(skill_dir: Path, *, name: Optional[str] = None) -> N
     files: dict[str, bytes] = {}
     for f in skill_dir.rglob("*"):
         if f.is_file():
+            # Skip sync metadata / stamps — not part of the skill payload
+            if f.name in {".mongo_updated_at", ".mongo_skills_stamp", ".bundled_manifest"}:
+                continue
+            if f.name.startswith(".") and f.suffix == ".lock":
+                continue
             rel = str(f.relative_to(skill_dir)).replace("\\", "/")
             files[rel] = f.read_bytes()
     storage.skills.put_skill(
@@ -112,7 +214,15 @@ def commit_skill_tree(skill_dir: Path, *, name: Optional[str] = None) -> None:
     skill_name = name or skill_dir.name
     try:
         upload_local_skill_tree(skill_dir, name=skill_name)
+        invalidate_skills_sync_cache()
         require_storage().skills.materialize(skill_name, mongo_skills_cache_dir())
+        # Refresh per-skill stamp from Mongo so the next sync skips this skill.
+        try:
+            meta = require_storage().skills.get_skill(skill_name) or {}
+            stamp = mongo_skills_cache_dir() / skill_name / ".mongo_updated_at"
+            stamp.write_text(_fmt_updated_at(meta.get("updated_at")), encoding="utf-8")
+        except OSError:
+            pass
     except Exception as exc:
         from hermes_storage.errors import raise_mongo_unavailable
         raise_mongo_unavailable(
@@ -141,9 +251,15 @@ def delete_remote_skill(name: str) -> bool:
             f"failed to delete skill {name!r} from Mongo: {exc}",
             cause=exc,
         )
+    invalidate_skills_sync_cache()
     cache_dir = mongo_skills_cache_dir() / name
     if cache_dir.exists():
         shutil.rmtree(cache_dir, ignore_errors=True)
+    # Drop collection stamp so next sync rebuilds fingerprint
+    try:
+        (mongo_skills_cache_dir() / ".mongo_skills_stamp").unlink(missing_ok=True)
+    except OSError:
+        pass
     return bool(deleted)
 
 
@@ -223,11 +339,12 @@ def seed_shared_skills_if_empty(
         break
 
     # If still empty, run classic bundled sync into the writable cache, then upload.
+    # Pass mongo_commit=False so sync_skills does not re-enter commit_all.
     if uploaded == 0:
         try:
             from tools.skills_sync import sync_skills
 
-            sync_skills(quiet=True)
+            sync_skills(quiet=True, mongo_commit=False)
             cache = mongo_skills_cache_dir()
             for d in _iter_skill_dirs(cache):
                 try:
@@ -243,6 +360,7 @@ def seed_shared_skills_if_empty(
         except Exception as exc:
             logger.warning("bundled sync_skills seed failed: %s", exc)
 
+    invalidate_skills_sync_cache()
     return {"existing": 0, "uploaded": uploaded, "source": source}
 
 
@@ -251,25 +369,100 @@ def seed_profile_defaults_if_empty(
     *,
     home: Optional[Path] = None,
 ) -> dict[str, int]:
-    """Push local config/soul/memories/secrets into Mongo when profile is empty."""
+    """Fill missing profile pieces from leftover local files.
+
+    Config, secrets, soul, and memories are seeded **independently** — having
+    a soul document must not skip importing API keys / providers from a local
+    ``.env`` / ``config.yaml`` left after enroll.
+    """
     from hermes_constants import get_hermes_home
     from hermes_storage import require_storage
-    from hermes_storage.local.migrate import export_local_home, import_payload_to_storage
+    from hermes_storage.local.migrate import export_local_home
 
     st = storage or require_storage()
     home = Path(home) if home else get_hermes_home()
+    counts = {
+        "config": 0,
+        "secrets": 0,
+        "soul": 0,
+        "memories": 0,
+        "skipped": 0,
+    }
 
-    # Only import "identity" bits if profile looks empty
-    cfg = {}
+    try:
+        payload = export_local_home(home)
+    except Exception as exc:
+        logger.warning("seed_profile_defaults: export_local_home failed: %s", exc)
+        return counts
+
+    cfg: dict = {}
     if hasattr(st, "load_profile_config"):
         cfg = st.load_profile_config() or {}
     elif hasattr(st, "config"):
         cfg = st.config.get("default") or {}
-    soul = st.load_soul() if hasattr(st, "load_soul") else ""
-    if cfg or (soul or "").strip():
-        return {"skipped": 1, "reason": "profile_already_set"}
+    if not cfg and payload.get("config"):
+        try:
+            st.save_profile_config(payload["config"])
+            if hasattr(st, "save_machine_overlay_from_config"):
+                st.save_machine_overlay_from_config(payload["config"])
+            counts["config"] = 1
+        except Exception as exc:
+            logger.warning("seed_profile_defaults: config import failed: %s", exc)
 
-    payload = export_local_home(home)
-    # Don't re-upload skills here (handled separately); still OK if duplicated
-    counts = import_payload_to_storage(st, payload)
+    existing_secrets: dict = {}
+    try:
+        existing_secrets = dict(st.secrets.get_all() or {})
+    except Exception:
+        existing_secrets = {}
+    usable = {
+        k: v
+        for k, v in existing_secrets.items()
+        if not str(k).startswith("__") and v not in (None, "")
+    }
+    if not usable:
+        secrets = dict(payload.get("secrets") or {})
+        auth = payload.get("auth")
+        if auth is not None:
+            import json
+
+            secrets["__auth_json__"] = (
+                auth if isinstance(auth, str) else json.dumps(auth)
+            )
+        if secrets:
+            try:
+                merged = {**existing_secrets, **secrets}
+                st.secrets.set_many(merged)
+                counts["secrets"] = len(secrets)
+            except Exception as exc:
+                logger.warning("seed_profile_defaults: secrets import failed: %s", exc)
+
+    soul = ""
+    try:
+        soul = st.load_soul() if hasattr(st, "load_soul") else ""
+    except Exception:
+        soul = ""
+    if not (soul or "").strip() and payload.get("soul"):
+        try:
+            st.save_soul(payload["soul"])
+            counts["soul"] = 1
+        except Exception as exc:
+            logger.warning("seed_profile_defaults: soul import failed: %s", exc)
+
+    memories = payload.get("memories") or {}
+    for key in ("memory", "user"):
+        try:
+            current = st.memories.load(key) if hasattr(st, "memories") else ""
+        except Exception:
+            current = ""
+        if not (current or "").strip() and memories.get(key):
+            try:
+                st.memories.save(key, memories[key])
+                counts["memories"] += 1
+            except Exception as exc:
+                logger.warning(
+                    "seed_profile_defaults: memory %s import failed: %s", key, exc
+                )
+
+    if not any(counts[k] for k in ("config", "secrets", "soul", "memories")):
+        counts["skipped"] = 1
     return counts

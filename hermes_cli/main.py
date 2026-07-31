@@ -928,7 +928,50 @@ def _sync_bundled_skills_for_startup() -> bool:
     Hashing every bundled skill is safe but expensive on older Android
     storage. The git/ref stamp keeps post-update correctness: a changed
     checkout revision forces one real sync, then later starts skip it.
+
+    Mongo mode: only materialize from GridFS (incremental cache). Do not run
+    classic bundled sync + full re-upload — that was multi‑MB up/down every
+    ``hermes chat`` start.
     """
+    try:
+        from hermes_storage import is_mongo_mode
+
+        _mongo = bool(is_mongo_mode())
+    except Exception:
+        _mongo = False
+
+    if _mongo:
+        from hermes_storage.skills_sync import (
+            seed_profile_defaults_if_empty,
+            sync_skills_from_mongo,
+        )
+
+        # Fill missing config/secrets independently (soul alone must not
+        # block importing providers/API keys from leftover local files).
+        try:
+            seed_profile_defaults_if_empty()
+            # Seed may have just written profile config/secrets — drop load caches
+            # so the banner/picker sees providers immediately.
+            try:
+                from hermes_cli import config as _cfg_mod
+
+                _cfg_mod._LOAD_CONFIG_CACHE.clear()
+                _cfg_mod._RAW_CONFIG_CACHE.clear()
+                _cfg_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # Re-apply secrets into os.environ after a late seed.
+        try:
+            from hermes_cli.env_loader import load_hermes_dotenv
+
+            load_hermes_dotenv()
+        except Exception:
+            pass
+        sync_skills_from_mongo()
+        return True
+
     if _is_termux_startup_environment() and not _termux_bundled_skills_sync_needed():
         return False
 
@@ -985,9 +1028,9 @@ def _has_any_provider_configured() -> bool:
         _model_name = ""
     _has_hermes_config = _model_name and _model_name != _DEFAULT_MODEL
 
-    # Check env vars (may be set by .env or shell).
-    # OPENAI_BASE_URL alone counts — local models (vLLM, llama.cpp, etc.)
-    # often don't require an API key.
+    # Check env vars (may be set by .env, shell, or Mongo secrets via
+    # load_hermes_dotenv). OPENAI_BASE_URL alone counts — local models
+    # (vLLM, llama.cpp, etc.) often don't require an API key.
     from hermes_cli.auth import PROVIDER_REGISTRY
 
     # Collect all provider env vars
@@ -1003,6 +1046,16 @@ def _has_any_provider_configured() -> bool:
             provider_env_vars.update(pconfig.api_key_env_vars)
     if any(os.getenv(v) for v in provider_env_vars):
         return True
+
+    # Mongo mode ignores local .env — also probe load_env() (Mongo secrets).
+    try:
+        from hermes_cli.config import load_env
+
+        env_vals = load_env()
+        if any(env_vals.get(v) for v in provider_env_vars):
+            return True
+    except Exception:
+        pass
 
     # Check .env file for keys
     env_file = get_env_path()
@@ -1057,6 +1110,22 @@ def _has_any_provider_configured() -> bool:
         cfg_api_key = (model_cfg.get("api_key") or "").strip()
         if cfg_provider or cfg_base_url or cfg_api_key:
             return True
+
+    # Custom / named providers in effective config (Mongo-aware via load_config).
+    customs = cfg.get("custom_providers") or []
+    if isinstance(customs, list):
+        for entry in customs:
+            if not isinstance(entry, dict):
+                continue
+            if (
+                (entry.get("api_key") or "").strip()
+                or (entry.get("base_url") or "").strip()
+                or (entry.get("name") or "").strip()
+            ):
+                return True
+    providers_section = cfg.get("providers")
+    if isinstance(providers_section, dict) and providers_section:
+        return True
 
     # Check for Claude Code OAuth credentials (~/.claude/.credentials.json)
     # Only count these if Hermes has been explicitly configured — Claude Code
