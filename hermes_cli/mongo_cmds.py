@@ -82,7 +82,10 @@ def collect_mongo_inventory(storage) -> dict[str, Any]:
 
     secrets_raw: dict[str, Any] = {}
     try:
-        secrets_raw = storage.secrets.get_all() or {}
+        if hasattr(storage, "get_effective_secrets"):
+            secrets_raw = storage.get_effective_secrets() or {}
+        else:
+            secrets_raw = storage.secrets.get_all() or {}
     except Exception:
         pass
     secret_keys = [

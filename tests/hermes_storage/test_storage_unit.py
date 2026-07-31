@@ -153,13 +153,105 @@ def test_overlay_merge_and_extract():
         "terminal": {"cwd": "/home/me", "backend": "local", "timeout": 60},
         "browser": {"headed": True},
         "mcp_servers": {"fs": {"command": "npx"}},
+        "proxy": {"enabled": True},
+        "platforms": {
+            "telegram": {"enabled": True, "proxy_url": "socks5://127.0.0.1:1080"},
+            "api_server": {"host": "127.0.0.1", "port": 8642, "enabled": True},
+        },
     }
     extracted = extract_machine_overlay(full)
     assert "cwd" in extracted["terminal"]
     assert "timeout" not in extracted["terminal"]
+    assert extracted["proxy"]["enabled"] is True
+    assert extracted["platforms"]["telegram"]["proxy_url"].startswith("socks5://")
+    assert extracted["platforms"]["api_server"]["port"] == 8642
     shared = strip_machine_local(full)
     assert "cwd" not in shared.get("terminal", {})
+    assert "proxy" not in shared
+    assert "proxy_url" not in shared.get("platforms", {}).get("telegram", {})
+    assert shared["platforms"]["telegram"]["enabled"] is True
     assert shared["model"]["default"] == "y"
+
+
+def test_split_machine_local_proxy_secrets():
+    from hermes_storage.overlay import split_machine_local_secrets
+
+    shared, local = split_machine_local_secrets({
+        "OPENAI_API_KEY": "sk-x",
+        "TELEGRAM_BOT_TOKEN": "bot",
+        "TELEGRAM_PROXY": "socks5://127.0.0.1:1080",
+        "HTTPS_PROXY": "http://corp:8080",
+    })
+    assert shared == {
+        "OPENAI_API_KEY": "sk-x",
+        "TELEGRAM_BOT_TOKEN": "bot",
+    }
+    assert local["TELEGRAM_PROXY"].startswith("socks5://")
+    assert local["HTTPS_PROXY"].startswith("http://")
+
+
+def test_storage_routes_proxy_secrets_to_machine_overlay():
+    """TELEGRAM_PROXY must not stay in shared profile secrets."""
+    from hermes_storage.factory import HermesStorage
+
+    class _Secrets:
+        def __init__(self):
+            self.values = {"OPENAI_API_KEY": "sk", "TELEGRAM_PROXY": "socks5://old"}
+
+        def get_all(self):
+            return dict(self.values)
+
+        def set_many(self, values):
+            self.values = dict(values)
+
+        def set(self, key, value):
+            self.values[key] = value
+
+    class _Machines:
+        def __init__(self):
+            self.overlay = {}
+
+        def get_overlay(self, _machine_id):
+            return dict(self.overlay)
+
+        def set_overlay(self, _machine_id, overlay):
+            self.overlay = dict(overlay)
+
+    secrets = _Secrets()
+    machines = _Machines()
+    storage = HermesStorage(
+        bootstrap=type("B", (), {"profile": "default"})(),
+        client=None,
+        shared_db=None,
+        profile_db=None,
+        settings=type("S", (), {"get": lambda *a, **k: {}})(),
+        knowledge=None,
+        config=type("C", (), {"get": lambda *a, **k: {}, "put": lambda *a, **k: None})(),
+        secrets=secrets,
+        soul=None,
+        memories=None,
+        skills=None,
+        machines=machines,
+        sessions=None,
+        ledgers=None,
+        cluster=None,
+        machine_id="pc1",
+        node_id="node1",
+    )
+
+    storage.set_secret("TELEGRAM_PROXY", "socks5://127.0.0.1:1080")
+    assert "TELEGRAM_PROXY" not in secrets.values
+    assert machines.overlay["secrets"]["TELEGRAM_PROXY"] == "socks5://127.0.0.1:1080"
+
+    effective = storage.get_effective_secrets()
+    assert effective["OPENAI_API_KEY"] == "sk"
+    assert effective["TELEGRAM_PROXY"] == "socks5://127.0.0.1:1080"
+
+    # Config overlay merge must not leak the secrets bag into YAML config.
+    machines.overlay["terminal"] = {"cwd": "/tmp"}
+    cfg = storage.load_effective_config({"model": {"default": "x"}})
+    assert cfg["terminal"]["cwd"] == "/tmp"
+    assert "secrets" not in cfg
 
 
 def test_cluster_prompt_empty_without_mongo(monkeypatch, tmp_path):

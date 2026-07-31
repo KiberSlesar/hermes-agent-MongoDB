@@ -44,7 +44,12 @@ class HermesStorage:
         merged = deep_merge(base or {}, shared)
         merged = deep_merge(merged, profile)
         overlay = self.machines.get_overlay(self.machine_id)
-        return deep_merge(merged, overlay)
+        # ``secrets`` in the overlay is the machine-local env bag — not config.
+        overlay_cfg = {
+            key: value for key, value in (overlay or {}).items()
+            if key != "secrets"
+        }
+        return deep_merge(merged, overlay_cfg)
 
     def load_profile_config(self) -> dict:
         """Raw profile config document (no machine overlay)."""
@@ -59,8 +64,109 @@ class HermesStorage:
     def save_machine_overlay_from_config(self, config: dict) -> None:
         from hermes_storage.overlay import extract_machine_overlay
 
+        existing = self.machines.get_overlay(self.machine_id) or {}
         overlay = extract_machine_overlay(config)
+        # Config saves must not wipe per-PC proxy secrets stored alongside.
+        secrets = existing.get("secrets")
+        if isinstance(secrets, dict) and secrets:
+            overlay["secrets"] = dict(secrets)
         self.machines.set_overlay(self.machine_id, overlay)
+
+    def get_machine_secrets(self) -> dict[str, str]:
+        overlay = self.machines.get_overlay(self.machine_id) or {}
+        raw = overlay.get("secrets") or {}
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(k): str(v)
+            for k, v in raw.items()
+            if v is not None and not str(k).startswith("__")
+        }
+
+    def _put_machine_secrets(self, secrets: dict[str, str]) -> None:
+        overlay = dict(self.machines.get_overlay(self.machine_id) or {})
+        overlay["secrets"] = {
+            str(k): str(v)
+            for k, v in (secrets or {}).items()
+            if v is not None
+        }
+        self.machines.set_overlay(self.machine_id, overlay)
+
+    def get_effective_secrets(self) -> dict[str, str]:
+        """Profile secrets ⊕ this machine's proxy/network secrets (machine wins)."""
+        from hermes_storage.overlay import MACHINE_LOCAL_SECRET_KEYS
+
+        profile = {
+            str(k): str(v)
+            for k, v in (self.secrets.get_all() or {}).items()
+            if v is not None
+        }
+        machine = self.get_machine_secrets()
+        out = dict(profile)
+        for key in MACHINE_LOCAL_SECRET_KEYS:
+            if key in machine:
+                out[key] = machine[key]
+        return out
+
+    def set_secret(self, key: str, value: str) -> None:
+        """Persist one secret; proxy/network keys go to this machine only."""
+        from hermes_storage.overlay import is_machine_local_secret
+
+        if is_machine_local_secret(key):
+            local = self.get_machine_secrets()
+            local[str(key)] = str(value)
+            self._put_machine_secrets(local)
+            # Drop from shared profile so other PCs don't inherit this egress.
+            profile = dict(self.secrets.get_all() or {})
+            if key in profile:
+                del profile[key]
+                self.secrets.set_many(profile)
+            return
+        self.secrets.set(key, value)
+
+    def remove_secret(self, key: str) -> bool:
+        from hermes_storage.overlay import is_machine_local_secret
+
+        found = False
+        if is_machine_local_secret(key):
+            local = self.get_machine_secrets()
+            if key in local:
+                del local[key]
+                self._put_machine_secrets(local)
+                found = True
+        profile = dict(self.secrets.get_all() or {})
+        if key in profile:
+            del profile[key]
+            self.secrets.set_many(profile)
+            found = True
+        return found
+
+    def set_secrets_many(self, values: dict[str, str], *, replace_profile: bool = True) -> None:
+        """Write secrets, routing proxy/network keys to this machine.
+
+        ``replace_profile=True`` (default) replaces the shared profile secrets
+        document with the non-local keys from *values* (migrate / full import).
+        Machine-local keys are merged into this PC's overlay.
+        """
+        from hermes_storage.overlay import (
+            MACHINE_LOCAL_SECRET_KEYS,
+            split_machine_local_secrets,
+        )
+
+        shared, local = split_machine_local_secrets(values)
+        if replace_profile:
+            self.secrets.set_many(shared)
+        else:
+            profile = {
+                str(k): str(v)
+                for k, v in (self.secrets.get_all() or {}).items()
+                if v is not None and str(k) not in MACHINE_LOCAL_SECRET_KEYS
+            }
+            profile.update(shared)
+            self.secrets.set_many(profile)
+        machine = self.get_machine_secrets()
+        machine.update(local)
+        self._put_machine_secrets(machine)
 
     def load_soul(self) -> str:
         doc = self.soul.get("default") or {}

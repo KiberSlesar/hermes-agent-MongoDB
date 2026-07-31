@@ -378,7 +378,7 @@ def load_hermes_dotenv(
     if _mongo:
         from hermes_storage import require_storage
         storage = require_storage()
-        for key, value in storage.secrets.get_all().items():
+        for key, value in storage.get_effective_secrets().items():
             if key.startswith("__"):
                 continue
             if value is not None:

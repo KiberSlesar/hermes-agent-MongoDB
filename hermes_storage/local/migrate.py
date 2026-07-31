@@ -169,7 +169,7 @@ def import_payload_to_storage(storage: Any, payload: dict[str, Any]) -> dict[str
     if payload.get("auth") is not None:
         secrets["__auth_json__"] = json.dumps(payload["auth"])
     if secrets:
-        storage.secrets.set_many(secrets)
+        storage.set_secrets_many(secrets)
         counts["secrets"] = len(secrets)
 
     if payload.get("soul"):

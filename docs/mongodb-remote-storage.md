@@ -68,6 +68,17 @@ hermes machine list
 hermes machine set-overlay --file overlay.yaml
 ```
 
+Machine-local (not shared across the fleet):
+
+- `terminal` bind/cwd/backend, `browser`, `mcp_servers`
+- `platforms.api_server` host/port
+- **network proxy**: top-level `proxy`, per-platform `proxy` / `proxy_url`
+- **proxy secrets**: `TELEGRAM_PROXY`, `DISCORD_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY`, …
+
+Bot tokens and model keys stay in the shared profile secrets. Proxy env vars
+written via `hermes config set` / setup on one PC land only on that machine's
+overlay.
+
 ## Cluster / active agent
 
 ```bash

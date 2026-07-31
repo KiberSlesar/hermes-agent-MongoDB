@@ -3812,7 +3812,7 @@ def load_env() -> Dict[str, str]:
         # (fleet split-brain / stale keys after migrate).
         from hermes_storage import require_storage
 
-        raw = require_storage().secrets.get_all()
+        raw = require_storage().get_effective_secrets()
         return {
             str(k): str(v)
             for k, v in raw.items()
@@ -4067,7 +4067,7 @@ def save_env_value(key: str, value: str):
 
     if _mongo:
         try:
-            require_storage().secrets.set(key, value)
+            require_storage().set_secret(key, value)
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to save {key} to Mongo secrets (Mongo mode is on; "
@@ -4239,11 +4239,7 @@ def remove_env_value(key: str) -> bool:
     if _mongo:
         try:
             storage = require_storage()
-            values = storage.secrets.get_all()
-            found = key in values
-            if found:
-                del values[key]
-                storage.secrets.set_many(values)
+            found = storage.remove_secret(key)
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to remove {key} from Mongo secrets: {exc}"

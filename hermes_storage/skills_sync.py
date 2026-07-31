@@ -431,7 +431,10 @@ def seed_profile_defaults_if_empty(
         if secrets:
             try:
                 merged = {**existing_secrets, **secrets}
-                st.secrets.set_many(merged)
+                if hasattr(st, "set_secrets_many"):
+                    st.set_secrets_many(merged)
+                else:
+                    st.secrets.set_many(merged)
                 counts["secrets"] = len(secrets)
             except Exception as exc:
                 logger.warning("seed_profile_defaults: secrets import failed: %s", exc)
