@@ -79,7 +79,12 @@ def is_protected_builtin(skill_name: str) -> bool:
 
 
 def _skills_dir() -> Path:
-    return get_hermes_home() / "skills"
+    try:
+        from hermes_storage.skills_sync import writable_skills_dir
+
+        return writable_skills_dir()
+    except Exception:
+        return get_hermes_home() / "skills"
 
 
 def _usage_file() -> Path:
@@ -931,6 +936,15 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
         add_suppressed_name(skill_name)
 
     set_state(skill_name, STATE_ARCHIVED)
+    try:
+        from hermes_storage.skills_sync import delete_remote_skill
+
+        delete_remote_skill(skill_name)
+    except Exception:
+        from hermes_storage import is_mongo_mode
+
+        if is_mongo_mode():
+            raise
     return True, f"archived to {dest}"
 
 
@@ -1006,6 +1020,15 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
     remove_suppressed_name(skill_name)
 
     set_state(skill_name, STATE_ACTIVE)
+    try:
+        from hermes_storage.skills_sync import commit_skill_tree
+
+        commit_skill_tree(dest, name=skill_name)
+    except Exception:
+        from hermes_storage import is_mongo_mode
+
+        if is_mongo_mode():
+            raise
     return True, f"restored to {dest}"
 
 

@@ -150,12 +150,17 @@ def _skills_dir() -> Path:
     Some long-lived runtimes import this module before the active profile has
     set HERMES_HOME. Keep the legacy SKILLS_DIR module attribute for tests and
     external patchers, but when it has not been patched, resolve from the live
-    profile-scoped HERMES_HOME on every call.
+    writable skills root (Mongo cache in mongo mode).
     """
     configured = Path(SKILLS_DIR)
     if configured != _SKILLS_DIR_AT_IMPORT:
         return configured
-    return get_hermes_home() / "skills"
+    try:
+        from hermes_storage.skills_sync import writable_skills_dir
+
+        return writable_skills_dir()
+    except Exception:
+        return get_hermes_home() / "skills"
 
 
 # Anthropic-recommended limits for progressive disclosure efficiency

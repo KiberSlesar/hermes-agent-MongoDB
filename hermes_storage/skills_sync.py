@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -13,6 +14,23 @@ def mongo_skills_cache_dir() -> Path:
     from hermes_constants import get_hermes_home
 
     path = get_hermes_home() / "cache" / "skills"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def writable_skills_dir() -> Path:
+    """Directory skill writers should use.
+
+    Mongo mode: ephemeral cache under ``cache/skills`` (durable store is Mongo).
+    Classic mode: ``~/.hermes/skills``.
+    """
+    from hermes_storage import is_mongo_mode
+
+    if is_mongo_mode():
+        return mongo_skills_cache_dir()
+    from hermes_constants import get_hermes_home
+
+    path = get_hermes_home() / "skills"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -63,6 +81,76 @@ def upload_local_skill_tree(skill_dir: Path, *, name: Optional[str] = None) -> N
         {"name": skill_name, "skill_md": body, "path": skill_name},
         files=files,
     )
+
+
+def commit_skill_tree(skill_dir: Path, *, name: Optional[str] = None) -> None:
+    """Persist a skill directory to Mongo and refresh its cache entry.
+
+    No-op outside Mongo mode (classic FS remains durable).
+    Fail-hard in Mongo mode — never leave cache-only skills.
+    """
+    from hermes_storage import is_mongo_mode, require_storage
+
+    if not is_mongo_mode():
+        return
+    skill_dir = Path(skill_dir)
+    skill_name = name or skill_dir.name
+    try:
+        upload_local_skill_tree(skill_dir, name=skill_name)
+        require_storage().skills.materialize(skill_name, mongo_skills_cache_dir())
+    except Exception as exc:
+        from hermes_storage.errors import raise_mongo_unavailable
+        raise_mongo_unavailable(
+            f"failed to commit skill {skill_name!r} to Mongo: {exc}",
+            cause=exc,
+        )
+
+
+def delete_remote_skill(name: str) -> bool:
+    """Delete a skill from Mongo and drop its local cache dir.
+
+    No-op outside Mongo mode (returns False). Fail-hard on Mongo errors.
+    """
+    from hermes_storage import is_mongo_mode, require_storage
+
+    if not is_mongo_mode():
+        return False
+    name = str(name or "").strip()
+    if not name:
+        return False
+    try:
+        deleted = require_storage().skills.delete_skill(name)
+    except Exception as exc:
+        from hermes_storage.errors import raise_mongo_unavailable
+        raise_mongo_unavailable(
+            f"failed to delete skill {name!r} from Mongo: {exc}",
+            cause=exc,
+        )
+    cache_dir = mongo_skills_cache_dir() / name
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    return bool(deleted)
+
+
+def commit_all_skill_trees(root: Optional[Path] = None) -> int:
+    """Upload every SKILL.md tree under *root* (default: writable skills dir)."""
+    from hermes_storage import is_mongo_mode
+
+    if not is_mongo_mode():
+        return 0
+    root = Path(root) if root else writable_skills_dir()
+    count = 0
+    for skill_dir in _iter_skill_dirs(root):
+        try:
+            rel_parts = skill_dir.relative_to(root).parts
+        except ValueError:
+            continue
+        # Skip hub staging / archive / restore metadata trees
+        if any(p.startswith(".") for p in rel_parts):
+            continue
+        commit_skill_tree(skill_dir, name=skill_dir.name)
+        count += 1
+    return count
 
 
 def _iter_skill_dirs(root: Path) -> list[Path]:

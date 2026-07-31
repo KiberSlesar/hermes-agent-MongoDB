@@ -164,12 +164,37 @@ def _skills_dir() -> Path:
     kanban workers) import this module once under the launch HERMES_HOME and
     later bind a different profile per session (#40677). Honor an explicitly
     patched module-level ``SKILLS_DIR`` (tests), otherwise resolve from the
-    live profile-scoped HERMES_HOME on every call.
+    live profile-scoped skills root (Mongo cache in mongo mode).
     """
     configured = Path(SKILLS_DIR)
     if configured != _SKILLS_DIR_AT_IMPORT:
         return configured
-    return get_hermes_home() / "skills"
+    try:
+        from hermes_storage.skills_sync import writable_skills_dir
+
+        return writable_skills_dir()
+    except Exception:
+        return get_hermes_home() / "skills"
+
+
+def _commit_skill_dir(skill_dir: Path, *, name: Optional[str] = None) -> None:
+    """Push skill tree to Mongo when remote storage is enabled."""
+    try:
+        from hermes_storage.skills_sync import commit_skill_tree
+
+        commit_skill_tree(Path(skill_dir), name=name or Path(skill_dir).name)
+    except Exception:
+        # commit_skill_tree fail-hards in mongo mode via raise_mongo_unavailable
+        raise
+
+
+def _delete_skill_remote(name: str) -> None:
+    try:
+        from hermes_storage.skills_sync import delete_remote_skill
+
+        delete_remote_skill(name)
+    except Exception:
+        raise
 
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
@@ -971,6 +996,7 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         "skill_manage(action='write_file', name='{}', file_path='references/example.md', file_content='...')".format(name)
     )
     _add_description_prompt_preview(result, content)
+    _commit_skill_dir(skill_dir, name=name)
     return result
 
 
@@ -1033,6 +1059,7 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
         result["org_sharing"] = org_note
         result["message"] = f"{result['message']} {org_note}"
     _add_description_prompt_preview(result, content)
+    _commit_skill_dir(existing["path"], name=name)
     return result
 
 
@@ -1153,6 +1180,7 @@ def _patch_skill(
     if org_note:
         result["org_sharing"] = org_note
         result["message"] = f"{result['message']} {org_note}"
+    _commit_skill_dir(skill_dir, name=name)
     return result
 
 
@@ -1258,6 +1286,7 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     if is_consolidation:
         message += f" Content absorbed into '{absorbed_target}'."
 
+    _delete_skill_remote(name)
     return {
         "success": True,
         "message": message,
@@ -1331,6 +1360,7 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     if org_note:
         result["org_sharing"] = org_note
         result["message"] = f"{result['message']} {org_note}"
+    _commit_skill_dir(existing["path"], name=name)
     return result
 
 
@@ -1381,6 +1411,7 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     if parent != skill_dir and parent.exists() and not any(parent.iterdir()):
         parent.rmdir()
 
+    _commit_skill_dir(skill_dir, name=name)
     return {
         "success": True,
         "message": f"File '{file_path}' removed from skill '{name}'.",

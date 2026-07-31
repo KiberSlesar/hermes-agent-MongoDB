@@ -900,7 +900,50 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
 
 # =============================================================================
 # Auth Store — persistence layer for ~/.hermes/auth.json
+# (Mongo mode: durable copy lives in profile secrets as ``__auth_json__``.)
 # =============================================================================
+
+_AUTH_JSON_SECRET_KEY = "__auth_json__"
+
+
+def _mongo_auth_enabled() -> bool:
+    try:
+        from hermes_storage import is_mongo_mode
+
+        return bool(is_mongo_mode())
+    except Exception:
+        return False
+
+
+def _load_auth_store_from_mongo() -> Optional[Dict[str, Any]]:
+    """Return auth dict from Mongo secrets, or None if unset."""
+    from hermes_storage import require_storage
+
+    raw = require_storage().secrets.get(_AUTH_JSON_SECRET_KEY)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception as exc:
+        logger.warning("auth: failed to parse Mongo __auth_json__: %s", exc)
+        return {"version": AUTH_STORE_VERSION, "providers": {}}
+    if isinstance(data, dict):
+        data.setdefault("providers", {})
+        return data
+    return {"version": AUTH_STORE_VERSION, "providers": {}}
+
+
+def _save_auth_store_to_mongo(auth_store: Dict[str, Any]) -> None:
+    from hermes_storage import require_storage
+
+    auth_store = dict(auth_store)
+    auth_store["version"] = AUTH_STORE_VERSION
+    auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
+    require_storage().secrets.set(
+        _AUTH_JSON_SECRET_KEY,
+        json.dumps(auth_store, indent=2) + "\n",
+    )
+
 
 def _auth_file_path() -> Path:
     path = get_hermes_home() / "auth.json"
@@ -1118,6 +1161,27 @@ def _auth_store_lock(
 
 
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
+    # Default store in Mongo mode: secrets.__auth_json__ (with one-shot
+    # migrate from a leftover local auth.json).
+    if auth_file is None and _mongo_auth_enabled():
+        mongo_store = _load_auth_store_from_mongo()
+        if mongo_store is not None:
+            return mongo_store
+        # One-shot migrate local file → Mongo if present
+        local = _auth_file_path()
+        if local.exists():
+            migrated = _load_auth_store(local)  # force file path
+            try:
+                _save_auth_store_to_mongo(migrated)
+                try:
+                    local.unlink()
+                except OSError:
+                    pass
+            except Exception as exc:
+                logger.warning("auth: could not migrate auth.json to Mongo: %s", exc)
+            return migrated
+        return {"version": AUTH_STORE_VERSION, "providers": {}}
+
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
@@ -1165,6 +1229,17 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # specific store — e.g. the global-root write-through for rotating xAI
     # OAuth grants (#43589) — reusing this function's atomic O_EXCL + 0o600
     # write so the root auth.json gets the same TOCTOU-safe treatment.
+    if target_path is None and _mongo_auth_enabled():
+        _save_auth_store_to_mongo(auth_store)
+        # Best-effort scrub of leftover local durable copy
+        try:
+            local = _auth_file_path()
+            if local.exists():
+                local.unlink()
+        except OSError:
+            pass
+        return _auth_file_path()
+
     auth_file = target_path if target_path is not None else _auth_file_path()
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.

@@ -66,7 +66,14 @@ def _hermes_home() -> Path:
 
 def _skills_dir() -> Path:
     forced = _override("SKILLS_DIR")
-    return Path(forced) if forced is not None else _hermes_home() / "skills"
+    if forced is not None:
+        return Path(forced)
+    try:
+        from hermes_storage.skills_sync import writable_skills_dir
+
+        return writable_skills_dir()
+    except Exception:
+        return _hermes_home() / "skills"
 
 
 def _hub_dir() -> Path:
@@ -3565,6 +3572,13 @@ def install_from_quarantine(
         content_hash(install_dir),
     )
 
+    try:
+        from hermes_storage.skills_sync import commit_skill_tree
+
+        commit_skill_tree(install_dir, name=safe_skill_name)
+    except Exception:
+        raise
+
     return install_dir
 
 
@@ -3594,6 +3608,13 @@ def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
 
     lock.record_uninstall(skill_name)
     append_audit_log("UNINSTALL", skill_name, entry["source"], entry["trust_level"], "n/a", "user_request")
+
+    try:
+        from hermes_storage.skills_sync import delete_remote_skill
+
+        delete_remote_skill(skill_name)
+    except Exception:
+        raise
 
     return True, f"Uninstalled '{skill_name}' from {entry['install_path']}"
 

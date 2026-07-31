@@ -894,14 +894,40 @@ def ensure_hermes_home():
     else:
         home.mkdir(parents=True, exist_ok=True)
         _secure_dir(home)
-        for subdir in (
-            "cron", "sessions", "logs", "logs/curator", "memories",
-            "pairing", "hooks", "image_cache", "audio_cache", "skills",
-        ):
-            d = home / subdir
-            d.mkdir(parents=True, exist_ok=True)
-            _secure_dir(d)
-        _ensure_default_soul_md(home)
+        try:
+            from hermes_storage import is_mongo_mode
+
+            _mongo = is_mongo_mode()
+        except Exception:
+            _mongo = False
+        if _mongo:
+            # Durable state lives in Mongo. Local dirs are runtime-only:
+            # logs, caches, and TLS material (certs created by enroll).
+            for subdir in (
+                "logs", "logs/curator", "cache", "cache/skills",
+                "image_cache", "audio_cache", "certs",
+            ):
+                d = home / subdir
+                d.mkdir(parents=True, exist_ok=True)
+                _secure_dir(d)
+            # Soul is stored in Mongo — seed there if empty, never write SOUL.md.
+            try:
+                from hermes_storage import require_storage
+
+                st = require_storage()
+                if not (st.load_soul() or "").strip():
+                    st.save_soul(DEFAULT_SOUL_MD)
+            except Exception:
+                pass
+        else:
+            for subdir in (
+                "cron", "sessions", "logs", "logs/curator", "memories",
+                "pairing", "hooks", "image_cache", "audio_cache", "skills",
+            ):
+                d = home / subdir
+                d.mkdir(parents=True, exist_ok=True)
+                _secure_dir(d)
+            _ensure_default_soul_md(home)
 
     _HERMES_HOME_ENSURED.add(key)
 
@@ -3541,7 +3567,8 @@ def save_config(
         # Persist to Mongo when remote storage is enabled. Fail hard on error —
         # do not leave a local-only write that diverges from the fleet brain.
         from hermes_storage import is_mongo_mode
-        if is_mongo_mode():
+        _mongo_save = is_mongo_mode()
+        if _mongo_save:
             from hermes_storage import require_storage
             storage = require_storage()
             storage.save_profile_config(config)
@@ -3590,6 +3617,17 @@ def save_config(
                 DEFAULT_CONFIG,
                 preserve_keys=effective_preserve_keys,
             )
+
+        # Mongo mode: durable config is the DB only — do not write config.yaml.
+        if _mongo_save:
+            from hermes_storage import require_storage
+            storage = require_storage()
+            storage.save_profile_config(normalized)
+            storage.save_machine_overlay_from_config(normalized)
+            _RAW_CONFIG_CACHE.pop(str(config_path), None)
+            _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+            _LOAD_CONFIG_CACHE.pop(str(config_path), None)
+            return
 
         # Build optional commented-out sections for features that are off by
         # default or only relevant when explicitly configured.

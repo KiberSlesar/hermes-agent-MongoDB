@@ -332,13 +332,23 @@ def load_hermes_dotenv(
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
 
+    # Mongo mode: durable secrets live in the DB — do not load local .env
+    # (avoids split-brain with stale keys). Still allow .op.env / managed /
+    # external sources for ops bootstrap, then apply Mongo secrets last.
+    try:
+        from hermes_storage import is_mongo_mode as _mongo_mode_fn
+
+        _mongo = _mongo_mode_fn()
+    except Exception:
+        _mongo = False
+
     # Normalize safe formatting and remove invalid NUL bytes before parsing.
-    if user_env.exists():
+    if not _mongo and user_env.exists():
         _sanitize_env_file_if_needed(user_env)
     if project_env_path and project_env_path.exists():
         _sanitize_env_file_if_needed(project_env_path)
 
-    if user_env.exists():
+    if not _mongo and user_env.exists():
         _load_dotenv_with_fallback(user_env, override=True)
         loaded.append(user_env)
 
@@ -356,7 +366,7 @@ def load_hermes_dotenv(
     if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
         _load_dotenv_with_fallback(op_env, override=False)
 
-    if project_env_path and project_env_path.exists():
+    if not _mongo and project_env_path and project_env_path.exists():
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
         loaded.append(project_env_path)
 
@@ -364,9 +374,8 @@ def load_hermes_dotenv(
     _apply_managed_env()
 
     # Mongo secrets (profile .env equivalent) — required when Mongo mode is on.
-    # Never silently skip: missing secrets would leave stale local .env in force.
-    from hermes_storage import is_mongo_mode
-    if is_mongo_mode():
+    # Never silently skip: missing secrets would leave the process without keys.
+    if _mongo:
         from hermes_storage import require_storage
         storage = require_storage()
         for key, value in storage.secrets.get_all().items():
