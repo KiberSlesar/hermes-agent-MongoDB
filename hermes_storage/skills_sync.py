@@ -39,6 +39,8 @@ def sync_skills_from_mongo() -> Optional[Path]:
     """Materialize all remote skills into the local cache. Returns cache root.
 
     In Mongo mode failures raise — never silently return the classic skills dir.
+    If the shared skills collection is empty, seed bundled skills once, then
+    materialize (so a freshly connected agent is never stuck with zero skills).
     """
     from hermes_storage import is_mongo_mode, require_storage
 
@@ -48,7 +50,20 @@ def sync_skills_from_mongo() -> Optional[Path]:
 
     dest = mongo_skills_cache_dir()
     try:
-        for skill in storage.skills.list_skills():
+        listed = storage.skills.list_skills()
+        if not listed:
+            # First-run / wiped local tree: push bundled into Mongo, then pull.
+            try:
+                seed = seed_shared_skills_if_empty(storage)
+                logger.info(
+                    "Mongo skills empty — seed result: uploaded=%s source=%s",
+                    seed.get("uploaded"),
+                    seed.get("source"),
+                )
+            except Exception as seed_exc:
+                logger.warning("Auto-seed of Mongo skills failed: %s", seed_exc)
+            listed = storage.skills.list_skills()
+        for skill in listed:
             name = skill.get("name")
             if not name:
                 continue

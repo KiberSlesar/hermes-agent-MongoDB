@@ -173,7 +173,15 @@ def _skills_dir() -> Path:
         from hermes_storage.skills_sync import writable_skills_dir
 
         return writable_skills_dir()
-    except Exception:
+    except Exception as exc:
+        try:
+            from hermes_storage.errors import MongoStorageError
+            from hermes_storage import is_mongo_mode
+
+            if is_mongo_mode() or isinstance(exc, MongoStorageError):
+                raise
+        except ImportError:
+            pass
         return get_hermes_home() / "skills"
 
 

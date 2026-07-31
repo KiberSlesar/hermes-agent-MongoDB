@@ -264,8 +264,13 @@ def get_skills_directory_mount(
     at ``<container_base>/external_skills/<index>``.
     """
     mounts = []
-    hermes_home = _resolve_hermes_home()
-    skills_dir = hermes_home / "skills"
+    try:
+        from hermes_constants import get_skills_dir
+
+        skills_dir = get_skills_dir()
+    except Exception:
+        hermes_home = _resolve_hermes_home()
+        skills_dir = hermes_home / "skills"
     if skills_dir.is_dir():
         host_path = _safe_skills_path(skills_dir)
         mounts.append({
@@ -347,8 +352,13 @@ def iter_skills_files(
     """
     result: List[Dict[str, str]] = []
 
-    hermes_home = _resolve_hermes_home()
-    skills_dir = hermes_home / "skills"
+    try:
+        from hermes_constants import get_skills_dir
+
+        skills_dir = get_skills_dir()
+    except Exception:
+        hermes_home = _resolve_hermes_home()
+        skills_dir = hermes_home / "skills"
     if skills_dir.is_dir():
         container_root = f"{container_base.rstrip('/')}/skills"
         for item in skills_dir.rglob("*"):

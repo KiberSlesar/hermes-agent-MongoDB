@@ -28,6 +28,12 @@ def build_mongo_parser(subparsers, *, cmd_mongo: Callable) -> None:
     )
     status.set_defaults(func=cmd_mongo)
 
+    seed = mongo_sub.add_parser(
+        "seed-skills",
+        help="If Mongo skills are empty, upload bundled skills then materialize cache",
+    )
+    seed.set_defaults(func=cmd_mongo)
+
     # Bare `hermes mongo` → status
     parser.set_defaults(func=cmd_mongo, mongo_command="status")
 
@@ -178,7 +184,25 @@ def format_mongo_inventory(inv: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def cmd_mongo_status(*, as_json: bool = False) -> int:
+def cmd_mongo_seed_skills() -> int:
+    """Push bundled/local skills into Mongo when empty, then materialize cache."""
+    from hermes_storage import get_storage, is_mongo_mode
+    from hermes_storage.skills_sync import seed_shared_skills_if_empty, sync_skills_from_mongo
+
+    if not is_mongo_mode():
+        print("Mongo mode: OFF — connect first: hermes db connect")
+        return 1
+    storage = get_storage(force=True)
+    result = seed_shared_skills_if_empty(storage)
+    cache = sync_skills_from_mongo()
+    print(
+        f"Seed: uploaded={result.get('uploaded', 0)} "
+        f"existing={result.get('existing', 0)} "
+        f"source={result.get('source')}"
+    )
+    print(f"Cache: {cache}")
+    print(f"Mongo skills now: {len(storage.skills.list_skills())}")
+    return 0
     """Entry used by ``hermes mongo status``. Returns process exit code."""
     import json
 
