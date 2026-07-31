@@ -79,7 +79,7 @@ confirm_replace_existing_installation() {
     say "HERMES_YES=1 / --yes: replacing existing install"
   elif can_prompt; then
     local answer=""
-    printf "%s" "Remove and replace the existing Hermes installation? [y/N] " > /dev/tty
+    printf "%s" "Update / replace existing Hermes runtime? [y/N] " > /dev/tty
     read -r answer < /dev/tty || true
     if [[ ! "$answer" =~ ^[Yy]$ ]]; then
       echo "Installation cancelled; existing Hermes was left unchanged." >&2
@@ -404,7 +404,7 @@ if ! can_prompt; then
   exit 0
 fi
 
-ask ans "Connect this PC to Hermes DB now? [Y/n] " "Y"
+ask ans "Connect this PC to Hermes DB now? (already enrolled: n) [Y/n] " "Y"
 if [[ "$ans" =~ ^[Yy] ]]; then
   echo "Enter values from the DB server (agent-add):"
   do_connect "" ""

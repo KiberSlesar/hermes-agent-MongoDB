@@ -64,7 +64,7 @@ function Confirm-ReplaceExistingInstallation {
     }
     Write-Host "Replacing it removes its launcher/runtime only; HERMES_HOME data is preserved."
     if (-not $Yes) {
-        $answer = Read-Host "Remove and replace the existing Hermes installation? [y/N]"
+        $answer = Read-Host "Update / replace existing Hermes runtime? [y/N]"
         if ($answer -notmatch '^[Yy]') {
             Write-Host "Installation cancelled; existing Hermes was left unchanged."
             exit 0
@@ -146,7 +146,7 @@ if (-not (($userPath -split ';') | Where-Object {
 
 Write-Host ""
 Write-Host "Mongo fork installed. No upstream Hermes runtime was installed."
-$ans = Read-Host "Connect this PC to Hermes DB now? [Y/n]"
+$ans = Read-Host "Connect this PC to Hermes DB now? (already enrolled: n) [Y/n]"
 if (-not $ans) { $ans = "Y" }
 if ($ans -match '^[Yy]') {
     & $launcher db connect
