@@ -173,10 +173,31 @@ def _sanitize_loaded_credentials() -> None:
 
 
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
+    # interpolate=False: API keys may contain literal ${...} / $VAR fragments;
+    # expanding them silently corrupts credentials (401 from providers).
     try:
-        load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
+        load_dotenv(
+            dotenv_path=path,
+            override=override,
+            encoding="utf-8",
+            interpolate=False,
+        )
+    except TypeError:
+        # Older python-dotenv without interpolate=
+        try:
+            load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
+        except UnicodeDecodeError:
+            load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
     except UnicodeDecodeError:
-        load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+        try:
+            load_dotenv(
+                dotenv_path=path,
+                override=override,
+                encoding="latin-1",
+                interpolate=False,
+            )
+        except TypeError:
+            load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
     # Strip non-ASCII characters from credential env vars that were just
     # loaded.  API keys must be pure ASCII since they're sent as HTTP
     # header values (httpx encodes headers as ASCII).  Non-ASCII chars

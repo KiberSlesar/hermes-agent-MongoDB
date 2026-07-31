@@ -1069,7 +1069,13 @@ def _model_flow_custom(config):
             _identity = f"{_identity}_{_parsed.port}"
         custom_key_env = custom_endpoint_key_env(_identity)
         save_env_value(custom_key_env, effective_key)
-        print(f"  API key saved to .env as {custom_key_env}")
+        try:
+            from hermes_storage import is_mongo_mode
+
+            _dest = "Mongo secrets" if is_mongo_mode() else ".env"
+        except Exception:
+            _dest = ".env"
+        print(f"  API key saved to {_dest} as {custom_key_env}")
 
     if model_name:
         _save_model_choice(model_name)

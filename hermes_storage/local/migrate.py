@@ -31,7 +31,28 @@ def _read_yaml(path: Path) -> dict[str, Any]:
         return {}
 
 
+def _unquote_env_value(val: str) -> str:
+    """Undo one layer of .env quoting without mangling embedded quotes."""
+    val = val.strip()
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+        quote = val[0]
+        inner = val[1:-1]
+        if quote == '"':
+            inner = (
+                inner.replace("\\\\", "\0")
+                .replace('\\"', '"')
+                .replace("\\n", "\n")
+                .replace("\0", "\\")
+            )
+        return inner
+    # Unquoted: drop trailing inline comment (KEY=value # note)
+    if " #" in val:
+        val = val.split(" #", 1)[0].rstrip()
+    return val
+
+
 def _read_env_file(path: Path) -> dict[str, str]:
+    """Parse .env for Mongo seed — preserve raw secret bytes, no ${} expansion."""
     values: dict[str, str] = {}
     if not path.is_file():
         return values
@@ -39,11 +60,13 @@ def _read_env_file(path: Path) -> dict[str, str]:
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
         key, _, val = line.partition("=")
         key = key.strip()
-        val = val.strip().strip("'").strip('"')
-        if key:
-            values[key] = val
+        if not key or any(c.isspace() for c in key):
+            continue
+        values[key] = _unquote_env_value(val)
     return values
 
 

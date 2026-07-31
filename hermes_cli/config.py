@@ -3383,7 +3383,10 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         if is_mongo_mode():
             from hermes_storage import require_storage
             storage = require_storage()
-            expanded = storage.load_effective_config(expanded)
+            # Mongo may reintroduce raw ``${VAR}`` templates from profile/shared
+            # config. Re-expand after merge so api_key does not stay a literal
+            # placeholder (→ provider 401) while the env var is already set.
+            expanded = _expand_env_vars(storage.load_effective_config(expanded))
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``
@@ -3637,20 +3640,28 @@ def _parse_env_value(raw_value: str) -> str:
 
 
 def load_env() -> Dict[str, str]:
-    """Load environment variables from ~/.hermes/.env.
+    """Load secrets for credential UIs / get_env_value.
 
-    Normalizes line endings before parsing while treating each assignment's
-    value as opaque data for boundary discovery.
-
-    The parsed dict is memoised keyed on the .env file mtime, because
-    ``get_env_value()`` is called dozens-to-hundreds of times per
-    interactive menu render (`hermes tools`, `hermes setup`, status
-    panels). Sanitisation is O(lines), so re-parsing the
-    same file on every call was burning ~300ms of CPU per `hermes tools`
-    menu paint on top of the OAuth-refresh slowness. The mtime check
-    invalidates the cache when the user edits .env mid-process.
+    Mongo mode: profile secrets from the DB (source of truth).
+    Otherwise: parse ``~/.hermes/.env`` (mtime-memoised).
     """
     global _env_cache
+
+    try:
+        from hermes_storage import is_mongo_mode, get_storage
+
+        if is_mongo_mode():
+            storage = get_storage()
+            if storage is not None:
+                raw = storage.secrets.get_all()
+                return {
+                    str(k): str(v)
+                    for k, v in raw.items()
+                    if v is not None and not str(k).startswith("__")
+                }
+    except Exception:
+        pass
+
     env_path = get_env_path()
 
     try:
@@ -3832,6 +3843,7 @@ def _quote_env_value(value: str) -> str:
     # internal runs that strip() would leave alone.
     needs_quoting = (
         "#" in value
+        or "$" in value  # prevent dotenv ${} / $VAR expansion if interpolate slips on
         or '"' in value
         or "'" in value
         or value != value.strip()
@@ -3858,7 +3870,12 @@ def _env_line_defines_key(line: str, key: str) -> bool:
 
 
 def save_env_value(key: str, value: str):
-    """Save or update a value in ~/.hermes/.env."""
+    """Save or update a secret.
+
+    In Mongo mode the durable store is profile ``secrets`` in the DB — local
+    ``.env`` is not written (avoids split-brain / 401 from stale placeholders).
+    Without Mongo, behaviour is unchanged: atomic write to ``~/.hermes/.env``.
+    """
     if is_managed():
         managed_error(f"set {key}")
         return
@@ -3882,6 +3899,68 @@ def save_env_value(key: str, value: str):
     # API keys / tokens must be ASCII — strip non-ASCII with a warning.
     value = _check_non_ascii_credential(key, value)
     ensure_hermes_home()
+
+    # Mongo mode: DB is the only durable secrets store.
+    try:
+        from hermes_storage import is_mongo_mode, require_storage
+
+        _mongo = is_mongo_mode()
+    except Exception:
+        _mongo = False
+
+    if _mongo:
+        try:
+            require_storage().secrets.set(key, value)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to save {key} to Mongo secrets (Mongo mode is on; "
+                f"local .env is not used as durable store): {exc}"
+            ) from exc
+        os.environ[key] = value
+        invalidate_env_cache()
+        # Drop stale local copy so prefer-dotenv / hand-edits can't win.
+        _drop_local_env_key(key)
+        return
+
+    _write_local_env_value(key, value)
+    os.environ[key] = value
+    invalidate_env_cache()
+
+
+def _drop_local_env_key(key: str) -> None:
+    """Best-effort remove a key from local .env (Mongo mode cleanup)."""
+    env_path = get_env_path()
+    if not env_path.exists():
+        return
+    try:
+        read_kw = {"encoding": "utf-8-sig", "errors": "replace"}
+        write_kw = {"encoding": "utf-8"}
+        with open(env_path, **read_kw) as f:
+            lines = _sanitize_env_lines(f.readlines())
+        new_lines = [line for line in lines if not _env_line_defines_key(line, key)]
+        if len(new_lines) == len(lines):
+            return
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(env_path.parent), suffix=".tmp", prefix=".env_"
+        )
+        try:
+            with os.fdopen(fd, "w", **write_kw) as f:
+                f.writelines(new_lines)
+                f.flush()
+                os.fsync(f.fileno())
+            atomic_replace(tmp_path, env_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        pass
+
+
+def _write_local_env_value(key: str, value: str) -> None:
+    """Atomic write of KEY=value into ~/.hermes/.env (non-Mongo path)."""
     env_path = get_env_path()
 
     # On Windows, open() defaults to the system locale (cp1252) which can
@@ -3916,7 +3995,7 @@ def save_env_value(key: str, value: str):
         if lines and not lines[-1].endswith("\n"):
             lines[-1] += "\n"
         lines.append(f"{key}={serialized_value}\n")
-    
+
     fd, tmp_path = tempfile.mkstemp(dir=str(env_path.parent), suffix='.tmp', prefix='.env_')
     # Preserve original permissions so Docker volume mounts aren't clobbered.
     original_mode = None
@@ -3947,9 +4026,6 @@ def save_env_value(key: str, value: str):
             pass
         raise
 
-    os.environ[key] = value
-    invalidate_env_cache()
-
 
 def custom_endpoint_key_env(identity: str) -> str:
     """Env var name holding a custom endpoint's API key.
@@ -3971,7 +4047,10 @@ def custom_endpoint_key_env(identity: str) -> str:
 
 
 def remove_env_value(key: str) -> bool:
-    """Remove a key from ~/.hermes/.env and os.environ.
+    """Remove a key from the durable secrets store and os.environ.
+
+    Mongo mode: delete from profile secrets (and scrub local .env if present).
+    Otherwise: remove from ~/.hermes/.env.
 
     Returns True if the key was found and removed, False otherwise.
     """
@@ -3992,6 +4071,31 @@ def remove_env_value(key: str) -> bool:
         return False
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
+
+    try:
+        from hermes_storage import is_mongo_mode, require_storage
+
+        _mongo = is_mongo_mode()
+    except Exception:
+        _mongo = False
+
+    if _mongo:
+        try:
+            storage = require_storage()
+            values = storage.secrets.get_all()
+            found = key in values
+            if found:
+                del values[key]
+                storage.secrets.set_many(values)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to remove {key} from Mongo secrets: {exc}"
+            ) from exc
+        os.environ.pop(key, None)
+        invalidate_env_cache()
+        _drop_local_env_key(key)
+        return found
+
     env_path = get_env_path()
     if not env_path.exists():
         os.environ.pop(key, None)
