@@ -2822,46 +2822,41 @@ def _gateway_config_home() -> Path:
 
 
 def _load_gateway_config() -> dict:
-    """Load and parse ~/.hermes/config.yaml, returning {} on any error.
+    """Load user config for gateway runtime reads.
 
-    Uses the module-level ``_hermes_home`` (so tests that monkeypatch it
-    still see their fixture) and shares the mtime-keyed raw-yaml cache
-    from ``hermes_cli.config.read_raw_config`` when the paths match.
-
-    Managed scope is overlaid on the result (via the shared helper) so the
-    gateway honors administrator-pinned values — neither read_raw_config nor a
-    direct yaml.safe_load carries the managed merge on its own. Fail-open.
+    Mongo mode: shared ⊕ profile ⊕ machine overlay (fleet SoT). Classic:
+    ``config.yaml`` under the gateway home. Managed scope is overlaid so
+    administrator-pinned values apply. Mongo errors fail hard; classic
+    parse errors fail open to ``{}``.
     """
     config_home = _gateway_config_home()
-    config_path = config_home / 'config.yaml'
     raw: dict = {}
-    used_canonical = False
     try:
-        from hermes_cli.config import get_config_path, read_raw_config
-        # Fast path: if _hermes_home agrees with the canonical config
-        # location, reuse the shared cache. Otherwise fall through to a
-        # direct read (keeps test fixtures with a monkeypatched
-        # _hermes_home working).
-        if config_path == get_config_path():
-            raw = read_raw_config()
-            used_canonical = True
-    except Exception:
-        pass
+        from hermes_cli.config import load_user_config_for_gateway
 
-    if not used_canonical:
+        raw = load_user_config_for_gateway(config_home)
+    except Exception as exc:
+        mongo = False
         try:
-            if config_path.exists():
-                import yaml
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    raw = yaml.safe_load(f) or {}
-        except Exception:
-            logger.debug("Could not load gateway config from %s", config_path)
-            raw = {}
+            from hermes_storage import is_mongo_mode
 
-    # Overlay managed scope. read_raw_config() returns the user's raw YAML
-    # WITHOUT the managed merge (that lives in load_config/_load_config_impl),
-    # so the overlay is required on both paths for the gateway to honor pinned
-    # values. Helper is fail-open and a no-op when no managed scope exists.
+            mongo = bool(is_mongo_mode())
+        except Exception:
+            mongo = False
+        if mongo:
+            raise
+        logger.debug(
+            "Could not load gateway config from %s: %s",
+            config_home / "config.yaml",
+            exc,
+        )
+        raw = {}
+
+    # Overlay managed scope. load_user_config_for_gateway returns the user's
+    # raw/Mongo document WITHOUT the managed merge (that lives in
+    # load_config/_load_config_impl), so the overlay is required for the
+    # gateway to honor pinned values. Helper is fail-open and a no-op when no
+    # managed scope exists.
     try:
         from hermes_cli import managed_scope
         raw = managed_scope.apply_managed_overlay(raw if isinstance(raw, dict) else {})

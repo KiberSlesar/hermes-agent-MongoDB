@@ -3000,6 +3000,54 @@ def read_raw_config() -> Dict[str, Any]:
         return data
 
 
+def load_user_config_for_gateway(
+    config_home: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """User config dict for messaging-gateway loaders.
+
+    Mongo mode: ``shared ⊕ profile ⊕ machine overlay`` — fleet-shared
+    ``gateway`` / ``platforms`` settings with per-PC overlay (e.g. api_server
+    bind). Fail hard on Mongo errors (no local yaml fallback).
+
+    Classic mode: raw ``config.yaml`` under *config_home* (or HERMES_HOME).
+    """
+    try:
+        from hermes_storage import is_mongo_mode, require_storage
+
+        if is_mongo_mode():
+            data = require_storage().load_effective_config({}) or {}
+            return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        try:
+            from hermes_storage import is_mongo_mode as _mongo_on
+
+            if _mongo_on():
+                raise RuntimeError(
+                    f"Failed to load gateway config from Mongo: {exc}"
+                ) from exc
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+    home = Path(config_home) if config_home is not None else get_hermes_home()
+    config_path = home / "config.yaml"
+    try:
+        if config_path == get_config_path():
+            return read_raw_config()
+    except Exception:
+        pass
+
+    try:
+        if config_path.exists():
+            with open(config_path, encoding="utf-8") as f:
+                data = fast_safe_load(f) or {}
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        _warn_config_parse_failure(config_path, e)
+    return {}
+
+
 def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
     """Read a user ``config.yaml`` EXACTLY as written on disk.
 

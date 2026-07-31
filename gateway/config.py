@@ -1273,14 +1273,14 @@ def load_gateway_config() -> GatewayConfig:
         except Exception as e:
             logger.warning("Failed to load %s: %s", gateway_json_path, e)
 
-    # Primary source: config.yaml
+    # Primary source: Mongo effective config (fleet SoT) or local config.yaml.
     try:
-        import yaml
-        config_yaml_path = _home / "config.yaml"
-        if config_yaml_path.exists():
-            with open(config_yaml_path, encoding="utf-8") as f:
-                yaml_cfg = yaml.safe_load(f) or {}
+        from hermes_cli.config import load_user_config_for_gateway
 
+        yaml_cfg = load_user_config_for_gateway(_home)
+        if not isinstance(yaml_cfg, dict):
+            yaml_cfg = {}
+        if yaml_cfg:
             # Managed scope: overlay administrator-pinned values so the gateway
             # honors them too. This loader builds its own dict instead of going
             # through hermes_cli.config.load_config, so without this a managed
@@ -1732,6 +1732,15 @@ def load_gateway_config() -> GatewayConfig:
             # #41112 / #3823.
 
     except Exception as e:
+        mongo = False
+        try:
+            from hermes_storage import is_mongo_mode
+
+            mongo = bool(is_mongo_mode())
+        except Exception:
+            mongo = False
+        if mongo:
+            raise
         logger.warning(
             "Failed to process config.yaml — falling back to .env / gateway.json values. "
             "Check %s for syntax errors. Error: %s",

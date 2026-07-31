@@ -403,3 +403,57 @@ def test_fail_hard_unreachable_uri(monkeypatch, tmp_path):
     with pytest.raises(MongoStorageError):
         SessionDB()
     assert not (tmp_path / "state.db").exists()
+
+
+def test_load_user_config_for_gateway_uses_mongo_effective(monkeypatch, tmp_path):
+    """Fleet gateway settings come from Mongo, not a local config.yaml."""
+    from hermes_cli.config import load_user_config_for_gateway
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # Stale local yaml must not win over Mongo.
+    (tmp_path / "config.yaml").write_text(
+        "platforms:\n  telegram:\n    enabled: false\n",
+        encoding="utf-8",
+    )
+
+    class _FakeStorage:
+        def load_effective_config(self, base=None):
+            return {
+                "gateway": {"unauthorized_dm_behavior": "ignore"},
+                "platforms": {"telegram": {"enabled": True}},
+            }
+
+    monkeypatch.setattr("hermes_storage.is_mongo_mode", lambda: True)
+    monkeypatch.setattr("hermes_storage.require_storage", lambda: _FakeStorage())
+
+    cfg = load_user_config_for_gateway(tmp_path)
+    assert cfg["platforms"]["telegram"]["enabled"] is True
+    assert cfg["gateway"]["unauthorized_dm_behavior"] == "ignore"
+
+
+def test_load_gateway_config_reads_mongo_platforms(monkeypatch, tmp_path):
+    """GatewayConfig.platforms must reflect Mongo SoT without local yaml."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # No local config.yaml at all.
+
+    class _FakeStorage:
+        def load_effective_config(self, base=None):
+            return {
+                "gateway": {"unauthorized_dm_behavior": "ignore"},
+                "platforms": {
+                    "telegram": {
+                        "enabled": True,
+                        "home_channel": {"platform": "telegram", "chat_id": "1", "name": "Home"},
+                    }
+                },
+            }
+
+    monkeypatch.setattr("hermes_storage.is_mongo_mode", lambda: True)
+    monkeypatch.setattr("hermes_storage.require_storage", lambda: _FakeStorage())
+
+    from gateway.config import Platform, load_gateway_config
+
+    gw = load_gateway_config()
+    assert Platform.TELEGRAM in gw.platforms
+    assert gw.platforms[Platform.TELEGRAM].enabled is True
+    assert gw.unauthorized_dm_behavior == "ignore"

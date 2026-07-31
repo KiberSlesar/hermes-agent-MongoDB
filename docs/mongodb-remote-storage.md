@@ -80,6 +80,13 @@ From chat: tools `cluster_status` / `cluster_activate`, slash `/cluster`.
 Messaging gateway moves with a lease handoff (one Telegram bot owner at a time),
 with rollback and auto-failover.
 
+Gateway / platforms settings (`gateway`, `platforms` in config — bot tokens in
+secrets) are fleet-shared via Mongo profile config. Both `load_gateway_config()`
+and the runner’s `_load_gateway_config()` read
+`shared ⊕ profile ⊕ machine overlay` (not a local stale `config.yaml`).
+Per-PC overlay still applies only to machine-local keys (e.g. `api_server`
+host/port).
+
 ## Fail-hard (no silent local fallback)
 
 When Mongo mode is on (`bootstrap.yaml` / `HERMES_MONGO_URI`), Hermes **never**
