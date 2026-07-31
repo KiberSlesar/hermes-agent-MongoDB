@@ -457,6 +457,32 @@ def test_reconcile_skips_when_not_owner(monkeypatch):
     assert cluster_module._LOCAL_MESSAGING_HELD is False
 
 
+def test_reconcile_skipped_during_gateway_bootstrap(monkeypatch):
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def get_state(self):
+            return {
+                "handoff_state": "idle",
+                "messaging_owner": "win",
+                "active_node_id": "win",
+            }
+
+    calls = []
+    monkeypatch.setattr(cluster_module, "_GATEWAY_BOOTSTRAPPING", True)
+    monkeypatch.setattr(cluster_module, "_LOCAL_MESSAGING_HELD", False)
+    monkeypatch.setattr(cluster_module, "_ACQUIRE_CB", lambda: calls.append("acquire") or True)
+    storage = type("Storage", (), {
+        "node_id": "win",
+        "machine_id": "win-pc",
+        "cluster": Cluster(),
+    })()
+
+    cluster_module._maybe_reconcile_messaging(storage)
+
+    assert calls == []
+
+
 def test_drop_stale_messaging_when_lease_lost(monkeypatch):
     from hermes_storage import cluster as cluster_module
 
@@ -469,6 +495,7 @@ def test_drop_stale_messaging_when_lease_lost(monkeypatch):
             }
 
     released = []
+    monkeypatch.setattr(cluster_module, "_GATEWAY_BOOTSTRAPPING", False)
     monkeypatch.setattr(cluster_module, "_LOCAL_MESSAGING_HELD", True)
     monkeypatch.setattr(cluster_module, "_RELEASE_CB", lambda: released.append(True))
     storage = type("Storage", (), {

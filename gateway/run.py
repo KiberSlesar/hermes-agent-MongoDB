@@ -10148,6 +10148,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Clean up and exit startup when restart/shutdown begins mid-startup."""
         if not self._startup_should_abort():
             return False
+        try:
+            from hermes_storage.cluster import set_gateway_bootstrapping
+
+            set_gateway_bootstrapping(False)
+        except Exception:
+            pass
         if adapter is not None and platform is not None:
             try:
                 await adapter.cancel_background_tasks()
@@ -10389,7 +10395,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # passive nodes can defer Telegram/Discord until activated.
                 try:
                     from hermes_storage import get_storage
+                    from hermes_storage.cluster import set_gateway_bootstrapping
 
+                    set_gateway_bootstrapping(True)
                     _st = get_storage()
                     if _st is not None:
                         _st.register_presence()
@@ -10400,13 +10408,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     api_cfg = getattr(self.config, "platforms", None)
                 except Exception:
                     api_cfg = None
-                start_heartbeat_loop(api_base=api_base or None)
                 self._mongo_defer_messaging = not should_connect_messaging()
                 if self._mongo_defer_messaging:
                     logger.info(
                         "This node is not the messaging owner — "
                         "Telegram/Discord will connect on cluster activate"
                     )
+                # Heartbeat starts under bootstrapping=True so reconcile cannot
+                # race the connect loop below and open a second getUpdates.
+                start_heartbeat_loop(api_base=api_base or None)
                 logger.info("Mongo cluster heartbeat started")
         except Exception as exc:
             logger.debug("Cluster heartbeat not started: %s", exc)
@@ -11117,6 +11127,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         self.delivery_router.adapters = self.adapters
         self._wire_teams_pipeline_runtime()
+
+        # End bootstrap fence: allow cluster reconcile to acquire/release.
+        # If we already connected messaging as owner, mark held so the next
+        # heartbeat does not open a second getUpdates session.
+        try:
+            from hermes_storage import is_mongo_mode
+            from hermes_storage.cluster import (
+                is_messaging_platform as _is_msg_plat,
+                mark_local_messaging_held,
+                set_gateway_bootstrapping,
+                should_connect_messaging as _should_msg,
+            )
+
+            if is_mongo_mode():
+                messaging_live = any(
+                    _adapter_already_connected(adapter)
+                    for platform, adapter in self.adapters.items()
+                    if _is_msg_plat(platform)
+                )
+                if _should_msg() and messaging_live:
+                    mark_local_messaging_held(True)
+                set_gateway_bootstrapping(False)
+        except Exception:
+            logger.debug("Cluster bootstrap fence clear failed", exc_info=True)
+            try:
+                from hermes_storage.cluster import set_gateway_bootstrapping
+
+                set_gateway_bootstrapping(False)
+            except Exception:
+                pass
 
         self._running = True
         self._update_runtime_status("running")
@@ -12190,6 +12230,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         service_restart: bool = False,
     ) -> None:
         """Stop the gateway and disconnect all adapters."""
+        try:
+            from hermes_storage.cluster import set_gateway_bootstrapping
+
+            set_gateway_bootstrapping(False)
+        except Exception:
+            pass
         # getattr-guard: shutdown-path tests build bare runners via
         # object.__new__ that lack the liveness-guard machinery.
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)

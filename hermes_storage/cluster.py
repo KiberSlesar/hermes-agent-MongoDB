@@ -21,9 +21,23 @@ _NOTIFY_CB: Optional[Callable[[str], None]] = None
 # Used so a gateway that started deferred can connect once it becomes owner
 # even if handoff_state is already idle (missed the acquiring tick).
 _LOCAL_MESSAGING_HELD: bool = False
+# True while GatewayRunner.start() is still wiring adapters. Blocks reconcile
+# acquire so it cannot race the normal connect loop and open a second
+# getUpdates session against the same bot token.
+_GATEWAY_BOOTSTRAPPING: bool = False
 
 # Platforms that stay up on every fleet node (not Telegram/Discord lease).
 NON_MESSAGING_PLATFORMS = frozenset({"api_server", "local", "webhook"})
+
+
+def set_gateway_bootstrapping(active: bool) -> None:
+    global _GATEWAY_BOOTSTRAPPING
+    _GATEWAY_BOOTSTRAPPING = bool(active)
+
+
+def mark_local_messaging_held(held: bool = True) -> None:
+    global _LOCAL_MESSAGING_HELD
+    _LOCAL_MESSAGING_HELD = bool(held)
 
 
 def is_messaging_platform(platform: Any) -> bool:
@@ -364,6 +378,8 @@ def _maybe_reconcile_messaging(storage: Any) -> None:
     acquiring branch never runs again — reconnect here.
     """
     global _LOCAL_MESSAGING_HELD
+    if _GATEWAY_BOOTSTRAPPING:
+        return
     if not should_connect_messaging(storage):
         # Stale hold: we lost the lease but still think we own adapters.
         _maybe_drop_stale_messaging(storage)
