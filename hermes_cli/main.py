@@ -4592,6 +4592,10 @@ def cmd_storage(args):
             print("  connection: OK")
             print(f"  machine_id: {storage.machine_id}")
             print(f"  node_id: {storage.node_id}")
+            print("")
+            from hermes_cli.mongo_cmds import collect_mongo_inventory, format_mongo_inventory
+
+            print(format_mongo_inventory(collect_mongo_inventory(storage)))
         except Exception as exc:
             print(f"  connection: FAILED ({exc})")
         return
