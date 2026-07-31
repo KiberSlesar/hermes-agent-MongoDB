@@ -261,7 +261,7 @@ fi
 export PATH="$HERMES_HOME_DIR/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
 hash -r 2>/dev/null || true
 
-# HARD REQUIREMENT: hermes db connect must work after this installer
+# HARD REQUIREMENT: hermes db connect + hermes mongo status must work after install
 verify_db_connect() {
   "$HERMES_HOME_DIR/bin/hermes" db connect --help >/dev/null 2>&1 && return 0
   "$HOME/.local/bin/hermes" db connect --help >/dev/null 2>&1 && return 0
@@ -270,8 +270,16 @@ verify_db_connect() {
   return 1
 }
 
-if ! "$PY" -c "import hermes_cli.main, hermes_storage" 2>/dev/null; then
-  die "Mongo packages failed to import via $PY вЂ” pip install -e likely failed"
+verify_mongo_status() {
+  "$HERMES_HOME_DIR/bin/hermes" mongo status --help >/dev/null 2>&1 && return 0
+  "$HOME/.local/bin/hermes" mongo status --help >/dev/null 2>&1 && return 0
+  hermes mongo status --help >/dev/null 2>&1 && return 0
+  "$PY" -m hermes_cli.main mongo status --help >/dev/null 2>&1 && return 0
+  return 1
+}
+
+if ! "$PY" -c "import hermes_cli.main, hermes_storage, hermes_cli.mongo_cmds" 2>/dev/null; then
+  die "Mongo packages failed to import via $PY — pip install -e likely failed"
 fi
 
 if ! verify_db_connect; then
@@ -280,17 +288,27 @@ if ! verify_db_connect; then
   echo "  which hermes = $(command -v hermes || echo none)"
   echo "  hermes --help (first lines):"
   hermes --help 2>&1 | head -20 || true
-  die "hermes db connect still missing after install вЂ” this is a bug, installer aborting"
+  die "hermes db connect still missing after install — this is a bug, installer aborting"
 fi
 
-say "Verified: hermes db connect works"
+if ! verify_mongo_status; then
+  echo ""
+  echo "DEBUG:"
+  echo "  which hermes = $(command -v hermes || echo none)"
+  hermes mongo --help 2>&1 | head -20 || true
+  die "hermes mongo status still missing after install — this is a bug, installer aborting"
+fi
+
+say "Verified: hermes db connect + hermes mongo status"
 echo "  which hermes: $(command -v hermes)"
+echo "  try: hermes mongo status"
 echo "  try: hermes db connect --help"
 
 echo ""
 echo "${GREEN}OK Agent installed (Mongo)${NC}"
 echo "  Source:   $AGENT_DIR"
 echo "  Launcher: $(command -v hermes)"
+echo "  Status:   hermes mongo status"
 echo ""
 
 curl_enroll() {

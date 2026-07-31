@@ -273,12 +273,13 @@ def cmd_db_connect(args: Any) -> None:
                     f"(config={prof.get('config', 0)}, soul={prof.get('soul', 0)}, "
                     f"secrets={prof.get('secrets', 0)})"
                 )
-            print("  Canonical state is Mongo; ~/.hermes/skills is only a cache/staging.")
+            print("  Canonical state is Mongo; local skills are only a cache.")
         except Exception as seed_exc:
             print(f"! Seed/migrate warning: {seed_exc}")
             print("  Run later: hermes storage migrate")
 
-        print("  Next: hermes cluster status")
+        print("  Next: hermes mongo status")
+        print("        hermes cluster status")
     except Exception as exc:
         print(f"Bootstrap installed, but Mongo ping failed: {exc}")
         print("  Check HERMES_MONGO_HOSTS on the server and network/firewall.")

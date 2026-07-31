@@ -36,8 +36,10 @@ curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB-pr
 # на DB
 systemctl --user status hermes-mongod hermes-enroll hermes-orchestrator
 
-# на агенте
-hermes storage status
+# на агенте — штатная команда (сразу после install / db connect)
+hermes mongo status
+# или: hermes mongo
+```
 hermes cluster status
 ```
 
