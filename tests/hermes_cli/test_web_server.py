@@ -3205,6 +3205,34 @@ def test_resolve_chat_argv_injects_gateway_ws_url(monkeypatch):
     assert "token=" in gateway_url
 
 
+def test_resolve_chat_argv_uses_mongo_config_over_stale_model_env(monkeypatch):
+    import hermes_cli.main as cli_main
+    import hermes_cli.web_server as ws
+    import hermes_storage
+
+    monkeypatch.setattr(
+        cli_main,
+        "_make_tui_argv",
+        lambda *_args, **_kwargs: (["node", "fake-tui.js"], Path("/tmp")),
+    )
+    monkeypatch.setattr(hermes_storage, "is_mongo_mode", lambda: True)
+    monkeypatch.setenv("HERMES_MODEL", "stale/glm-5.2")
+    monkeypatch.setenv("HERMES_INFERENCE_MODEL", "stale/glm-5.2")
+    monkeypatch.setenv("HERMES_TUI_PROVIDER", "stale")
+    monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "stale")
+
+    _argv, _cwd, env = ws._resolve_chat_argv()
+
+    assert env is not None
+    for key in (
+        "HERMES_MODEL",
+        "HERMES_INFERENCE_MODEL",
+        "HERMES_TUI_PROVIDER",
+        "HERMES_INFERENCE_PROVIDER",
+    ):
+        assert key not in env
+
+
 class TestDashboardPluginStaticAssetAllowlist:
     """``/dashboard-plugins/<name>/<path>`` is unauthenticated by design —
     the SPA loads plugin JS via ``<script src>`` and CSS via

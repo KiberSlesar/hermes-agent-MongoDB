@@ -14612,6 +14612,24 @@ def _resolve_chat_argv(
     # An explicit profile scope below still overrides HERMES_HOME afterwards.
     from tools.environments.local import build_subprocess_env
     env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=True)
+    # Mongo profile config is authoritative for Dashboard chats. A dashboard
+    # process may inherit a launch-scoped HERMES_MODEL/provider seed; the TUI
+    # gives it priority over load_config(), while the Dashboard model card reads
+    # the profile config. That makes the displayed and actually-run models
+    # diverge. Strip only transient inference selectors in Mongo mode.
+    try:
+        from hermes_storage import is_mongo_mode
+
+        if is_mongo_mode():
+            for key in (
+                "HERMES_MODEL",
+                "HERMES_INFERENCE_MODEL",
+                "HERMES_TUI_PROVIDER",
+                "HERMES_INFERENCE_PROVIDER",
+            ):
+                env.pop(key, None)
+    except Exception:
+        pass
     try:
         from hermes_cli.config import apply_terminal_config_to_env
         apply_terminal_config_to_env(env=env)
