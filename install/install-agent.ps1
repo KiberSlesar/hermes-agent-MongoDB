@@ -42,6 +42,44 @@ function Ensure-Uv {
     return $uv
 }
 
+function Confirm-ReplaceExistingInstallation {
+    param(
+        [string]$AgentDir
+    )
+
+    $existingCommand = Get-Command hermes -ErrorAction SilentlyContinue
+    $hasExistingCheckout = Test-Path $AgentDir
+    if (-not $existingCommand -and -not $hasExistingCheckout) {
+        return
+    }
+
+    Write-Host "An existing Hermes installation was found:"
+    if ($existingCommand) {
+        Write-Host "  command: $($existingCommand.Source)"
+    }
+    if ($hasExistingCheckout) {
+        Write-Host "  checkout: $AgentDir"
+    }
+    Write-Host "Replacing it removes its launcher/runtime only; HERMES_HOME data is preserved."
+    $answer = Read-Host "Remove and replace the existing Hermes installation? [y/N]"
+    if ($answer -notmatch '^[Yy]') {
+        Write-Host "Installation cancelled; existing Hermes was left unchanged."
+        exit 0
+    }
+
+    # The old checkout is the runtime managed by this installer. Do not delete
+    # arbitrary directories or user profile data discovered through PATH.
+    if ($hasExistingCheckout) {
+        Remove-Item -Recurse -Force $AgentDir
+    }
+    if ($existingCommand -and
+        $existingCommand.CommandType -eq "Application" -and
+        $existingCommand.Source -and
+        (Test-Path $existingCommand.Source)) {
+        Remove-Item -Force $existingCommand.Source
+    }
+}
+
 Write-Host ""
 Write-Host "Hermes Agent installer (Mongo / Windows)"
 Write-Host "  HERMES_HOME=$HermesHome"
@@ -53,12 +91,12 @@ $env:HERMES_HOME = $HermesHome
 $tmp = Join-Path $env:TEMP ("hermes-agent-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 $archive = Join-Path $tmp "src.tgz"
+$agentDir = Join-Path $HermesHome "hermes-agent"
 Write-Host "Downloading Mongo fork $Repo@$Ref …"
 Invoke-WebRequest -Uri "https://api.github.com/repos/$Repo/tarball/$Ref" -Headers (Get-AuthHeaders) -OutFile $archive
 tar -xzf $archive -C $tmp
 $src = Get-ChildItem $tmp -Directory | Select-Object -First 1
-$agentDir = Join-Path $HermesHome "hermes-agent"
-if (Test-Path $agentDir) { Remove-Item -Recurse -Force $agentDir }
+Confirm-ReplaceExistingInstallation -AgentDir $agentDir
 Move-Item $src.FullName $agentDir
 
 Push-Location $agentDir

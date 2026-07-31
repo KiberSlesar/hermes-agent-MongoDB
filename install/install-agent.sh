@@ -59,6 +59,37 @@ ask() {
   printf -v "$__var" '%s' "$__ans"
 }
 
+confirm_replace_existing_installation() {
+  local existing=""
+  existing="$(command -v hermes 2>/dev/null || true)"
+  [[ -n "$existing" || -d "$AGENT_DIR" ]] || return 0
+
+  echo "An existing Hermes installation was found:" >&2
+  [[ -n "$existing" ]] && echo "  command: $existing" >&2
+  [[ -d "$AGENT_DIR" ]] && echo "  checkout: $AGENT_DIR" >&2
+  echo "Replacing it removes its launcher/runtime only; HERMES_HOME data is preserved." >&2
+  if ! can_prompt; then
+    die "Existing Hermes found. Re-run interactively to confirm its replacement."
+  fi
+
+  local answer=""
+  printf "%s" "Remove and replace the existing Hermes installation? [y/N] " > /dev/tty
+  read -r answer < /dev/tty || true
+  if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+    echo "Installation cancelled; existing Hermes was left unchanged." >&2
+    exit 0
+  fi
+
+  [[ -d "$AGENT_DIR" ]] && rm -rf "$AGENT_DIR"
+  if [[ -n "$existing" && -e "$existing" ]]; then
+    if [[ -w "$(dirname "$existing")" ]]; then
+      rm -f "$existing"
+    else
+      sudo rm -f "$existing"
+    fi
+  fi
+}
+
 auth_curl() {
   if [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]]; then
     curl -fsSL -H "Authorization: Bearer ${GH_TOKEN:-$GITHUB_TOKEN}" "$@"
@@ -92,10 +123,7 @@ tar -xzf "$TMP/src.tgz" -C "$TMP/out"
 SRC=$(find "$TMP/out" -mindepth 1 -maxdepth 1 -type d | head -1)
 [[ -n "$SRC" ]] || die "empty archive"
 
-if [[ -d "$AGENT_DIR" ]]; then
-  say "Replacing existing checkout at $AGENT_DIR"
-  rm -rf "$AGENT_DIR"
-fi
+confirm_replace_existing_installation
 mkdir -p "$(dirname "$AGENT_DIR")"
 mv "$SRC" "$AGENT_DIR"
 
