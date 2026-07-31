@@ -211,8 +211,23 @@ PY_BASE="$(pick_python | tail -n1 | tr -d '\r')"
 [[ -n "$PY_BASE" ]] || PY_BASE="python3"
 say "Using interpreter: $PY_BASE ($(py_majmin "$PY_BASE"))"
 
+# Slow / flaky PyPI links exceed uv's 30s default.
+export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-180}"
+export UV_HTTP_RETRIES="${UV_HTTP_RETRIES:-10}"
+export UV_REQUEST_TIMEOUT="${UV_REQUEST_TIMEOUT:-$UV_HTTP_TIMEOUT}"
+
 if command -v uv >/dev/null 2>&1; then
-  (cd "$AGENT_DIR" && uv venv .venv --python "$PY_BASE" && uv pip install -e .)
+  say "uv pip install (HTTP timeout=${UV_HTTP_TIMEOUT}s, retries=${UV_HTTP_RETRIES})"
+  pip_ok=0
+  for attempt in 1 2 3 4 5; do
+    if (cd "$AGENT_DIR" && uv venv .venv --python "$PY_BASE" && uv pip install -e .); then
+      pip_ok=1
+      break
+    fi
+    warn "uv pip install failed (attempt $attempt/5); retrying…"
+    sleep $((5 * attempt))
+  done
+  [[ "$pip_ok" -eq 1 ]] || die "uv pip install failed after retries (PyPI timeout/network). Retry with UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=15"
   PY="$AGENT_DIR/.venv/bin/python"
 elif ensure_venv_support && "$PY_BASE" -m venv "$AGENT_DIR/.venv"; then
   "$AGENT_DIR/.venv/bin/pip" install -U pip -q

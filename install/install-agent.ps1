@@ -105,18 +105,80 @@ function Ensure-Uv {
     return $uv
 }
 
+function Set-UvNetworkDefaults {
+    # Slow / flaky PyPI links (common on Windows) exceed uv's 30s default.
+    if (-not $env:UV_HTTP_TIMEOUT) { $env:UV_HTTP_TIMEOUT = "180" }
+    if (-not $env:UV_HTTP_RETRIES) { $env:UV_HTTP_RETRIES = "10" }
+    if (-not $env:UV_REQUEST_TIMEOUT) { $env:UV_REQUEST_TIMEOUT = $env:UV_HTTP_TIMEOUT }
+}
+
+function Install-MongoEditable {
+    param(
+        [string]$Uv,
+        [string]$Python,
+        [string]$AgentDir,
+        [int]$Attempts = 5
+    )
+
+    Set-UvNetworkDefaults
+    Write-Host ("Installing Mongo packages (uv HTTP timeout={0}s, retries={1})…" -f `
+        $env:UV_HTTP_TIMEOUT, $env:UV_HTTP_RETRIES)
+
+    $lastError = $null
+    for ($i = 1; $i -le $Attempts; $i++) {
+        try {
+            & $Uv pip install --python $Python -e $AgentDir
+            if ($LASTEXITCODE -ne 0) {
+                throw "uv pip install exited with code $LASTEXITCODE"
+            }
+            & $Python -c "import yaml, hermes_cli, hermes_storage"
+            if ($LASTEXITCODE -ne 0) {
+                throw "post-install import check failed (yaml/hermes_cli/hermes_storage)"
+            }
+            return
+        } catch {
+            $lastError = $_
+            Write-Host ("Package install retry {0}/{1}: {2}" -f $i, $Attempts, $_.Exception.Message)
+            if ($i -lt $Attempts) {
+                Start-Sleep -Seconds (5 * $i)
+            }
+        }
+    }
+
+    throw @"
+Failed to install Mongo packages after $Attempts attempts (PyPI timeout/network).
+Last error: $lastError
+
+Retry with a longer timeout, or set a mirror:
+  `$env:UV_HTTP_TIMEOUT = '300'
+  `$env:UV_HTTP_RETRIES = '15'
+  # optional: `$env:UV_INDEX_URL = 'https://pypi.org/simple'
+  `$env:HERMES_YES = '1'; `$env:HERMES_SKIP_CONNECT = '1'
+  irm https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/install-agent.ps1 | iex
+
+Or repair the existing checkout without re-download:
+  cd `$env:LOCALAPPDATA\hermes\hermes-agent
+  `$env:UV_HTTP_TIMEOUT = '300'; `$env:UV_HTTP_RETRIES = '15'
+  uv pip install --python .venv\Scripts\python.exe -e .
+"@
+}
+
 function Stop-HermesRuntimeLocks {
     param(
         [string]$AgentDir
     )
 
     # Gateway / CLI keep .venv\Scripts\python.exe locked on Windows.
+    # Prefer process kill below — `hermes gateway stop` itself needs a healthy
+    # venv (imports yaml) and often fails mid-broken-upgrade.
     $launcher = Get-Command hermes -ErrorAction SilentlyContinue
     if ($launcher) {
         try {
             Write-Host "Stopping hermes gateway (if running)…"
             & $launcher.Source gateway stop 2>$null | Out-Null
-        } catch {}
+        } catch {
+            Write-Host "gateway stop skipped (runtime may be broken); killing locked processes…"
+        }
     }
 
     $agentFull = [System.IO.Path]::GetFullPath($AgentDir)
@@ -228,11 +290,15 @@ try {
     # installer: it installs a second CLI/config path and can overwrite the
     # Mongo-aware command surface.
     $uv = Ensure-Uv
+    Set-UvNetworkDefaults
     Write-Host "Installing Python 3.12 for the Mongo fork…"
     & $uv python install 3.12
+    if ($LASTEXITCODE -ne 0) { throw "uv python install 3.12 failed (exit $LASTEXITCODE)" }
     & $uv venv .venv --python 3.12
+    if ($LASTEXITCODE -ne 0) { throw "uv venv failed (exit $LASTEXITCODE)" }
     $python = Join-Path $agentDir ".venv\Scripts\python.exe"
-    & $uv pip install --python $python -e .
+    if (-not (Test-Path $python)) { throw "venv python missing: $python" }
+    Install-MongoEditable -Uv $uv -Python $python -AgentDir $agentDir
 } finally {
     Pop-Location
 }
