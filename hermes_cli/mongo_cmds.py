@@ -12,6 +12,10 @@ def build_mongo_parser(subparsers, *, cmd_mongo: Callable) -> None:
         description="Show what Hermes has stored in MongoDB",
     )
     mongo_sub = parser.add_subparsers(dest="mongo_command")
+    try:
+        mongo_sub.required = False
+    except (AttributeError, TypeError):
+        pass
 
     status = mongo_sub.add_parser(
         "status",
