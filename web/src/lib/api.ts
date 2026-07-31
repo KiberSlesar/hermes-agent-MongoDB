@@ -321,6 +321,23 @@ export interface SessionQueryOptions {
   excludeSources?: string[];
 }
 
+export interface ClusterNode {
+  node_id: string;
+  machine_id?: string;
+  hostname?: string;
+  online?: boolean;
+  active_turns?: number;
+}
+
+export interface ClusterStatus {
+  state: {
+    active_node_id?: string | null;
+    messaging_owner?: string | null;
+    handoff_state?: string | null;
+  };
+  nodes: ClusterNode[];
+}
+
 function normalizeSessionQueryOptions(
   profileOrOptions?: string | SessionQueryOptions,
   order: "created" | "recent" = "created",
@@ -350,6 +367,12 @@ function appendSessionFilters(url: string, options: SessionQueryOptions): string
 export const api = {
   buildWsUrl,
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
+  getCluster: () => fetchJSON<ClusterStatus>("/api/cluster"),
+  activateClusterNode: (target: string) =>
+    fetchJSON<{ ok: true; state: ClusterStatus["state"] }>("/api/cluster/activate", {
+      method: "POST",
+      body: JSON.stringify({ target, reason: "dashboard" }),
+    }),
   /**
    * Identity probe for the dashboard auth gate (Phase 7).
    *

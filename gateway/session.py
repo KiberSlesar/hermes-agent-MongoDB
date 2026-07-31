@@ -1248,6 +1248,19 @@ class SessionStore:
         state.db) never see each other's routing entries.
         """
         try:
+            from hermes_storage import is_mongo_mode
+            if is_mongo_mode():
+                from hermes_storage import get_storage
+
+                storage = get_storage()
+                if storage is not None:
+                    # Mongo transcripts are shared by profile across machines.
+                    # A local sessions_dir scope would strand the gateway
+                    # session→transcript binding on the old active node.
+                    return f"mongo-profile:{storage.bootstrap.profile}"
+        except Exception:
+            logger.debug("Mongo routing scope unavailable", exc_info=True)
+        try:
             return str(Path(self.sessions_dir).resolve())
         except Exception:
             return str(self.sessions_dir)

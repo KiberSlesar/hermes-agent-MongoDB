@@ -164,6 +164,17 @@ def _get_message_storage_state(db, message_id) -> Optional[Dict[str, Any]]:
     """Return the owning session and visibility flags for *message_id*."""
     if not message_id:
         return None
+    adapter_lookup = getattr(db, "get_message_storage_state", None)
+    if callable(adapter_lookup):
+        try:
+            return adapter_lookup(message_id)
+        except Exception:
+            logging.debug(
+                "adapter message storage-state lookup failed for %s",
+                message_id,
+                exc_info=True,
+            )
+            return None
     try:
         with db._lock:
             cursor = db._conn.execute(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import threading
@@ -39,7 +40,17 @@ def _session_doc_to_sessiondb_shape(doc: Optional[Dict[str, Any]]) -> Optional[D
     # last_active, so use it when older Mongo documents do not carry that key.
     if out.get("last_active") is None and out.get("updated_at") is not None:
         out["last_active"] = out["updated_at"]
+    if out.get("id") is None and out.get("session_id") is not None:
+        out["id"] = out["session_id"]
     return out
+
+
+def _mongo_message_id(session_id: str, message_index: Any) -> int:
+    """Stable integer message id for SessionDB-compatible recall APIs."""
+    key = f"{session_id}:{message_index}".encode("utf-8")
+    return int.from_bytes(
+        hashlib.blake2b(key, digest_size=8).digest(), "big"
+    ) & ((1 << 63) - 1)
 
 
 class MongoSessionAdapter:
@@ -63,6 +74,7 @@ class MongoSessionAdapter:
         self._wal_active = False
         self._write_count = 0
         self._mongo_mode = True
+        self._message_state_cache: Dict[int, Dict[str, Any]] = {}
 
     def close(self) -> None:
         return None
@@ -83,7 +95,12 @@ class MongoSessionAdapter:
         self._store.update_session(session_id, ended_at=None, end_reason=None)
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        return _session_doc_to_sessiondb_shape(self._store.get_session(session_id))
+        session = _session_doc_to_sessiondb_shape(self._store.get_session(session_id))
+        if session is not None:
+            session["message_count"] = len(
+                self._store.get_messages(session_id, include_inactive=True)
+            )
+        return session
 
     def delete_session(self, session_id: str) -> bool:
         return self._store.delete_session(session_id)
@@ -92,10 +109,36 @@ class MongoSessionAdapter:
         return sum(1 for sid in session_ids if self.delete_session(sid))
 
     def list_sessions_rich(self, *, limit: int = 50, source: Optional[str] = None, **kwargs):
-        return [
-            _session_doc_to_sessiondb_shape(session) or {}
-            for session in self._store.list_sessions(limit=limit, source=source)
-        ]
+        offset = max(0, int(kwargs.get("offset") or 0))
+        exclude_sources = set(kwargs.get("exclude_sources") or [])
+        include_children = bool(kwargs.get("include_children", False))
+        min_message_count = max(0, int(kwargs.get("min_message_count") or 0))
+        rows = self._store.list_sessions(
+            limit=limit + offset + len(exclude_sources) + 20,
+            source=source,
+        )
+        result = []
+        for raw in rows:
+            if raw.get("source") in exclude_sources:
+                continue
+            if not include_children and raw.get("parent_session_id"):
+                continue
+            session = _session_doc_to_sessiondb_shape(raw) or {}
+            session_id = session.get("session_id")
+            if not session_id:
+                continue
+            messages = self._store.get_messages(session_id, include_inactive=True)
+            session["message_count"] = len(messages)
+            if session["message_count"] < min_message_count:
+                continue
+            first_user = next(
+                (m.get("content") for m in messages if m.get("role") == "user"),
+                None,
+            )
+            if first_user is not None:
+                session["preview"] = str(first_user)[:60]
+            result.append(session)
+        return result[offset:offset + limit]
 
     def search_sessions(self, query: str, *, limit: int = 20, **kwargs):
         msgs = self._store.search_messages(query, limit=limit * 3)
@@ -213,12 +256,21 @@ class MongoSessionAdapter:
         return self._store.append_message(session_id, role, content, **kwargs)
 
     def get_messages(self, session_id: str, include_inactive: bool = False, **kwargs):
-        return [
-            _session_doc_to_sessiondb_shape(message) or {}
-            for message in self._store.get_messages(
-                session_id, include_inactive=include_inactive
+        messages = []
+        for raw in self._store.get_messages(
+            session_id, include_inactive=include_inactive
+        ):
+            message = _session_doc_to_sessiondb_shape(raw) or {}
+            message["id"] = _mongo_message_id(
+                session_id, message.get("message_index", 0)
             )
-        ]
+            self._message_state_cache[message["id"]] = {
+                "session_id": session_id,
+                "active": message.get("active", True),
+                "compacted": message.get("compacted", False),
+            }
+            messages.append(message)
+        return messages
 
     def get_messages_as_conversation(self, session_id: str, **kwargs):
         messages = self.get_messages(session_id)
@@ -232,14 +284,106 @@ class MongoSessionAdapter:
             conversation.append(item)
         return conversation
 
-    def get_messages_around(self, session_id: str, message_index: int, window: int = 10, **kwargs):
+    def get_messages_around(
+        self, session_id: str, around_message_id: int, window: int = 10, **kwargs
+    ) -> Dict[str, Any]:
         messages = self.get_messages(session_id, include_inactive=True)
-        start = max(0, message_index - window)
-        end = message_index + window + 1
-        return messages[start:end]
+        anchor = next(
+            (i for i, message in enumerate(messages) if message.get("id") == around_message_id),
+            None,
+        )
+        if anchor is None:
+            return {"window": [], "messages_before": 0, "messages_after": 0}
+        window = max(0, window)
+        start = max(0, anchor - window)
+        end = min(len(messages), anchor + window + 1)
+        return {
+            "window": messages[start:end],
+            "messages_before": anchor - start,
+            "messages_after": end - anchor - 1,
+        }
+
+    def get_anchored_view(
+        self,
+        session_id: str,
+        around_message_id: int,
+        window: int = 5,
+        bookend: int = 3,
+        keep_roles=("user", "assistant"),
+    ) -> Dict[str, Any]:
+        view = self.get_messages_around(session_id, around_message_id, window)
+        messages = self.get_messages(session_id, include_inactive=True)
+        window_rows = view["window"]
+        if not window_rows:
+            return {**view, "bookend_start": [], "bookend_end": []}
+
+        keep = set(keep_roles) if keep_roles is not None else None
+        filtered_window = [
+            message for message in window_rows
+            if keep is None
+            or message.get("id") == around_message_id
+            or message.get("role") in keep
+        ]
+        first_id, last_id = window_rows[0]["id"], window_rows[-1]["id"]
+        eligible = lambda message: (
+            (keep is None or message.get("role") in keep)
+            and bool(message.get("content"))
+        )
+        before = [
+            message for message in messages
+            if message["id"] < first_id and eligible(message)
+        ][:bookend]
+        after = [
+            message for message in messages
+            if message["id"] > last_id and eligible(message)
+        ][-bookend:]
+        return {
+            **view,
+            "window": filtered_window,
+            "bookend_start": before,
+            "bookend_end": after,
+        }
+
+    def get_message_storage_state(self, message_id: int) -> Optional[Dict[str, Any]]:
+        return self._message_state_cache.get(message_id)
 
     def search_messages(self, query: str, limit: int = 20, **kwargs):
-        return self._store.search_messages(query, limit=limit)
+        role_filter = set(kwargs.get("role_filter") or [])
+        excluded_sources = set(kwargs.get("exclude_sources") or [])
+        offset = max(0, int(kwargs.get("offset") or 0))
+        candidates = self._store.search_messages(query, limit=(limit + offset) * 3)
+        results = []
+        session_cache: Dict[str, Dict[str, Any]] = {}
+        for raw in candidates:
+            if role_filter and raw.get("role") not in role_filter:
+                continue
+            session_id = raw.get("session_id")
+            if not session_id:
+                continue
+            session = session_cache.setdefault(
+                session_id, self._store.get_session(session_id) or {}
+            )
+            if session.get("source") in excluded_sources:
+                continue
+            message = _session_doc_to_sessiondb_shape(raw) or {}
+            message_id = _mongo_message_id(session_id, message.get("message_index", 0))
+            self._message_state_cache[message_id] = {
+                "session_id": session_id,
+                "active": message.get("active", True),
+                "compacted": message.get("compacted", False),
+            }
+            results.append({
+                **message,
+                "id": message_id,
+                "session_id": session_id,
+                "session_started": session.get("started_at"),
+                "source": session.get("source"),
+                "model": session.get("model"),
+                "snippet": str(message.get("content") or "")[:400],
+            })
+            if len(results) >= limit + offset:
+                break
+        return results[offset:offset + limit]
 
     def replace_messages(
         self,

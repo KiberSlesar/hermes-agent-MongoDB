@@ -10205,6 +10205,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 start_heartbeat_loop,
             )
             if is_mongo_mode():
+                gateway_loop = asyncio.get_running_loop()
+
+                def _run_adapter_operation(result):
+                    if asyncio.iscoroutine(result):
+                        return asyncio.run_coroutine_threadsafe(
+                            result, gateway_loop
+                        ).result(timeout=30)
+                    return result
+
                 def _release_messaging():
                     # Stop messaging adapters while retaining API/local ones.
                     for platform, adapter in list(getattr(self, "adapters", {}).items()):
@@ -10214,29 +10223,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         try:
                             stop = getattr(adapter, "stop", None) or getattr(adapter, "disconnect", None)
                             if stop:
-                                import asyncio as _asyncio
-                                result = stop()
-                                if _asyncio.iscoroutine(result):
-                                    # Best-effort sync bridge during handoff loop
-                                    try:
-                                        loop = _asyncio.get_event_loop()
-                                        if loop.is_running():
-                                            _asyncio.ensure_future(result)
-                                        else:
-                                            loop.run_until_complete(result)
-                                    except Exception:
-                                        pass
+                                _run_adapter_operation(stop())
                         except Exception as exc:
                             logger.warning("Failed stopping %s during handoff: %s", name, exc)
 
                 def _acquire_messaging() -> bool:
-                    # Health: storage reachable + at least attempt to mark healthy.
+                    # Reconnect adapters on the target before taking ownership.
                     try:
                         from hermes_storage import get_storage
                         storage = get_storage()
                         if storage is None:
                             return False
                         storage.client.admin.command("ping")
+                        for platform, adapter in list(getattr(self, "adapters", {}).items()):
+                            name = getattr(platform, "value", str(platform))
+                            if name in ("api_server", "local", "webhook"):
+                                continue
+                            connected = getattr(adapter, "is_connected", None)
+                            if callable(connected):
+                                connected = connected()
+                            if connected:
+                                continue
+                            starter = getattr(adapter, "start", None) or getattr(adapter, "connect", None)
+                            if starter:
+                                _run_adapter_operation(starter())
                         return True
                     except Exception as exc:
                         logger.error("Messaging acquire health-check failed: %s", exc)
@@ -10249,6 +10259,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     on_release=_release_messaging,
                     on_acquire=_acquire_messaging,
                     on_notify=_notify,
+                    runtime_state=lambda: {
+                        "active_turns": self._running_agent_count(),
+                        "active_session_keys": list(self._running_agents.keys()),
+                    },
                 )
                 api_base = ""
                 try:

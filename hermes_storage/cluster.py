@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 _HEARTBEAT_THREAD: Optional[threading.Thread] = None
 _HEARTBEAT_STOP = threading.Event()
+_RUNTIME_STATE_CB: Optional[Callable[[], dict[str, Any]]] = None
 
 
 def format_cluster_prompt_block(status: Optional[dict[str, Any]] = None) -> str:
@@ -65,7 +66,17 @@ def start_heartbeat_loop(
     def _loop() -> None:
         while not _HEARTBEAT_STOP.is_set():
             try:
-                storage.register_presence(api_base=api_base)
+                runtime = {}
+                if _RUNTIME_STATE_CB:
+                    try:
+                        runtime = _RUNTIME_STATE_CB() or {}
+                    except Exception:
+                        logger.debug("Cluster runtime-state callback failed", exc_info=True)
+                storage.register_presence(
+                    api_base=api_base,
+                    active_turns=runtime.get("active_turns", 0),
+                    active_session_keys=runtime.get("active_session_keys"),
+                )
                 # Also publish presence over mTLS orchestrator when configured
                 try:
                     from hermes_storage.orchestrator_client import (
@@ -79,6 +90,8 @@ def start_heartbeat_loop(
                             "profile": storage.bootstrap.profile,
                             "api_base": api_base or "",
                             "status": "online",
+                            "active_turns": runtime.get("active_turns", 0),
+                            "active_session_keys": runtime.get("active_session_keys") or [],
                         })
                 except Exception as orch_exc:
                     logger.debug("Orchestrator heartbeat skipped: %s", orch_exc)
@@ -109,6 +122,19 @@ def _maybe_handle_handoff(storage: Any) -> None:
     node_id = storage.node_id
 
     if handoff == "releasing" and state.get("handoff_from") == node_id:
+        source = next(
+            (
+                node for node in storage.cluster.list_nodes(online_within_s=60.0)
+                if node.get("node_id") == node_id
+            ),
+            {},
+        )
+        if int(source.get("active_turns") or 0) > 0:
+            logger.info(
+                "Deferring cluster handoff while %d foreground task(s) finish",
+                int(source.get("active_turns") or 0),
+            )
+            return
         cb = _RELEASE_CB
         if cb:
             try:
@@ -192,12 +218,15 @@ def register_messaging_callbacks(
     on_release: Optional[Callable[[], None]] = None,
     on_acquire: Optional[Callable[[], bool]] = None,
     on_notify: Optional[Callable[[str], None]] = None,
+    runtime_state: Optional[Callable[[], dict[str, Any]]] = None,
 ) -> None:
     """Gateway registers stop/start/notify hooks for messaging handoff."""
-    global _RELEASE_CB, _ACQUIRE_CB, _NOTIFY_CB
+    global _RELEASE_CB, _ACQUIRE_CB, _NOTIFY_CB, _RUNTIME_STATE_CB
     if on_release is not None:
         _RELEASE_CB = on_release
     if on_acquire is not None:
         _ACQUIRE_CB = on_acquire
     if on_notify is not None:
         _NOTIFY_CB = on_notify
+    if runtime_state is not None:
+        _RUNTIME_STATE_CB = runtime_state

@@ -75,6 +75,8 @@ class HermesStorage:
         api_base: Optional[str] = None,
         capabilities: Optional[list[str]] = None,
         hostname: Optional[str] = None,
+        active_turns: int = 0,
+        active_session_keys: Optional[list[str]] = None,
     ) -> None:
         self.cluster.heartbeat({
             "node_id": self.node_id,
@@ -84,6 +86,8 @@ class HermesStorage:
             "api_base": api_base or "",
             "capabilities": capabilities or detect_capabilities(),
             "status": "online",
+            "active_turns": max(0, int(active_turns)),
+            "active_session_keys": list(active_session_keys or []),
         })
         self.machines.upsert_machine(self.machine_id, {
             "hostname": hostname or socket.gethostname(),

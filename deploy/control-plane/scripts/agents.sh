@@ -6,6 +6,7 @@
 # Usage:
 #   agents              list nodes + enrolled agents
 #   agents list
+#   agents activate <machine_id|node_id|hostname>
 #   agents prune [--keep NAME] [--yes]
 #   agents revoke <machine_id|cert_cn> [--yes]
 # ============================================================================
@@ -66,7 +67,7 @@ print('Handoff     : ' + (st.handoff_state || 'idle'));
 print('');
 
 print('Online presence (cluster_nodes)');
-print(pad('NODE', 22) + pad('MACHINE', 16) + pad('HOST', 16) + pad('STATUS', 8) + 'LAST SEEN');
+print(pad('NODE', 22) + pad('MACHINE', 16) + pad('HOST', 16) + pad('STATUS', 8) + pad('TASKS', 7) + 'LAST SEEN');
 print('-'.repeat(78));
 const nodes = s.cluster_nodes.find().sort({hostname:1}).toArray();
 if (!nodes.length) print('(none)');
@@ -83,6 +84,7 @@ for (const n of nodes) {
     pad(n.machine_id || '-', 16) +
     pad(n.hostname || '-', 16) +
     pad(status, 8) +
+    pad(n.active_turns || 0, 7) +
     ago(hb)
   );
 }
@@ -117,6 +119,39 @@ for (const m of macs) {
   );
 }
 print('');
+"
+    ;;
+
+  activate)
+    TARGET="${1:-}"
+    [[ -n "$TARGET" ]] || die "usage: agents activate <machine_id|node_id|hostname>"
+    meval "
+const s = db.getSiblingDB('hermes_shared');
+const needle = '${TARGET}'.toLowerCase();
+const nodes = s.cluster_nodes.find().toArray();
+const target = nodes.find(n => [n.node_id, n.machine_id, n.hostname]
+  .filter(Boolean).some(v => String(v).toLowerCase() === needle || String(v).toLowerCase().startsWith(needle)));
+if (!target) { print('ERROR: no online node matched ${TARGET}'); quit(2); }
+const st = s.cluster_state.findOne({_id:'default'}) || {};
+const owner = st.messaging_owner || st.active_node_id;
+const source = owner ? s.cluster_nodes.findOne({node_id: owner}) : null;
+if (source && Number(source.active_turns || 0) > 0) {
+  print('ERROR: active agent is busy; wait for the task to finish or send /stop before switching');
+  quit(3);
+}
+if (owner === target.node_id) { print('Already active: ' + target.node_id); quit(0); }
+s.cluster_state.updateOne({_id:'default'}, {\$set: {
+  active_node_id: target.node_id,
+  pending_active_node_id: target.node_id,
+  handoff_state: 'releasing',
+  handoff_from: owner || null,
+  handoff_to: target.node_id,
+  handoff_error: null,
+  handoff_session_keys: (source && source.active_session_keys) || [],
+  updated_at: new Date()
+}}, {upsert:true});
+print('Switch requested: ' + (owner || '(none)') + ' -> ' + target.node_id);
+print('The old gateway will release after its active task is idle; the target will acquire the same Mongo session routing.');
 "
     ;;
 

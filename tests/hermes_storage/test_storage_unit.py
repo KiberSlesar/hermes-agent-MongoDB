@@ -321,6 +321,64 @@ def test_mongo_adapter_cleans_only_empty_ended_sessions():
     }
 
 
+def test_mongo_adapter_exposes_session_search_contract():
+    """Mongo rows expose the identifiers and windows session_search consumes."""
+    from hermes_storage.session_bridge import MongoSessionAdapter
+
+    class Store:
+        def __init__(self):
+            self.session = {
+                "session_id": "history-1",
+                "source": "cli",
+                "started_at": 1,
+            }
+            self.messages = [
+                {
+                    "session_id": "history-1",
+                    "message_index": 0,
+                    "role": "user",
+                    "content": "first request",
+                },
+                {
+                    "session_id": "history-1",
+                    "message_index": 1,
+                    "role": "assistant",
+                    "content": "first reply",
+                },
+            ]
+
+        def list_sessions(self, **_kwargs):
+            return [self.session]
+
+        def get_session(self, session_id):
+            return self.session if session_id == "history-1" else None
+
+        def get_messages(self, session_id, **_kwargs):
+            return self.messages if session_id == "history-1" else []
+
+        def search_messages(self, _query, **_kwargs):
+            return [self.messages[1]]
+
+    adapter = object.__new__(MongoSessionAdapter)
+    adapter._store = Store()
+    adapter._message_state_cache = {}
+
+    session = adapter.list_sessions_rich()[0]
+    assert session["id"] == "history-1"
+    assert session["message_count"] == 2
+    assert session["preview"] == "first request"
+
+    hit = adapter.search_messages("reply")[0]
+    view = adapter.get_anchored_view("history-1", hit["id"], window=1)
+    assert view["window"][0]["content"] == "first request"
+    assert view["window"][1]["content"] == "first reply"
+    assert adapter.get_message_storage_state(hit["id"]) == {
+        "session_id": "history-1",
+        "active": True,
+        "compacted": False,
+    }
+
+
 def test_fail_hard_unreachable_uri(monkeypatch, tmp_path):
     from hermes_storage import MongoStorageError
     from hermes_storage.bootstrap import reset_bootstrap_cache

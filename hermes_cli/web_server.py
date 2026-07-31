@@ -4697,6 +4697,9 @@ def _strip_session_list_rows(sessions: List[Dict[str, Any]]) -> List[Dict[str, A
 from hermes_cli.web_routers import sessions as _sessions_routes  # noqa: E402
 
 app.include_router(_sessions_routes.list_router)
+from hermes_cli.web_routers import cluster as _cluster_routes  # noqa: E402
+
+app.include_router(_cluster_routes.router)
 from hermes_cli.web_routers.sessions import (  # noqa: E402,F401 — legacy re-exports; tests call these via web_server.<name>
     get_sessions,
 )

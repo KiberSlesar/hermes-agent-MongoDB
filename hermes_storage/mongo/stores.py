@@ -393,6 +393,30 @@ class MongoClusterStore(ClusterStore):
             }},
             upsert=True,
         )
+        # Control-plane bootstrap pre-creates this document with null owners.
+        # Atomically let the first live node claim it, but never replace an
+        # operator-selected owner or steal an in-progress handoff.
+        self._state.update_one(
+            {
+                "_id": self.STATE_ID,
+                "$and": [
+                    {"$or": [
+                        {"active_node_id": None},
+                        {"active_node_id": {"$exists": False}},
+                    ]},
+                    {"$or": [
+                        {"messaging_owner": None},
+                        {"messaging_owner": {"$exists": False}},
+                    ]},
+                ],
+            },
+            {"$set": {
+                "active_node_id": node_id,
+                "messaging_owner": node_id,
+                "handoff_state": "idle",
+                "updated_at": utcnow(),
+            }},
+        )
 
     def list_nodes(self, *, online_within_s: float = 60.0) -> list[dict[str, Any]]:
         cutoff = utcnow() - timedelta(seconds=online_within_s)
@@ -433,6 +457,20 @@ class MongoClusterStore(ClusterStore):
         )
 
     def set_active(self, node_id: str, *, reason: str = "manual") -> dict[str, Any]:
+        state = self.get_state()
+        current = state.get("messaging_owner") or state.get("active_node_id")
+        if state.get("handoff_state") not in (None, "idle", "done", "failed"):
+            raise RuntimeError("agent switch already in progress")
+        if current == node_id:
+            return state
+        if current:
+            source = self._nodes.find_one({"node_id": current}) or {}
+            active_turns = int(source.get("active_turns") or 0)
+            if active_turns > 0:
+                raise RuntimeError(
+                    "active agent is busy; wait for the current task to finish "
+                    "or send /stop before switching"
+                )
         self._state.update_one(
             {"_id": self.STATE_ID},
             {"$set": {
@@ -443,7 +481,7 @@ class MongoClusterStore(ClusterStore):
             upsert=True,
         )
         self._append_history({"type": "activate", "node_id": node_id, "reason": reason})
-        return self.begin_messaging_handoff(node_id)
+        return self.begin_messaging_handoff(node_id, from_node_id=current)
 
     def begin_messaging_handoff(self, target_node_id: str, *, from_node_id: Optional[str] = None) -> dict[str, Any]:
         state = self.get_state()
@@ -454,6 +492,12 @@ class MongoClusterStore(ClusterStore):
                 "handoff_state": "releasing",
                 "handoff_from": current,
                 "handoff_to": target_node_id,
+                "handoff_session_keys": list(
+                    (self._nodes.find_one(
+                        {"node_id": current},
+                        {"active_session_keys": 1},
+                    ) or {}).get("active_session_keys") or []
+                ),
                 "handoff_error": None,
                 "updated_at": utcnow(),
             }},
@@ -493,6 +537,7 @@ class MongoClusterStore(ClusterStore):
                 "pending_active_node_id": None,
                 "handoff_from": None,
                 "handoff_to": None,
+                "handoff_session_keys": [],
                 "handoff_error": None,
                 "updated_at": utcnow(),
             }},
@@ -530,6 +575,7 @@ class MongoClusterStore(ClusterStore):
                 "handoff_state": "idle",
                 "handoff_from": None,
                 "handoff_to": None,
+                "handoff_session_keys": [],
             }},
         )
         return self.get_state()

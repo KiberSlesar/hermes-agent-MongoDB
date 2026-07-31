@@ -56,6 +56,7 @@ import type {
   SystemStats,
   UpdateCheckResponse,
   CuratorStatus,
+  ClusterStatus,
   PortalStatus,
   DebugShareResponse,
 } from "@/lib/api";
@@ -202,6 +203,8 @@ export default function SystemPage() {
   const [hooks, setHooks] = useState<HooksResponse | null>(null);
   const [curator, setCurator] = useState<CuratorStatus | null>(null);
   const [portal, setPortal] = useState<PortalStatus | null>(null);
+  const [cluster, setCluster] = useState<ClusterStatus | null>(null);
+  const [switchingAgent, setSwitchingAgent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   const [activeAction, setActiveAction] = useState<string | null>(null);
@@ -262,11 +265,12 @@ export default function SystemPage() {
       api.getHooks(),
       api.getCurator(),
       api.getPortal(),
+      api.getCluster(),
       // Cached (non-forced) check so the version row shows update status on
       // load without a separate effect / a forced network round-trip.
       api.checkHermesUpdate(false),
     ])
-      .then(([s, st, m, p, c, h, cur, prt, upd]) => {
+      .then(([s, st, m, p, c, h, cur, prt, clusterResult, upd]) => {
         if (s.status === "fulfilled") setStatus(s.value);
         if (st.status === "fulfilled") setStats(st.value);
         if (m.status === "fulfilled") setMemory(m.value);
@@ -275,6 +279,7 @@ export default function SystemPage() {
         if (h.status === "fulfilled") setHooks(h.value);
         if (cur.status === "fulfilled") setCurator(cur.value);
         if (prt.status === "fulfilled") setPortal(prt.value);
+        if (clusterResult.status === "fulfilled") setCluster(clusterResult.value);
         if (upd.status === "fulfilled") setUpdateInfo(upd.value);
       })
       .finally(() => setLoading(false));
@@ -301,6 +306,20 @@ export default function SystemPage() {
       setTimeout(loadAll, 3000);
     } catch (e) {
       showToast(`Gateway ${verb} failed: ${e}`, "error");
+    }
+  };
+
+  const activateAgent = async (nodeId: string) => {
+    setSwitchingAgent(nodeId);
+    try {
+      await api.activateClusterNode(nodeId);
+      showToast("Agent handoff requested", "success");
+      const next = await api.getCluster();
+      setCluster(next);
+    } catch (e) {
+      showToast(`Cannot switch agent: ${e}`, "error");
+    } finally {
+      setSwitchingAgent(null);
     }
   };
 
@@ -1034,6 +1053,51 @@ export default function SystemPage() {
           </CardContent>
         </Card>
       </section>
+
+      {/* ── Active agent ───────────────────────────────────────────── */}
+      {cluster && (
+        <section className="flex flex-col gap-3">
+          <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
+            <Server className="h-4 w-4" /> Active agent
+          </H2>
+          <Card>
+            <CardContent className="flex flex-col gap-3 py-4">
+              <div className="flex items-center gap-3 text-sm">
+                <Badge tone="success">
+                  {cluster.state.active_node_id ?? "unassigned"}
+                </Badge>
+                <span className="text-muted-foreground">
+                  messaging: {cluster.state.messaging_owner ?? "unassigned"} · {cluster.state.handoff_state ?? "idle"}
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {cluster.nodes.filter((node) => node.online).map((node) => {
+                  const nodeId = node.node_id;
+                  const active = nodeId === cluster.state.active_node_id;
+                  return (
+                    <Button
+                      key={nodeId}
+                      size="sm"
+                      ghost={!active}
+                      disabled={active || switchingAgent !== null}
+                      onClick={() => void activateAgent(nodeId)}
+                    >
+                      {switchingAgent === nodeId
+                        ? "Switching…"
+                        : active
+                          ? `${node.hostname ?? node.machine_id ?? nodeId} (active)`
+                          : `Use ${node.hostname ?? node.machine_id ?? nodeId}`}
+                    </Button>
+                  );
+                })}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                A switch is refused while the active agent has a running task. Wait for it to finish or send /stop first.
+              </p>
+            </CardContent>
+          </Card>
+        </section>
+      )}
 
       {/* ── Gateway ───────────────────────────────────────────────── */}
       <section className="flex flex-col gap-3">

@@ -4722,7 +4722,13 @@ def cmd_cluster(args):
         print(_json.dumps(status, indent=2, default=str))
         return
     if sub == "activate":
-        state = storage.activate(args.target, reason=getattr(args, "reason", None) or "cli")
+        try:
+            state = storage.activate(
+                args.target, reason=getattr(args, "reason", None) or "cli"
+            )
+        except RuntimeError as exc:
+            print(f"Cannot switch active agent: {exc}")
+            raise SystemExit(2) from exc
         print(_json.dumps({"ok": True, "state": state}, indent=2, default=str))
         return
     if sub == "prune":

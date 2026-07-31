@@ -173,7 +173,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not match:
                     self._json(404, {"error": f"no node matched {target!r}"})
                     return
-                state = cluster.set_active(match["node_id"], reason=reason)
+                try:
+                    state = cluster.set_active(match["node_id"], reason=reason)
+                except RuntimeError as exc:
+                    self._json(409, {"error": str(exc), "state": cluster.get_state()})
+                    return
                 self._json(200, {"ok": True, "state": state, "activated_by_cn": cn})
                 return
         except Exception as exc:
