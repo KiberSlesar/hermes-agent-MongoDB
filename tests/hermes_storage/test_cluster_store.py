@@ -455,3 +455,29 @@ def test_reconcile_skips_when_not_owner(monkeypatch):
 
     assert calls == []
     assert cluster_module._LOCAL_MESSAGING_HELD is False
+
+
+def test_drop_stale_messaging_when_lease_lost(monkeypatch):
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def get_state(self):
+            return {
+                "handoff_state": "idle",
+                "messaging_owner": "other",
+                "active_node_id": "other",
+            }
+
+    released = []
+    monkeypatch.setattr(cluster_module, "_LOCAL_MESSAGING_HELD", True)
+    monkeypatch.setattr(cluster_module, "_RELEASE_CB", lambda: released.append(True))
+    storage = type("Storage", (), {
+        "node_id": "me",
+        "machine_id": "me-pc",
+        "cluster": Cluster(),
+    })()
+
+    cluster_module._maybe_reconcile_messaging(storage)
+
+    assert released == [True]
+    assert cluster_module._LOCAL_MESSAGING_HELD is False

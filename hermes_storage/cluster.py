@@ -364,9 +364,11 @@ def _maybe_reconcile_messaging(storage: Any) -> None:
     acquiring branch never runs again — reconnect here.
     """
     global _LOCAL_MESSAGING_HELD
-    if _LOCAL_MESSAGING_HELD:
-        return
     if not should_connect_messaging(storage):
+        # Stale hold: we lost the lease but still think we own adapters.
+        _maybe_drop_stale_messaging(storage)
+        return
+    if _LOCAL_MESSAGING_HELD:
         return
     state = storage.cluster.get_state() or {}
     handoff = state.get("handoff_state") or "idle"
@@ -392,6 +394,29 @@ def _maybe_reconcile_messaging(storage: Any) -> None:
         logger.warning(
             "Messaging reconcile acquire returned failure; will retry next heartbeat"
         )
+
+
+def _maybe_drop_stale_messaging(storage: Any) -> None:
+    """Disconnect messaging if we still hold it after losing the lease."""
+    global _LOCAL_MESSAGING_HELD
+    if not _LOCAL_MESSAGING_HELD:
+        return
+    state = storage.cluster.get_state() or {}
+    handoff = state.get("handoff_state") or "idle"
+    if handoff == "releasing" and state.get("handoff_from") == storage.node_id:
+        return
+    cb = _RELEASE_CB
+    if cb is None:
+        _LOCAL_MESSAGING_HELD = False
+        return
+    logger.warning(
+        "This node is not messaging owner but still holds adapters; releasing"
+    )
+    try:
+        cb()
+    except Exception:
+        logger.warning("Stale messaging release failed", exc_info=True)
+    _LOCAL_MESSAGING_HELD = False
 
 
 def _maybe_failover(storage: Any) -> None:

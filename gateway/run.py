@@ -1864,6 +1864,30 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
     return False
 
 
+def _adapter_already_connected(adapter: Any) -> bool:
+    """True if a platform adapter is already live.
+
+    ``BasePlatformAdapter.is_connected`` is a ``@property`` returning bool —
+    callers must not treat it as a method via ``callable()``.
+    """
+    try:
+        connected = getattr(adapter, "is_connected", False)
+        if callable(connected):
+            connected = connected()
+        if connected:
+            return True
+    except Exception:
+        pass
+    try:
+        app = getattr(adapter, "_app", None)
+        updater = getattr(app, "updater", None) if app else None
+        if updater is not None and getattr(updater, "running", False):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
 _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
@@ -10226,25 +10250,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
                     adapter._busy_text_mode = self._busy_text_mode
 
-                def _release_messaging():
-                    # Stop messaging adapters while retaining API/local ones.
-                    for platform, adapter in list(getattr(self, "adapters", {}).items()):
-                        if not is_messaging_platform(platform):
-                            continue
-                        try:
-                            stop = getattr(adapter, "disconnect", None) or getattr(adapter, "stop", None)
-                            if stop:
-                                _run_adapter_operation(stop())
-                            self._update_platform_runtime_status(
-                                getattr(platform, "value", str(platform)),
-                                platform_state="idle",
-                                error_code=None,
-                                error_message="released for cluster handoff",
-                            )
-                        except Exception as exc:
-                            name = getattr(platform, "value", str(platform))
-                            logger.warning("Failed stopping %s during handoff: %s", name, exc)
-
                 async def _acquire_messaging_async() -> bool:
                     """Create/connect all enabled messaging platforms for ownership."""
                     from hermes_storage import get_storage
@@ -10275,13 +10280,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 continue
                             _wire_adapter(adapter, platform)
                             self.adapters[platform] = adapter
-                        connected = getattr(adapter, "is_connected", None)
-                        if callable(connected):
-                            try:
-                                if connected():
-                                    continue
-                            except Exception:
-                                pass
+                        # is_connected is a @property (bool), not a method —
+                        # callable() was always False, so every reconcile
+                        # re-entered connect() and started a second Updater.
+                        if _adapter_already_connected(adapter):
+                            logger.info(
+                                "✓ %s already connected (skip re-acquire)",
+                                getattr(platform, "value", platform),
+                            )
+                            continue
                         try:
                             success = await self._connect_adapter_with_timeout(
                                 adapter, platform
@@ -10316,6 +10323,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # No messaging platforms configured still counts as success
                     # (gateway is up; lease can move).
                     return connected_ok if any_messaging else True
+
+                def _release_messaging():
+                    # Stop messaging adapters while retaining API/local ones.
+                    # Also fence reconnect so this node cannot steal getUpdates
+                    # after the lease moves away.
+                    self._mongo_defer_messaging = True
+                    for platform in list(getattr(self, "_failed_platforms", {}) or {}):
+                        try:
+                            if is_messaging_platform(platform):
+                                del self._failed_platforms[platform]
+                        except Exception:
+                            pass
+                    for platform, adapter in list(getattr(self, "adapters", {}).items()):
+                        if not is_messaging_platform(platform):
+                            continue
+                        try:
+                            stop = getattr(adapter, "disconnect", None) or getattr(adapter, "stop", None)
+                            if stop:
+                                _run_adapter_operation(stop())
+                            self._update_platform_runtime_status(
+                                getattr(platform, "value", str(platform)),
+                                platform_state="idle",
+                                error_code=None,
+                                error_message="released for cluster handoff",
+                            )
+                        except Exception as exc:
+                            name = getattr(platform, "value", str(platform))
+                            logger.warning("Failed stopping %s during handoff: %s", name, exc)
 
                 def _acquire_messaging() -> bool:
                     try:
@@ -11896,6 +11931,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
                 if now < info["next_retry"]:
                     continue  # not time yet
+
+                # Fleet: never steal Telegram/Discord while another node owns
+                # the messaging lease (would cause getUpdates 409 conflicts).
+                try:
+                    from hermes_storage import is_mongo_mode
+                    from hermes_storage.cluster import (
+                        is_messaging_platform as _is_msg_plat,
+                        should_connect_messaging as _should_msg,
+                    )
+
+                    if (
+                        is_mongo_mode()
+                        and _is_msg_plat(platform)
+                        and not _should_msg()
+                    ):
+                        logger.info(
+                            "Reconnect %s skipped — this node is not the "
+                            "messaging owner",
+                            platform.value,
+                        )
+                        del self._failed_platforms[platform]
+                        continue
+                except Exception:
+                    logger.debug(
+                        "Cluster messaging reconnect guard failed",
+                        exc_info=True,
+                    )
 
                 platform_config = info["config"]
                 attempt = info["attempts"] + 1
