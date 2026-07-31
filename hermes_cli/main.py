@@ -4726,13 +4726,17 @@ def cmd_db(args):
 
 
 def cmd_mongo(args):
-    """MongoDB inventory: hermes mongo status."""
+    """MongoDB inventory: hermes mongo status | seed-skills."""
     sub = getattr(args, "mongo_command", None) or "status"
     if sub == "status":
         from hermes_cli.mongo_cmds import cmd_mongo_status
 
         raise SystemExit(cmd_mongo_status(as_json=bool(getattr(args, "json", False))))
-    print("usage: hermes mongo status [--json]")
+    if sub == "seed-skills":
+        from hermes_cli.mongo_cmds import cmd_mongo_seed_skills
+
+        raise SystemExit(cmd_mongo_seed_skills())
+    print("usage: hermes mongo status [--json] | hermes mongo seed-skills")
     raise SystemExit(2)
 
 
