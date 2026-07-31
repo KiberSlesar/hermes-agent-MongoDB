@@ -19,6 +19,66 @@ function Get-AuthHeaders {
     return $h
 }
 
+function Download-RepoTarball {
+    param(
+        [string]$RepoName,
+        [string]$RefName,
+        [string]$OutFile,
+        [int]$Attempts = 5
+    )
+
+    $uri = "https://api.github.com/repos/$RepoName/tarball/$RefName"
+    $codeload = "https://codeload.github.com/$RepoName/tar.gz/$RefName"
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = (
+            [Net.ServicePointManager]::SecurityProtocol -bor
+            [Net.SecurityProtocolType]::Tls12
+        )
+    } catch {}
+
+    $headers = Get-AuthHeaders
+    $lastError = $null
+    for ($i = 1; $i -le $Attempts; $i++) {
+        try {
+            if (Test-Path $OutFile) { Remove-Item -Force $OutFile -ErrorAction SilentlyContinue }
+
+            $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+            if ($curl) {
+                $args = @(
+                    "-fsSL", "--retry", "3", "--retry-all-errors",
+                    "-A", "hermes-agent-installer",
+                    "-o", $OutFile
+                )
+                if ($headers["Authorization"]) {
+                    $args += @("-H", "Authorization: $($headers['Authorization'])")
+                }
+                # Prefer codeload (more stable than api.github.com tarball redirects).
+                & $curl.Source @args $codeload
+                if ($LASTEXITCODE -ne 0 -or -not (Test-Path $OutFile) -or ((Get-Item $OutFile).Length -lt 1024)) {
+                    & $curl.Source @args $uri
+                }
+            } else {
+                $ProgressPreference = "SilentlyContinue"
+                try {
+                    Invoke-WebRequest -Uri $codeload -Headers $headers -OutFile $OutFile -UseBasicParsing
+                } catch {
+                    Invoke-WebRequest -Uri $uri -Headers $headers -OutFile $OutFile -UseBasicParsing
+                }
+            }
+
+            if ((Test-Path $OutFile) -and ((Get-Item $OutFile).Length -gt 1024)) {
+                return
+            }
+            throw "Downloaded archive is empty or too small"
+        } catch {
+            $lastError = $_
+            Write-Host ("Download retry {0}/{1}: {2}" -f $i, $Attempts, $_.Exception.Message)
+            Start-Sleep -Seconds (2 * $i)
+        }
+    }
+    throw "Failed to download $RepoName@$RefName after $Attempts attempts. Last error: $lastError"
+}
+
 function Get-UvPath {
     $cmd = Get-Command uv -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
@@ -155,9 +215,10 @@ New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 $archive = Join-Path $tmp "src.tgz"
 $agentDir = Join-Path $HermesHome "hermes-agent"
 Write-Host "Downloading Mongo fork $Repo@$Ref …"
-Invoke-WebRequest -Uri "https://api.github.com/repos/$Repo/tarball/$Ref" -Headers (Get-AuthHeaders) -OutFile $archive
+Download-RepoTarball -RepoName $Repo -RefName $Ref -OutFile $archive
 tar -xzf $archive -C $tmp
 $src = Get-ChildItem $tmp -Directory | Select-Object -First 1
+if (-not $src) { throw "Empty archive from $Repo@$Ref" }
 Confirm-ReplaceExistingInstallation -AgentDir $agentDir
 Move-Item $src.FullName $agentDir
 
