@@ -10,14 +10,20 @@
 # Env / flags:
 #   HERMES_HOME              (default: ~/.hermes)
 #   HERMES_SKIP_CONNECT=1    skip connect prompt
-#   bash -s -- --host IP:8743 --code ABCD-EFGH
+#   HERMES_YES=1             replace existing install without prompting
+#   bash -s -- --yes --host IP:8743 --code ABCD-EFGH
 # ============================================================================
 set -euo pipefail
 
 HERMES_HOME_DIR="${HERMES_HOME:-$HOME/.hermes}"
 REPO="${HERMES_MONGO_REPO:-KiberSlesar/hermes-agent-MongoDB}"
+# Old private clone name was renamed; rewrite stale env overrides.
+if [[ "$REPO" == "KiberSlesar/hermes-agent-MongoDB-private" ]]; then
+  REPO="KiberSlesar/hermes-agent-MongoDB"
+fi
 REF="${HERMES_MONGO_REF:-main}"
 SKIP_CONNECT="${HERMES_SKIP_CONNECT:-0}"
+YES="${HERMES_YES:-0}"
 FORCE_CONNECT=0
 ENROLL_HOST=""
 ENROLL_CODE=""
@@ -27,6 +33,7 @@ while [[ $# -gt 0 ]]; do
     --connect) FORCE_CONNECT=1; shift ;;
     --host) ENROLL_HOST="$2"; shift 2 ;;
     --code) ENROLL_CODE="$2"; shift 2 ;;
+    --yes|-y) YES=1; shift ;;
     # Kept as a compatibility no-op: this installer is self-contained and
     # never invokes the upstream Hermes installer.
     --skip-base) shift ;;
@@ -68,16 +75,18 @@ confirm_replace_existing_installation() {
   [[ -n "$existing" ]] && echo "  command: $existing" >&2
   [[ -d "$AGENT_DIR" ]] && echo "  checkout: $AGENT_DIR" >&2
   echo "Replacing it removes its launcher/runtime only; HERMES_HOME data is preserved." >&2
-  if ! can_prompt; then
-    die "Existing Hermes found. Re-run interactively to confirm its replacement."
-  fi
-
-  local answer=""
-  printf "%s" "Remove and replace the existing Hermes installation? [y/N] " > /dev/tty
-  read -r answer < /dev/tty || true
-  if [[ ! "$answer" =~ ^[Yy]$ ]]; then
-    echo "Installation cancelled; existing Hermes was left unchanged." >&2
-    exit 0
+  if [[ "$YES" == "1" ]]; then
+    say "HERMES_YES=1 / --yes: replacing existing install"
+  elif can_prompt; then
+    local answer=""
+    printf "%s" "Remove and replace the existing Hermes installation? [y/N] " > /dev/tty
+    read -r answer < /dev/tty || true
+    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+      echo "Installation cancelled; existing Hermes was left unchanged." >&2
+      exit 0
+    fi
+  else
+    die "Existing Hermes found. Re-run interactively, or set HERMES_YES=1 / pass --yes."
   fi
 
   [[ -d "$AGENT_DIR" ]] && rm -rf "$AGENT_DIR"
@@ -100,6 +109,9 @@ auth_curl() {
   fi
   curl -fsSL "$@"
 }
+
+# Avoid getcwd failures when the shell's cwd was deleted (e.g. old checkout).
+cd "${HOME:-/}" >/dev/null 2>&1 || cd / >/dev/null 2>&1 || true
 
 echo ""
 echo "${BOLD}Hermes Agent installer (Mongo)${NC}"

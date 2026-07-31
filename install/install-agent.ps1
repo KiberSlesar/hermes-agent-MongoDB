@@ -4,8 +4,12 @@
 
 $ErrorActionPreference = "Stop"
 $Repo = if ($env:HERMES_MONGO_REPO) { $env:HERMES_MONGO_REPO } else { "KiberSlesar/hermes-agent-MongoDB" }
+if ($Repo -eq "KiberSlesar/hermes-agent-MongoDB-private") {
+    $Repo = "KiberSlesar/hermes-agent-MongoDB"
+}
 $Ref = if ($env:HERMES_MONGO_REF) { $env:HERMES_MONGO_REF } else { "main" }
 $HermesHome = if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:LOCALAPPDATA "hermes" }
+$Yes = ($env:HERMES_YES -eq "1")
 
 function Get-AuthHeaders {
     $h = @{}
@@ -59,10 +63,14 @@ function Confirm-ReplaceExistingInstallation {
         Write-Host "  checkout: $AgentDir"
     }
     Write-Host "Replacing it removes its launcher/runtime only; HERMES_HOME data is preserved."
-    $answer = Read-Host "Remove and replace the existing Hermes installation? [y/N]"
-    if ($answer -notmatch '^[Yy]') {
-        Write-Host "Installation cancelled; existing Hermes was left unchanged."
-        exit 0
+    if (-not $Yes) {
+        $answer = Read-Host "Remove and replace the existing Hermes installation? [y/N]"
+        if ($answer -notmatch '^[Yy]') {
+            Write-Host "Installation cancelled; existing Hermes was left unchanged."
+            exit 0
+        }
+    } else {
+        Write-Host "HERMES_YES=1: replacing existing install"
     }
 
     # The old checkout is the runtime managed by this installer. Do not delete

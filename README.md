@@ -37,6 +37,10 @@ Linux:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/install-agent.sh | bash
+
+# non-interactive upgrade (replace existing install, keep HERMES_HOME data):
+curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/install-agent.sh \
+  | HERMES_YES=1 HERMES_SKIP_CONNECT=1 bash
 ```
 
 Windows PowerShell:
