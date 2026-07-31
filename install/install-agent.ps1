@@ -1,11 +1,9 @@
 # Hermes Agent (Mongo) curl installer — Windows
 #
-#   irm https://raw.githubusercontent.com/<user>/<repo>/main/install/install-agent.ps1 | iex
-#
-# Set GH_TOKEN only if you use a private fork.
+#   irm https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/install-agent.ps1 | iex
 
 $ErrorActionPreference = "Stop"
-$Repo = if ($env:HERMES_MONGO_REPO) { $env:HERMES_MONGO_REPO } else { "KiberSlesar/hermes-agent-MongoDB-private" }
+$Repo = if ($env:HERMES_MONGO_REPO) { $env:HERMES_MONGO_REPO } else { "KiberSlesar/hermes-agent-MongoDB" }
 $Ref = if ($env:HERMES_MONGO_REF) { $env:HERMES_MONGO_REF } else { "main" }
 $HermesHome = if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:LOCALAPPDATA "hermes" }
 

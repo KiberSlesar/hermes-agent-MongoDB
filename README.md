@@ -15,7 +15,7 @@
 Нужны: `sudo`, `systemd`, `openssl`, `python3`. **Docker не нужен.**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB-private/main/install/installDB.sh | bash
+curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/installDB.sh | bash
 ```
 
 Поставит:
@@ -36,13 +36,13 @@ agent-add hermes-windows
 Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB-private/main/install/install-agent.sh | bash
+curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/install-agent.sh | bash
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB-private/main/install/install-agent.ps1 | iex
+irm https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/install-agent.ps1 | iex
 ```
 
 Подключите установленный агент кодом, выданным на DB-сервере:

@@ -5,7 +5,7 @@
 # Installs the Mongo fork and forces `hermes` on PATH to that checkout
 # (upstream /usr/local/bin/hermes has no `db connect`).
 #
-#   curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB-private/main/install/install-agent.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/install-agent.sh | bash
 #
 # Env / flags:
 #   HERMES_HOME              (default: ~/.hermes)
@@ -15,7 +15,7 @@
 set -euo pipefail
 
 HERMES_HOME_DIR="${HERMES_HOME:-$HOME/.hermes}"
-REPO="${HERMES_MONGO_REPO:-KiberSlesar/hermes-agent-MongoDB-private}"
+REPO="${HERMES_MONGO_REPO:-KiberSlesar/hermes-agent-MongoDB}"
 REF="${HERMES_MONGO_REF:-main}"
 SKIP_CONNECT="${HERMES_SKIP_CONNECT:-0}"
 FORCE_CONNECT=0
@@ -92,10 +92,13 @@ confirm_replace_existing_installation() {
 
 auth_curl() {
   if [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]]; then
-    curl -fsSL -H "Authorization: Bearer ${GH_TOKEN:-$GITHUB_TOKEN}" "$@"
-  else
-    curl -fsSL "$@"
+    # A stale token must not make a public installation fail. Retain the
+    # authenticated attempt for private forks, then retry anonymously.
+    curl -fsSL -H "Authorization: Bearer ${GH_TOKEN:-$GITHUB_TOKEN}" "$@" || \
+      curl -fsSL "$@"
+    return
   fi
+  curl -fsSL "$@"
 }
 
 echo ""

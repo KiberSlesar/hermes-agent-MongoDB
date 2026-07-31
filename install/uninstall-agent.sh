@@ -2,7 +2,7 @@
 # ============================================================================
 # Full uninstall — Hermes AGENT (Mongo fork + upstream leftovers)
 # ============================================================================
-#   curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB-private/main/install/uninstall-agent.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/uninstall-agent.sh | bash
 #
 # Env:
 #   HERMES_HOME           default ~/.hermes
@@ -115,5 +115,5 @@ echo "${GREEN}OK agent wiped${NC}"
 echo "  which hermes: $(command -v hermes || echo '(none)')"
 echo ""
 echo "Reinstall:"
-echo "  curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB-private/main/install/install-agent.sh | bash"
+echo "  curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/install-agent.sh | bash"
 echo ""

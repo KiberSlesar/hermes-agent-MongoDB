@@ -5,7 +5,7 @@
 # Native MongoDB + systemd user services for enroll (:8743) and
 # mTLS orchestrator (:8744). Ubuntu/Debian.
 #
-#   curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB-private/main/install/installDB.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/installDB.sh | bash
 #
 # Env (non-interactive):
 #   HERMES_LISTEN_MODE=lo|lan|wan     where to listen / advertise
@@ -17,7 +17,7 @@ set -euo pipefail
 
 HERMES_DB_HOME="${HERMES_DB_HOME:-$HOME/hermes-db}"
 SKIP_CONNECT="${HERMES_SKIP_CONNECT:-0}"
-REPO="${HERMES_MONGO_REPO:-KiberSlesar/hermes-agent-MongoDB-private}"
+REPO="${HERMES_MONGO_REPO:-KiberSlesar/hermes-agent-MongoDB}"
 REF="${HERMES_MONGO_REF:-main}"
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'; BOLD=$'\033[1m'; NC=$'\033[0m'
@@ -45,10 +45,13 @@ ask() {
 
 auth_curl() {
   if [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]]; then
-    curl -fsSL -H "Authorization: Bearer ${GH_TOKEN:-$GITHUB_TOKEN}" "$@"
-  else
-    curl -fsSL "$@"
+    # A stale token must not make a public installation fail. Retain the
+    # authenticated attempt for private forks, then retry anonymously.
+    curl -fsSL -H "Authorization: Bearer ${GH_TOKEN:-$GITHUB_TOKEN}" "$@" || \
+      curl -fsSL "$@"
+    return
   fi
+  curl -fsSL "$@"
 }
 
 guess_lan_ip() {

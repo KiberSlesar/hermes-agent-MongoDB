@@ -2,7 +2,7 @@
 # ============================================================================
 # Full uninstall — Hermes DB control plane (native Mongo + systemd)
 # ============================================================================
-#   curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB-private/main/install/uninstall-db.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/uninstall-db.sh | bash
 #
 # Env:
 #   HERMES_DB_HOME=~/hermes-db
@@ -86,5 +86,5 @@ echo ""
 echo "${GREEN}OK DB wiped${NC}"
 echo ""
 echo "Reinstall:"
-echo "  curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB-private/main/install/installDB.sh | bash"
+echo "  curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/installDB.sh | bash"
 echo ""
