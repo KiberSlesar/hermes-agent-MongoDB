@@ -24,9 +24,12 @@ CLUSTER_ACTIVATE_SCHEMA = {
     "name": "cluster_activate",
     "description": (
         "Switch the active Hermes agent to another PC/instance. Accepts "
-        "node_id, machine_id, or hostname. Messaging gateway moves with a "
-        "lease handoff (old PC releases Telegram first; if the new PC fails "
-        "health-check, the switch rolls back). Tell the user the result."
+        "node_id, machine_id, or hostname. Starts a messaging lease handoff "
+        "(old PC releases Telegram after the current turn finishes; target "
+        "acquires next). IMPORTANT: this turn's tools keep running on the "
+        "CURRENT PC — do not claim you already execute on the target. Tell "
+        "the user handoff started and that their NEXT message will run there "
+        "once messaging_owner flips (check cluster_status)."
     ),
     "parameters": {
         "type": "object",
@@ -121,11 +124,24 @@ def cluster_activate_tool(target: str = "", reason: str = "agent", **kwargs) -> 
 
     try:
         state = storage.activate(str(target).strip(), reason=reason or "agent")
+        handoff = state.get("handoff_state") or "idle"
+        owner = state.get("messaging_owner")
+        pending = state.get("pending_active_node_id")
+        # Activate always *starts* a handoff; completion is async via heartbeat.
         return json.dumps({
             "success": True,
             "via": "mongo",
-            "message": f"Activation/handoff started toward {target}.",
+            "handoff_started": True,
+            "handoff_complete": False,
+            "message": (
+                f"Handoff started toward {target}. "
+                f"messaging_owner is still {owner!r}; pending={pending!r}; "
+                f"handoff_state={handoff!r}. "
+                "This turn continues on the current node. After handoff "
+                "completes, the user's next Telegram message runs on the target."
+            ),
             "state": state,
+            "execution_stays_here_until_next_message": True,
         }, default=str)
     except Exception as exc:
         return json.dumps({"success": False, "error": str(exc)})

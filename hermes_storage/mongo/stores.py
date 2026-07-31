@@ -471,10 +471,12 @@ class MongoClusterStore(ClusterStore):
                     "active agent is busy; wait for the current task to finish "
                     "or send /stop before switching"
                 )
+        # Do NOT flip active_node_id here — that made cluster_status claim the
+        # target was already live while Telegram/tools still ran on the source
+        # until release+acquire finished. Only pending_* until complete.
         self._state.update_one(
             {"_id": self.STATE_ID},
             {"$set": {
-                "active_node_id": node_id,
                 "pending_active_node_id": node_id,
                 "updated_at": utcnow(),
             }},

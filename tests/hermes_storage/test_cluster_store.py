@@ -142,6 +142,11 @@ def test_active_switch_records_handoff_and_session_keys():
     assert state["handoff_from"] == "old"
     assert state["handoff_to"] == "new"
     assert state["handoff_session_keys"] == ["telegram:1"]
+    # Active/owner stay on source until acquire completes — otherwise UIs and
+    # the agent claim tools already run on the target mid-handoff.
+    assert state["active_node_id"] == "old"
+    assert state["messaging_owner"] == "old"
+    assert state["pending_active_node_id"] == "new"
 
 
 def test_handoff_does_not_release_gateway_while_source_turn_is_active(monkeypatch):

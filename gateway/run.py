@@ -13797,6 +13797,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
 
+        # Fleet lease guard: if Telegram is somehow still connected after we
+        # lost messaging ownership, do not run agent turns (split body/gateway).
+        if not is_internal:
+            try:
+                from hermes_storage import is_mongo_mode
+                from hermes_storage.cluster import (
+                    is_messaging_platform,
+                    should_connect_messaging,
+                )
+
+                plat = getattr(source, "platform", None)
+                if (
+                    is_mongo_mode()
+                    and plat is not None
+                    and is_messaging_platform(plat)
+                    and not should_connect_messaging()
+                ):
+                    logger.warning(
+                        "Dropping inbound %s message — this node is not the "
+                        "messaging owner (stale adapter after cluster handoff)",
+                        getattr(plat, "value", plat),
+                    )
+                    return None
+            except Exception:
+                logger.debug("Cluster messaging ownership guard failed", exc_info=True)
+
         # Ignored-channel guard runs FIRST — before startup-restore queueing,
         # plugin hooks, auth, and session setup — so a configured ignored
         # channel can never reach pairing/auth/session state (#51899).

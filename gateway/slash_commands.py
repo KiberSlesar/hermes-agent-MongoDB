@@ -568,13 +568,14 @@ class GatewaySlashCommandsMixin:
             lines = [
                 f"Active: {state.get('active_node_id') or 'none'}",
                 f"Messaging owner: {state.get('messaging_owner') or 'none'}",
+                f"Pending: {state.get('pending_active_node_id') or 'none'}",
                 f"Handoff: {state.get('handoff_state') or 'idle'}",
-                "Online:",
+                "Online (* = messaging owner):",
             ]
             for n in status.get("nodes") or []:
                 if not n.get("online"):
                     continue
-                mark = " *" if n.get("node_id") == state.get("active_node_id") else ""
+                mark = " *" if n.get("node_id") == state.get("messaging_owner") else ""
                 lines.append(
                     f"- {n.get('hostname') or n.get('machine_id')} [{n.get('node_id')}]{mark}"
                 )
@@ -586,8 +587,12 @@ class GatewaySlashCommandsMixin:
             try:
                 state = storage.activate(target, reason="slash")
                 return (
-                    f"Activation/handoff started toward `{target}`.\n"
-                    f"handoff_state={state.get('handoff_state')}"
+                    f"Handoff started toward `{target}`.\n"
+                    f"handoff_state={state.get('handoff_state')}\n"
+                    f"messaging_owner (still)={state.get('messaging_owner')}\n"
+                    f"pending={state.get('pending_active_node_id')}\n"
+                    "This chat keeps running here until handoff completes; "
+                    "send another message after that for tools on the target."
                 )
             except Exception as exc:
                 return f"Activate failed: {exc}"

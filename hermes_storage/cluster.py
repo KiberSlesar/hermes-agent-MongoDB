@@ -102,12 +102,17 @@ def format_cluster_prompt_block(status: Optional[dict[str, Any]] = None) -> str:
     status = status or storage.cluster_status()
     state = status.get("state") or {}
     nodes = status.get("nodes") or []
+    pending = state.get("pending_active_node_id")
     lines = [
         "CLUSTER (Hermes multi-PC fleet)",
         f"- This node: {status.get('this_node_id')} (machine {status.get('this_machine_id')})",
         f"- Active node: {state.get('active_node_id') or 'none'}",
         f"- Messaging owner: {state.get('messaging_owner') or 'none'}",
-        f"- Handoff: {state.get('handoff_state') or 'idle'}",
+        f"- Handoff: {state.get('handoff_state') or 'idle'}"
+        + (f" → pending {pending}" if pending else ""),
+        "- Tools and Telegram for gateway chats run on the messaging owner.",
+        "- After cluster_activate, THIS turn stays on the current node; the "
+        "user's next message runs on the target only after handoff completes.",
         "- Online instances:",
     ]
     online = [n for n in nodes if n.get("online")]
