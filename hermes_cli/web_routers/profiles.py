@@ -592,7 +592,18 @@ async def delete_profile_endpoint(name: str):
 
 @router.get("/api/profiles/{name}/soul")
 async def get_profile_soul(name: str):
-    soul_path = _resolve_profile_dir(name) / "SOUL.md"
+    profile_dir = _resolve_profile_dir(name)
+    try:
+        from hermes_constants import get_hermes_home
+        from hermes_storage import is_mongo_mode, require_storage
+
+        if is_mongo_mode() and Path(profile_dir).resolve() == get_hermes_home().resolve():
+            content = require_storage().load_soul() or ""
+            return {"content": content, "exists": bool(content.strip())}
+    except Exception as e:
+        _log.exception("GET /api/profiles/%s/soul mongo failed", name)
+        raise HTTPException(status_code=500, detail=f"Could not read SOUL from Mongo: {e}")
+    soul_path = profile_dir / "SOUL.md"
     if soul_path.exists():
         try:
             return {"content": soul_path.read_text(encoding="utf-8"), "exists": True}
@@ -603,7 +614,18 @@ async def get_profile_soul(name: str):
 
 @router.put("/api/profiles/{name}/soul")
 async def update_profile_soul(name: str, body: ProfileSoulUpdate):
-    soul_path = _resolve_profile_dir(name) / "SOUL.md"
+    profile_dir = _resolve_profile_dir(name)
+    try:
+        from hermes_constants import get_hermes_home
+        from hermes_storage import is_mongo_mode, require_storage
+
+        if is_mongo_mode() and Path(profile_dir).resolve() == get_hermes_home().resolve():
+            require_storage().save_soul(body.content)
+            return {"ok": True}
+    except Exception as e:
+        _log.exception("PUT /api/profiles/%s/soul mongo failed", name)
+        raise HTTPException(status_code=500, detail=f"Could not write SOUL to Mongo: {e}")
+    soul_path = profile_dir / "SOUL.md"
     try:
         soul_path.write_text(body.content, encoding="utf-8")
     except OSError as e:

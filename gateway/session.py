@@ -1198,9 +1198,18 @@ class SessionStore:
         # Whether to keep writing the legacy sessions.json mirror alongside
         # the primary gateway_routing table in state.db. Default True for
         # backward compatibility; disable via gateway.write_sessions_json.
+        # Mongo mode: sessions live in the DB adapter — never mirror to local
+        # sessions.json (would diverge across fleet nodes).
         self._write_sessions_json = bool(
             getattr(config, "write_sessions_json", True)
         )
+        try:
+            from hermes_storage import is_mongo_mode
+
+            if is_mongo_mode():
+                self._write_sessions_json = False
+        except Exception:
+            pass
         
         # Initialize SQLite session database
         self._db = None

@@ -366,8 +366,24 @@ class MemoryStore:
         bypassed.  Used by the ``add`` action which appends without
         rewriting, so existing content is never clobbered.
         """
-        path = self._path_for(target)
-        raw, read_ok = self._read_raw_checked(path)
+        # Mongo SoT: never reload from local memories/*.md (often empty after
+        # mongo-only installs) — that would wipe the in-memory view and then
+        # overwrite Mongo on the next save.
+        try:
+            from hermes_storage import is_mongo_mode
+
+            _mongo = is_mongo_mode()
+        except Exception:
+            _mongo = False
+        if _mongo:
+            from hermes_storage import require_storage
+
+            key = "user" if target == "user" else "memory"
+            raw = require_storage().memories.load(key) or ""
+            read_ok = True
+        else:
+            path = self._path_for(target)
+            raw, read_ok = self._read_raw_checked(path)
         if not read_ok:
             # Leave in-memory entries untouched and tell the caller to abort;
             # persisting over an unreadable file would destroy it.

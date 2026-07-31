@@ -65,15 +65,31 @@ def _memory_local_index(source: str, global_index: int) -> int:
 def _locate_memory(source: str, gidx: int) -> tuple[Path, list[str], int]:
     """Resolve a memory card to its file, all §-delimited entries, and local index.
 
-    Entries come from ``MemoryStore._read_file`` — the same parser the memory
-    tool uses — so journey indices stay aligned with what the graph renders.
+    Entries come from ``MemoryStore._read_file`` / Mongo — the same parser the
+    memory tool uses — so journey indices stay aligned with what the graph
+    renders.
     """
     from tools.memory_tool import MemoryStore
 
     path = _memories_dir() / _MEMORY_FILES[source]
-    if not path.exists():
-        raise ValueError(f"{path.name} not found")
-    chunks = MemoryStore._read_file(path)
+    try:
+        from hermes_storage import is_mongo_mode
+
+        _mongo = is_mongo_mode()
+    except Exception:
+        _mongo = False
+    if _mongo:
+        from hermes_storage import require_storage
+
+        key = "user" if source == "profile" else "memory"
+        raw = require_storage().memories.load(key) or ""
+        chunks = MemoryStore._parse_entries(raw)
+        if not chunks:
+            raise ValueError(f"{path.name} not found")
+    else:
+        if not path.exists():
+            raise ValueError(f"{path.name} not found")
+        chunks = MemoryStore._read_file(path)
     local = _memory_local_index(source, gidx)
     if not 0 <= local < len(chunks):
         raise ValueError("memory node id is stale — refresh the graph")

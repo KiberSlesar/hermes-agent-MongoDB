@@ -87,7 +87,12 @@ def _load_usage() -> dict[str, dict[str, Any]]:
 
         return load_usage()
     except Exception:
-        path = get_hermes_home() / "skills" / ".usage.json"
+        try:
+            from hermes_constants import get_skills_dir
+
+            path = get_skills_dir() / ".usage.json"
+        except Exception:
+            path = get_hermes_home() / "skills" / ".usage.json"
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
@@ -196,8 +201,37 @@ def _memory_cards() -> list[dict[str, Any]]:
     ``MEMORY.md`` / ``USER.md`` are prose split on bare ``§`` separators; each
     chunk becomes one card. Every chunk is surfaced — the graph shows everything.
     """
-    base = get_hermes_home() / "memories"
     cards: list[dict[str, Any]] = []
+    try:
+        from hermes_storage import is_mongo_mode
+
+        _mongo = bool(is_mongo_mode())
+    except Exception:
+        _mongo = False
+
+    if _mongo:
+        from hermes_storage import require_storage
+
+        storage = require_storage()
+        for key, source in (("memory", "memory"), ("user", "profile")):
+            text = (storage.memories.load(key) or "").strip()
+            if not text:
+                continue
+            for chunk_idx, chunk in enumerate(c.strip() for c in text.split("\n§\n")):
+                if not chunk:
+                    continue
+                first = chunk.splitlines()[0].strip().lstrip("# ").strip()
+                cards.append(
+                    {
+                        "source": source,
+                        "timestamp": None,
+                        "title": (first[:80] + "…") if len(first) > 80 else first,
+                        "body": chunk[:1200],
+                    }
+                )
+        return cards
+
+    base = get_hermes_home() / "memories"
     for fname, source in (("MEMORY.md", "memory"), ("USER.md", "profile")):
         path = base / fname
         try:
@@ -247,7 +281,9 @@ def _memory_skill_edges(memory_cards: list[dict[str, Any]], skills: list[SkillNo
 
 def _skill_roots() -> list[tuple[str, Path]]:
     repo = Path(__file__).resolve().parent.parent
-    home_skills = get_hermes_home() / "skills"
+    from hermes_constants import get_skills_dir
+
+    home_skills = get_skills_dir()
     return [("base", repo / "skills"), ("profile", home_skills)]
 
 

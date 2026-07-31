@@ -12479,11 +12479,25 @@ async def get_memory_status():
         active = _normalize_memory_provider_name(mem.get("provider"))
 
     # Built-in memory file sizes (so the UI can show what a reset would erase).
-    mem_dir = get_hermes_home() / "memories"
     files = {}
-    for fname, key in (("MEMORY.md", "memory"), ("USER.md", "user")):
-        path = mem_dir / fname
-        files[key] = path.stat().st_size if path.exists() else 0
+    try:
+        from hermes_storage import is_mongo_mode
+
+        _mongo_mem = bool(is_mongo_mode())
+    except Exception:
+        _mongo_mem = False
+    if _mongo_mem:
+        from hermes_storage import require_storage
+
+        storage = require_storage()
+        for key in ("memory", "user"):
+            content = storage.memories.load(key) or ""
+            files[key] = len(content.encode("utf-8"))
+    else:
+        mem_dir = get_hermes_home() / "memories"
+        for fname, key in (("MEMORY.md", "memory"), ("USER.md", "user")):
+            path = mem_dir / fname
+            files[key] = path.stat().st_size if path.exists() else 0
 
     return {
         "active": active,
@@ -12512,8 +12526,31 @@ async def reset_memory(body: MemoryReset):
     if target not in {"all", "memory", "user"}:
         raise HTTPException(status_code=400, detail="target must be all, memory, or user")
 
-    mem_dir = get_hermes_home() / "memories"
     deleted = []
+    try:
+        from hermes_storage import is_mongo_mode
+
+        _mongo_reset = bool(is_mongo_mode())
+    except Exception:
+        _mongo_reset = False
+    if _mongo_reset:
+        try:
+            from hermes_storage import require_storage
+
+            storage = require_storage()
+            keys = []
+            if target in {"all", "memory"}:
+                keys.append("memory")
+            if target in {"all", "user"}:
+                keys.append("user")
+            for key in keys:
+                storage.memories.save(key, "")
+                deleted.append("MEMORY.md" if key == "memory" else "USER.md")
+            return {"ok": True, "deleted": deleted}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Could not reset Mongo memory: {exc}")
+
+    mem_dir = get_hermes_home() / "memories"
     targets = []
     if target in {"all", "memory"}:
         targets.append("MEMORY.md")
@@ -13718,6 +13755,26 @@ async def get_config_raw(profile: Optional[str] = None):
     process's own profile, which is wrong under the global profile switcher.
     """
     with _profile_scope(profile):
+        try:
+            from hermes_storage import is_mongo_mode, require_storage
+
+            if is_mongo_mode():
+                cfg = require_storage().load_profile_config() or {}
+                text = yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True) if cfg else ""
+                return {"yaml": text, "path": "mongo:profile/config"}
+        except Exception as exc:
+            try:
+                from hermes_storage import is_mongo_mode as _mongo_on
+
+                if _mongo_on():
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Could not read Mongo profile config: {exc}",
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                pass
         path = get_config_path()
     if not path.exists():
         return {"yaml": "", "path": str(path)}
