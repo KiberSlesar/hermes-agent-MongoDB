@@ -10200,49 +10200,128 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 start_heartbeat_loop,
             )
             if is_mongo_mode():
+                from hermes_storage.cluster import (
+                    is_messaging_platform,
+                    should_connect_messaging,
+                )
+
                 gateway_loop = asyncio.get_running_loop()
 
                 def _run_adapter_operation(result):
                     if asyncio.iscoroutine(result):
                         return asyncio.run_coroutine_threadsafe(
                             result, gateway_loop
-                        ).result(timeout=30)
+                        ).result(timeout=60)
                     return result
+
+                def _wire_adapter(adapter, platform):
+                    adapter.set_message_handler(self._handle_message)
+                    adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+                    adapter.set_session_store(self.session_store)
+                    adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+                    _set_reaction = getattr(adapter, "set_reaction_handler", None)
+                    if callable(_set_reaction):
+                        _set_reaction(self._handle_reaction_event)
+                    adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+                    adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+                    adapter._busy_text_mode = self._busy_text_mode
 
                 def _release_messaging():
                     # Stop messaging adapters while retaining API/local ones.
                     for platform, adapter in list(getattr(self, "adapters", {}).items()):
-                        name = getattr(platform, "value", str(platform))
-                        if name in ("api_server", "local", "webhook"):
+                        if not is_messaging_platform(platform):
                             continue
                         try:
-                            stop = getattr(adapter, "stop", None) or getattr(adapter, "disconnect", None)
+                            stop = getattr(adapter, "disconnect", None) or getattr(adapter, "stop", None)
                             if stop:
                                 _run_adapter_operation(stop())
+                            self._update_platform_runtime_status(
+                                getattr(platform, "value", str(platform)),
+                                platform_state="idle",
+                                error_code=None,
+                                error_message="released for cluster handoff",
+                            )
                         except Exception as exc:
+                            name = getattr(platform, "value", str(platform))
                             logger.warning("Failed stopping %s during handoff: %s", name, exc)
 
+                async def _acquire_messaging_async() -> bool:
+                    """Create/connect all enabled messaging platforms for ownership."""
+                    from hermes_storage import get_storage
+
+                    storage = get_storage()
+                    if storage is None:
+                        return False
+                    storage.client.admin.command("ping")
+                    any_messaging = False
+                    connected_ok = True
+                    for platform, platform_config in list(self.config.platforms.items()):
+                        if not getattr(platform_config, "enabled", False):
+                            continue
+                        if not is_messaging_platform(platform):
+                            continue
+                        any_messaging = True
+                        adapter = self.adapters.get(platform)
+                        if adapter is None:
+                            adapter = self._create_adapter(platform, platform_config)
+                            if not adapter:
+                                logger.warning(
+                                    "No adapter for %s during messaging acquire",
+                                    getattr(platform, "value", platform),
+                                )
+                                connected_ok = False
+                                continue
+                            _wire_adapter(adapter, platform)
+                            self.adapters[platform] = adapter
+                        connected = getattr(adapter, "is_connected", None)
+                        if callable(connected):
+                            try:
+                                if connected():
+                                    continue
+                            except Exception:
+                                pass
+                        try:
+                            success = await self._connect_adapter_with_timeout(
+                                adapter, platform
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "Messaging acquire failed for %s: %s",
+                                getattr(platform, "value", platform),
+                                exc,
+                            )
+                            success = False
+                        if success:
+                            self._sync_voice_mode_state_to_adapter(adapter)
+                            if hasattr(adapter, "_voice_input_callback"):
+                                adapter._voice_input_callback = self._handle_voice_channel_input
+                            self._update_platform_runtime_status(
+                                getattr(platform, "value", str(platform)),
+                                platform_state="connected",
+                                error_code=None,
+                                error_message=None,
+                            )
+                            logger.info(
+                                "✓ %s connected (cluster acquire)",
+                                getattr(platform, "value", platform),
+                            )
+                        else:
+                            connected_ok = False
+                            logger.warning(
+                                "✗ %s failed to connect during cluster acquire",
+                                getattr(platform, "value", platform),
+                            )
+                    # No messaging platforms configured still counts as success
+                    # (gateway is up; lease can move).
+                    return connected_ok if any_messaging else True
+
                 def _acquire_messaging() -> bool:
-                    # Reconnect adapters on the target before taking ownership.
                     try:
-                        from hermes_storage import get_storage
-                        storage = get_storage()
-                        if storage is None:
-                            return False
-                        storage.client.admin.command("ping")
-                        for platform, adapter in list(getattr(self, "adapters", {}).items()):
-                            name = getattr(platform, "value", str(platform))
-                            if name in ("api_server", "local", "webhook"):
-                                continue
-                            connected = getattr(adapter, "is_connected", None)
-                            if callable(connected):
-                                connected = connected()
-                            if connected:
-                                continue
-                            starter = getattr(adapter, "start", None) or getattr(adapter, "connect", None)
-                            if starter:
-                                _run_adapter_operation(starter())
-                        return True
+                        return bool(
+                            asyncio.run_coroutine_threadsafe(
+                                _acquire_messaging_async(), gateway_loop
+                            ).result(timeout=90)
+                        )
                     except Exception as exc:
                         logger.error("Messaging acquire health-check failed: %s", exc)
                         return False
@@ -10259,12 +10338,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "active_session_keys": list(self._running_agents.keys()),
                     },
                 )
+                # Claim / refresh ownership before the first adapter connect so
+                # passive nodes can defer Telegram/Discord until activated.
+                try:
+                    from hermes_storage import get_storage
+
+                    _st = get_storage()
+                    if _st is not None:
+                        _st.register_presence()
+                except Exception:
+                    logger.debug("Initial cluster presence failed", exc_info=True)
                 api_base = ""
                 try:
                     api_cfg = getattr(self.config, "platforms", None)
                 except Exception:
                     api_cfg = None
                 start_heartbeat_loop(api_base=api_base or None)
+                self._mongo_defer_messaging = not should_connect_messaging()
+                if self._mongo_defer_messaging:
+                    logger.info(
+                        "This node is not the messaging owner — "
+                        "Telegram/Discord will connect on cluster activate"
+                    )
                 logger.info("Mongo cluster heartbeat started")
         except Exception as exc:
             logger.debug("Cluster heartbeat not started: %s", exc)
@@ -10675,6 +10770,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     logger.warning("No adapter available for %s", _pval)
                 continue
+
+            # Fleet: keep messaging adapters prepared but offline until this
+            # node owns the messaging lease (cluster activate / failover).
+            if getattr(self, "_mongo_defer_messaging", False):
+                try:
+                    from hermes_storage.cluster import is_messaging_platform as _is_msg
+                except Exception:
+                    _is_msg = None
+                if _is_msg is not None and _is_msg(platform):
+                    adapter.set_message_handler(self._handle_message)
+                    adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+                    adapter.set_session_store(self.session_store)
+                    adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+                    _set_reaction = getattr(adapter, "set_reaction_handler", None)
+                    if callable(_set_reaction):
+                        _set_reaction(self._handle_reaction_event)
+                    adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+                    adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+                    adapter._busy_text_mode = self._busy_text_mode
+                    self.adapters[platform] = adapter
+                    self._update_platform_runtime_status(
+                        platform.value,
+                        platform_state="idle",
+                        error_code=None,
+                        error_message="deferred until this node is the active messaging owner",
+                    )
+                    logger.info(
+                        "⏸ %s prepared (deferred — not messaging owner)",
+                        platform.value,
+                    )
+                    continue
             
             # Set up message + fatal error handlers
             adapter.set_message_handler(self._handle_message)

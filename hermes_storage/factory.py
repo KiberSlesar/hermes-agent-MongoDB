@@ -122,7 +122,17 @@ class HermesStorage:
                 break
         if not match:
             raise ValueError(f"No cluster node matched {target!r}")
-        return self.cluster.set_active(match["node_id"], reason=reason)
+        state = self.cluster.set_active(match["node_id"], reason=reason)
+        # If we just selected THIS machine, make sure the local gateway is up
+        # so messaging acquire can complete.
+        if match.get("node_id") == self.node_id:
+            try:
+                from hermes_storage.cluster import ensure_local_gateway_service
+
+                ensure_local_gateway_service()
+            except Exception:
+                logger.debug("ensure_local_gateway_service failed", exc_info=True)
+        return state
 
 
 def _build_storage(boot: BootstrapConfig) -> HermesStorage:

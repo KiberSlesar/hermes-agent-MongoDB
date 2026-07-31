@@ -78,7 +78,12 @@ hermes cluster activate HOME-PC
 From chat: tools `cluster_status` / `cluster_activate`, slash `/cluster`.
 
 Messaging gateway moves with a lease handoff (one Telegram bot owner at a time),
-with rollback and auto-failover.
+with rollback and auto-failover. When a node becomes active:
+
+1. Source releases Telegram/Discord adapters (or marks release if no gateway).
+2. Target **auto-starts** `hermes gateway start` if the process is not up.
+3. Target acquire callback creates/connects messaging adapters.
+4. Passive nodes keep messaging adapters prepared but offline until ownership.
 
 Gateway / platforms settings (`gateway`, `platforms` in config — bot tokens in
 secrets) are fleet-shared via Mongo profile config. Both `load_gateway_config()`

@@ -14,6 +14,80 @@ logger = logging.getLogger(__name__)
 _HEARTBEAT_THREAD: Optional[threading.Thread] = None
 _HEARTBEAT_STOP = threading.Event()
 _RUNTIME_STATE_CB: Optional[Callable[[], dict[str, Any]]] = None
+_RELEASE_CB: Optional[Callable[[], None]] = None
+_ACQUIRE_CB: Optional[Callable[[], bool]] = None
+_NOTIFY_CB: Optional[Callable[[str], None]] = None
+
+# Platforms that stay up on every fleet node (not Telegram/Discord lease).
+NON_MESSAGING_PLATFORMS = frozenset({"api_server", "local", "webhook"})
+
+
+def is_messaging_platform(platform: Any) -> bool:
+    name = getattr(platform, "value", None) or str(platform)
+    return str(name).strip().lower() not in NON_MESSAGING_PLATFORMS
+
+
+def should_connect_messaging(storage: Any = None) -> bool:
+    """Whether this node should hold live Telegram/Discord adapters now."""
+    storage = storage or get_storage()
+    if storage is None:
+        return True
+    state = storage.cluster.get_state() or {}
+    node_id = storage.node_id
+    handoff = state.get("handoff_state") or "idle"
+    if handoff == "acquiring" and state.get("handoff_to") == node_id:
+        return True
+    if handoff == "releasing" and state.get("handoff_from") == node_id:
+        # Still the live owner until release completes.
+        return True
+    owner = state.get("messaging_owner")
+    if owner:
+        return owner == node_id
+    active = state.get("active_node_id")
+    return active in (None, "", node_id)
+
+
+def ensure_local_gateway_service() -> dict[str, Any]:
+    """Best-effort start of the local messaging gateway process/service.
+
+    Used when this node is selected as active but the gateway process has not
+    registered acquire/release callbacks yet. Safe to call repeatedly.
+    """
+    result: dict[str, Any] = {"started": False, "already_running": False}
+    try:
+        from hermes_cli.gateway import find_gateway_pids
+
+        pids = find_gateway_pids() or []
+        if pids:
+            result["already_running"] = True
+            result["pids"] = list(pids)
+            return result
+    except Exception as exc:
+        logger.debug("Could not inspect gateway PIDs: %s", exc)
+
+    import shutil
+    import subprocess
+    import sys
+
+    hermes_bin = shutil.which("hermes")
+    if hermes_bin:
+        cmd = [hermes_bin, "gateway", "start"]
+    else:
+        cmd = [sys.executable, "-m", "hermes_cli.main", "gateway", "start"]
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        result["started"] = True
+        result["cmd"] = cmd
+        logger.info("Started local gateway for active-agent handoff: %s", cmd)
+    except Exception as exc:
+        result["error"] = str(exc)
+        logger.warning("Failed to auto-start local gateway: %s", exc)
+    return result
 
 
 def format_cluster_prompt_block(status: Optional[dict[str, Any]] = None) -> str:
@@ -112,11 +186,7 @@ def stop_heartbeat_loop() -> None:
 
 
 def _maybe_handle_handoff(storage: Any) -> None:
-    """If we own messaging and handoff says releasing — stop adapters (hook).
-
-    Actual gateway adapter stop/start is wired from gateway/run.py via
-    ``on_release`` / ``on_acquire`` callbacks registered below.
-    """
+    """Drive messaging lease release/acquire via gateway callbacks."""
     state = storage.cluster.get_state()
     handoff = state.get("handoff_state")
     node_id = storage.node_id
@@ -136,25 +206,42 @@ def _maybe_handle_handoff(storage: Any) -> None:
             )
             return
         cb = _RELEASE_CB
-        if cb:
-            try:
-                cb()
-            except Exception as exc:
-                logger.error("Messaging release callback failed: %s", exc)
-                storage.cluster.rollback_messaging_handoff(reason=str(exc))
-                return
+        if cb is None:
+            # No local gateway — treat messaging as already released so the
+            # target can acquire.
+            logger.info(
+                "No local messaging gateway; marking release complete for handoff"
+            )
+            storage.cluster.mark_messaging_released(node_id)
+            return
+        try:
+            cb()
+        except Exception as exc:
+            logger.error("Messaging release callback failed: %s", exc)
+            storage.cluster.rollback_messaging_handoff(reason=str(exc))
+            return
         storage.cluster.mark_messaging_released(node_id)
 
     if handoff == "acquiring" and state.get("handoff_to") == node_id:
         cb = _ACQUIRE_CB
+        if cb is None:
+            # Becoming active without a live gateway: start it and wait for
+            # the next heartbeat once acquire callbacks are registered.
+            info = ensure_local_gateway_service()
+            logger.info(
+                "Active agent handoff waiting for local gateway acquire "
+                "(auto-start=%s already_running=%s)",
+                info.get("started"),
+                info.get("already_running"),
+            )
+            return
         ok = True
         err = None
-        if cb:
-            try:
-                ok = bool(cb())
-            except Exception as exc:
-                ok = False
-                err = str(exc)
+        try:
+            ok = bool(cb())
+        except Exception as exc:
+            ok = False
+            err = str(exc)
         if ok:
             storage.cluster.complete_messaging_handoff(node_id)
             notify = _NOTIFY_CB
@@ -206,11 +293,6 @@ def _maybe_failover(storage: Any) -> None:
             target["node_id"],
         )
         storage.cluster.set_active(target["node_id"], reason="failover")
-
-
-_RELEASE_CB: Optional[Callable[[], None]] = None
-_ACQUIRE_CB: Optional[Callable[[], bool]] = None
-_NOTIFY_CB: Optional[Callable[[str], None]] = None
 
 
 def register_messaging_callbacks(

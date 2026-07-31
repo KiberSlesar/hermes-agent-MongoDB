@@ -168,3 +168,79 @@ def test_handoff_does_not_release_gateway_while_source_turn_is_active(monkeypatc
     cluster_module._maybe_handle_handoff(storage)
 
     assert released == []
+
+
+def test_should_connect_messaging_for_owner_and_handoff():
+    from hermes_storage.cluster import should_connect_messaging
+
+    class Cluster:
+        def __init__(self, state):
+            self._state = state
+
+        def get_state(self):
+            return self._state
+
+    owner = type(
+        "S",
+        (),
+        {
+            "node_id": "a",
+            "cluster": Cluster({"messaging_owner": "a", "handoff_state": "idle"}),
+        },
+    )()
+    other = type(
+        "S",
+        (),
+        {
+            "node_id": "b",
+            "cluster": Cluster({"messaging_owner": "a", "handoff_state": "idle"}),
+        },
+    )()
+    acquiring = type(
+        "S",
+        (),
+        {
+            "node_id": "b",
+            "cluster": Cluster({
+                "messaging_owner": None,
+                "handoff_state": "acquiring",
+                "handoff_to": "b",
+            }),
+        },
+    )()
+
+    assert should_connect_messaging(owner) is True
+    assert should_connect_messaging(other) is False
+    assert should_connect_messaging(acquiring) is True
+
+
+def test_acquiring_without_gateway_callback_starts_service_and_waits(monkeypatch):
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def get_state(self):
+            return {
+                "handoff_state": "acquiring",
+                "handoff_from": "old",
+                "handoff_to": "new",
+            }
+
+        def complete_messaging_handoff(self, _node_id):
+            raise AssertionError("must not complete without acquire callback")
+
+    calls = []
+    monkeypatch.setattr(cluster_module, "_ACQUIRE_CB", None)
+    monkeypatch.setattr(
+        cluster_module,
+        "ensure_local_gateway_service",
+        lambda: calls.append("start") or {"started": True},
+    )
+    storage = type("Storage", (), {
+        "node_id": "new",
+        "machine_id": "new-pc",
+        "cluster": Cluster(),
+    })()
+
+    cluster_module._maybe_handle_handoff(storage)
+
+    assert calls == ["start"]
