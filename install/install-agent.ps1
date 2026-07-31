@@ -10,6 +10,7 @@ if ($Repo -eq "KiberSlesar/hermes-agent-MongoDB-private") {
 $Ref = if ($env:HERMES_MONGO_REF) { $env:HERMES_MONGO_REF } else { "main" }
 $HermesHome = if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:LOCALAPPDATA "hermes" }
 $Yes = ($env:HERMES_YES -eq "1")
+$SkipConnect = ($env:HERMES_SKIP_CONNECT -eq "1")
 
 function Get-AuthHeaders {
     $h = @{}
@@ -42,6 +43,59 @@ function Ensure-Uv {
         throw "uv installation failed. Install uv from https://docs.astral.sh/uv/ and rerun this installer."
     }
     return $uv
+}
+
+function Stop-HermesRuntimeLocks {
+    param(
+        [string]$AgentDir
+    )
+
+    # Gateway / CLI keep .venv\Scripts\python.exe locked on Windows.
+    $launcher = Get-Command hermes -ErrorAction SilentlyContinue
+    if ($launcher) {
+        try {
+            Write-Host "Stopping hermes gateway (if running)…"
+            & $launcher.Source gateway stop 2>$null | Out-Null
+        } catch {}
+    }
+
+    $agentFull = [System.IO.Path]::GetFullPath($AgentDir)
+    $killed = @()
+    foreach ($proc in Get-CimInstance Win32_Process -ErrorAction SilentlyContinue) {
+        $cmd = [string]$proc.CommandLine
+        $exe = [string]$proc.ExecutablePath
+        if (-not $cmd -and -not $exe) { continue }
+        $hay = "$exe $cmd"
+        if ($hay -like "*$agentFull*") {
+            try {
+                Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+                $killed += $proc.ProcessId
+            } catch {}
+        }
+    }
+    if ($killed.Count -gt 0) {
+        Write-Host ("Stopped locked Hermes process(es): {0}" -f ($killed -join ", "))
+        Start-Sleep -Seconds 2
+    }
+}
+
+function Remove-TreeWithRetry {
+    param(
+        [string]$Path,
+        [int]$Attempts = 5
+    )
+
+    if (-not (Test-Path $Path)) { return }
+    for ($i = 1; $i -le $Attempts; $i++) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($i -eq $Attempts) { throw }
+            Write-Host ("Retry delete ({0}/{1}): {2}" -f $i, $Attempts, $_.Exception.Message)
+            Start-Sleep -Seconds (1 + $i)
+        }
+    }
 }
 
 function Confirm-ReplaceExistingInstallation {
@@ -77,13 +131,14 @@ function Confirm-ReplaceExistingInstallation {
     # The old checkout is the runtime managed by this installer. Do not delete
     # arbitrary directories or user profile data discovered through PATH.
     if ($hasExistingCheckout) {
-        Remove-Item -Recurse -Force $AgentDir
+        Stop-HermesRuntimeLocks -AgentDir $AgentDir
+        Remove-TreeWithRetry -Path $AgentDir
     }
     if ($existingCommand -and
         $existingCommand.CommandType -eq "Application" -and
         $existingCommand.Source -and
         (Test-Path $existingCommand.Source)) {
-        Remove-Item -Force $existingCommand.Source
+        Remove-Item -Force $existingCommand.Source -ErrorAction SilentlyContinue
     }
 }
 
@@ -150,22 +205,30 @@ Write-Host "Mongo fork installed. No upstream Hermes runtime was installed."
 $bootstrap = Join-Path $HermesHome "bootstrap.yaml"
 $agentPem = Join-Path $HermesHome "certs\agent.pem"
 $alreadyConnected = Test-Path $bootstrap
-if ($alreadyConnected) {
-    Write-Host ""
-    Write-Host "Existing DB connection found:"
-    Write-Host "  $bootstrap"
-    if (Test-Path $agentPem) { Write-Host "  $agentPem" }
-    Write-Host "It was not removed by the update. Choose n unless you want a new one-time code."
-    $ans = Read-Host "Connect again with a new code? [y/N]"
-    if (-not $ans) { $ans = "N" }
+if ($SkipConnect) {
+    if ($alreadyConnected) {
+        Write-Host "HERMES_SKIP_CONNECT=1: keeping existing DB connection."
+    } else {
+        Write-Host "HERMES_SKIP_CONNECT=1: later run $launcher db connect"
+    }
 } else {
-    $ans = Read-Host "Connect this PC to Hermes DB now? [Y/n]"
-    if (-not $ans) { $ans = "Y" }
-}
-if ($ans -match '^[Yy]') {
-    & $launcher db connect
-} elseif ($alreadyConnected) {
-    Write-Host "Keeping existing DB connection."
-} else {
-    Write-Host "Later: $launcher db connect"
+    if ($alreadyConnected) {
+        Write-Host ""
+        Write-Host "Existing DB connection found:"
+        Write-Host "  $bootstrap"
+        if (Test-Path $agentPem) { Write-Host "  $agentPem" }
+        Write-Host "It was not removed by the update. Choose n unless you want a new one-time code."
+        $ans = Read-Host "Connect again with a new code? [y/N]"
+        if (-not $ans) { $ans = "N" }
+    } else {
+        $ans = Read-Host "Connect this PC to Hermes DB now? [Y/n]"
+        if (-not $ans) { $ans = "Y" }
+    }
+    if ($ans -match '^[Yy]') {
+        & $launcher db connect
+    } elseif ($alreadyConnected) {
+        Write-Host "Keeping existing DB connection."
+    } else {
+        Write-Host "Later: $launcher db connect"
+    }
 }
