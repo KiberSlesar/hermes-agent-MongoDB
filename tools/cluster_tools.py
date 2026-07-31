@@ -122,8 +122,22 @@ def cluster_activate_tool(target: str = "", reason: str = "agent", **kwargs) -> 
             "error": "cluster.agent_can_activate is disabled by policy.",
         })
 
+    announce_keys = []
     try:
-        state = storage.activate(str(target).strip(), reason=reason or "agent")
+        from gateway.session_context import get_session_env
+
+        sk = (get_session_env("HERMES_SESSION_KEY", "") or "").strip()
+        if sk:
+            announce_keys.append(sk)
+    except Exception:
+        pass
+
+    try:
+        state = storage.activate(
+            str(target).strip(),
+            reason=reason or "agent",
+            announce_session_keys=announce_keys or None,
+        )
         handoff = state.get("handoff_state") or "idle"
         owner = state.get("messaging_owner")
         pending = state.get("pending_active_node_id")
@@ -138,9 +152,11 @@ def cluster_activate_tool(target: str = "", reason: str = "agent", **kwargs) -> 
                 f"messaging_owner is still {owner!r}; pending={pending!r}; "
                 f"handoff_state={handoff!r}. "
                 "This turn continues on the current node. After handoff "
-                "completes, the user's next Telegram message runs on the target."
+                "completes, a system message is posted in chat and the user's "
+                "next Telegram message runs on the target."
             ),
             "state": state,
+            "announce_session_keys": announce_keys,
             "execution_stays_here_until_next_message": True,
         }, default=str)
     except Exception as exc:

@@ -262,6 +262,34 @@ def _maybe_handle_handoff(storage: Any) -> None:
         _run_acquire_for_handoff(storage, node_id)
 
 
+def format_cluster_move_notice(
+    storage: Any,
+    *,
+    from_node_id: Optional[str] = None,
+    to_node_id: Optional[str] = None,
+) -> str:
+    """User-facing system line when messaging ownership moves."""
+    nodes = {
+        n.get("node_id"): n
+        for n in (storage.cluster.list_nodes(online_within_s=300.0) or [])
+    }
+
+    def _label(node_id: Optional[str]) -> str:
+        if not node_id:
+            return "unknown"
+        node = nodes.get(node_id) or {}
+        host = node.get("hostname") or node.get("machine_id") or node_id
+        return f"{host} [{node_id}]"
+
+    to_id = to_node_id or storage.node_id
+    return (
+        "🔀 Системное сообщение: активный агент переехал на "
+        f"{_label(to_id)}"
+        + (f" (было: {_label(from_node_id)})" if from_node_id else "")
+        + ". Telegram и инструменты теперь выполняются на этой машине."
+    )
+
+
 def _run_acquire_for_handoff(storage: Any, node_id: str) -> None:
     """Complete an in-progress acquiring handoff via the gateway callback."""
     global _LOCAL_MESSAGING_HELD
@@ -286,16 +314,25 @@ def _run_acquire_for_handoff(storage: Any, node_id: str) -> None:
         err = str(exc)
     if ok:
         _LOCAL_MESSAGING_HELD = True
+        pre = storage.cluster.get_state() or {}
+        session_keys = list(pre.get("handoff_session_keys") or [])
+        from_id = pre.get("handoff_from")
+        notice = format_cluster_move_notice(
+            storage, from_node_id=from_id, to_node_id=node_id
+        )
         storage.cluster.complete_messaging_handoff(node_id)
         notify = _NOTIFY_CB
         if notify:
             try:
-                notify(
-                    f"Active Hermes agent switched to this machine "
-                    f"({storage.machine_id}). Messaging gateway is here now."
-                )
+                notify(notice, session_keys)
+            except TypeError:
+                # Older single-arg callbacks
+                try:
+                    notify(notice)
+                except Exception:
+                    logger.debug("Cluster notify failed", exc_info=True)
             except Exception:
-                pass
+                logger.debug("Cluster notify failed", exc_info=True)
     else:
         _LOCAL_MESSAGING_HELD = False
         storage.cluster.rollback_messaging_handoff(
@@ -304,10 +341,16 @@ def _run_acquire_for_handoff(storage: Any, node_id: str) -> None:
         notify = _NOTIFY_CB
         if notify:
             try:
-                notify(
-                    f"Failed to move messaging gateway here "
-                    f"({err or 'health-check failed'}). Rolled back."
+                fail_msg = (
+                    "⚠️ Системное сообщение: не удалось перенести активного агента "
+                    f"сюда ({err or 'health-check failed'}). Handoff откатан."
                 )
+                notify(fail_msg, [])
+            except TypeError:
+                try:
+                    notify(fail_msg)
+                except Exception:
+                    pass
             except Exception:
                 pass
 

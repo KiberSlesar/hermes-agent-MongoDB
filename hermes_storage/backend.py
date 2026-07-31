@@ -192,11 +192,23 @@ class ClusterStore(ABC):
         ...
 
     @abstractmethod
-    def set_active(self, node_id: str, *, reason: str = "manual") -> dict[str, Any]:
+    def set_active(
+        self,
+        node_id: str,
+        *,
+        reason: str = "manual",
+        announce_session_keys: Optional[list] = None,
+    ) -> dict[str, Any]:
         ...
 
     @abstractmethod
-    def begin_messaging_handoff(self, target_node_id: str, *, from_node_id: Optional[str] = None) -> dict[str, Any]:
+    def begin_messaging_handoff(
+        self,
+        target_node_id: str,
+        *,
+        from_node_id: Optional[str] = None,
+        announce_session_keys: Optional[list] = None,
+    ) -> dict[str, Any]:
         ...
 
     @abstractmethod

@@ -213,7 +213,13 @@ class HermesStorage:
             "nodes": nodes,
         }
 
-    def activate(self, target: str, *, reason: str = "manual") -> dict[str, Any]:
+    def activate(
+        self,
+        target: str,
+        *,
+        reason: str = "manual",
+        announce_session_keys: Optional[list] = None,
+    ) -> dict[str, Any]:
         """Activate a node by node_id, machine_id, or hostname."""
         nodes = self.cluster.list_nodes(online_within_s=120.0)
         match = None
@@ -228,7 +234,11 @@ class HermesStorage:
                 break
         if not match:
             raise ValueError(f"No cluster node matched {target!r}")
-        state = self.cluster.set_active(match["node_id"], reason=reason)
+        state = self.cluster.set_active(
+            match["node_id"],
+            reason=reason,
+            announce_session_keys=announce_session_keys,
+        )
         # If we just selected THIS machine, make sure the local gateway is up
         # so messaging acquire can complete.
         if match.get("node_id") == self.node_id:

@@ -456,7 +456,13 @@ class MongoClusterStore(ClusterStore):
             upsert=True,
         )
 
-    def set_active(self, node_id: str, *, reason: str = "manual") -> dict[str, Any]:
+    def set_active(
+        self,
+        node_id: str,
+        *,
+        reason: str = "manual",
+        announce_session_keys: Optional[list] = None,
+    ) -> dict[str, Any]:
         state = self.get_state()
         current = state.get("messaging_owner") or state.get("active_node_id")
         if state.get("handoff_state") not in (None, "idle", "done", "failed"):
@@ -483,23 +489,41 @@ class MongoClusterStore(ClusterStore):
             upsert=True,
         )
         self._append_history({"type": "activate", "node_id": node_id, "reason": reason})
-        return self.begin_messaging_handoff(node_id, from_node_id=current)
+        return self.begin_messaging_handoff(
+            node_id,
+            from_node_id=current,
+            announce_session_keys=announce_session_keys,
+        )
 
-    def begin_messaging_handoff(self, target_node_id: str, *, from_node_id: Optional[str] = None) -> dict[str, Any]:
+    def begin_messaging_handoff(
+        self,
+        target_node_id: str,
+        *,
+        from_node_id: Optional[str] = None,
+        announce_session_keys: Optional[list] = None,
+    ) -> dict[str, Any]:
         state = self.get_state()
         current = from_node_id or state.get("messaging_owner")
+        keys: list[str] = []
+        seen: set[str] = set()
+        for key in list(
+            (self._nodes.find_one(
+                {"node_id": current},
+                {"active_session_keys": 1},
+            ) or {}).get("active_session_keys") or []
+        ) + list(announce_session_keys or []):
+            text = str(key or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            keys.append(text)
         self._state.update_one(
             {"_id": self.STATE_ID},
             {"$set": {
                 "handoff_state": "releasing",
                 "handoff_from": current,
                 "handoff_to": target_node_id,
-                "handoff_session_keys": list(
-                    (self._nodes.find_one(
-                        {"node_id": current},
-                        {"active_session_keys": 1},
-                    ) or {}).get("active_session_keys") or []
-                ),
+                "handoff_session_keys": keys,
                 "handoff_error": None,
                 "updated_at": utcnow(),
             }},

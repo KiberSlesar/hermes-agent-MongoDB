@@ -149,6 +149,105 @@ def test_active_switch_records_handoff_and_session_keys():
     assert state["pending_active_node_id"] == "new"
 
 
+def test_begin_handoff_merges_announce_session_keys():
+    from hermes_storage.mongo.stores import MongoClusterStore
+
+    db = _Database(
+        {
+            "_id": "default",
+            "active_node_id": "old",
+            "messaging_owner": "old",
+            "handoff_state": "idle",
+        },
+        [
+            {"node_id": "old", "active_turns": 0, "active_session_keys": ["agent:main:telegram:dm:1"]},
+            {"node_id": "new", "active_turns": 0},
+        ],
+    )
+    cluster = MongoClusterStore(db)
+    state = cluster.set_active(
+        "new",
+        announce_session_keys=["agent:main:telegram:dm:99"],
+    )
+    assert "agent:main:telegram:dm:1" in state["handoff_session_keys"]
+    assert "agent:main:telegram:dm:99" in state["handoff_session_keys"]
+
+
+def test_format_cluster_move_notice_mentions_target():
+    from hermes_storage.cluster import format_cluster_move_notice
+
+    class Cluster:
+        def list_nodes(self, **_kwargs):
+            return [
+                {"node_id": "win", "hostname": "R2D2"},
+                {"node_id": "linux", "hostname": "hermes-mongo"},
+            ]
+
+    storage = type("S", (), {
+        "node_id": "linux",
+        "cluster": Cluster(),
+    })()
+    text = format_cluster_move_notice(
+        storage, from_node_id="win", to_node_id="linux"
+    )
+    assert "Системное сообщение" in text
+    assert "hermes-mongo" in text
+    assert "R2D2" in text
+
+
+def test_acquire_notifies_chat_with_captured_session_keys(monkeypatch):
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def __init__(self):
+            self.state = {
+                "handoff_state": "acquiring",
+                "handoff_from": "old",
+                "handoff_to": "new",
+                "handoff_session_keys": ["agent:main:telegram:dm:42"],
+            }
+            self.completed = False
+
+        def get_state(self):
+            return dict(self.state)
+
+        def list_nodes(self, **_kwargs):
+            return [
+                {"node_id": "old", "hostname": "old-host"},
+                {"node_id": "new", "hostname": "new-host"},
+            ]
+
+        def complete_messaging_handoff(self, node_id):
+            self.completed = True
+            self.state = {
+                "handoff_state": "idle",
+                "messaging_owner": node_id,
+                "active_node_id": node_id,
+                "handoff_session_keys": [],
+            }
+
+    notes = []
+    cluster = Cluster()
+    monkeypatch.setattr(cluster_module, "_ACQUIRE_CB", lambda: True)
+    monkeypatch.setattr(
+        cluster_module,
+        "_NOTIFY_CB",
+        lambda msg, keys=None: notes.append((msg, list(keys or []))),
+    )
+    storage = type("Storage", (), {
+        "node_id": "new",
+        "machine_id": "new-pc",
+        "cluster": cluster,
+    })()
+
+    cluster_module._run_acquire_for_handoff(storage, "new")
+
+    assert cluster.completed is True
+    assert notes
+    assert "Системное сообщение" in notes[0][0]
+    assert notes[0][1] == ["agent:main:telegram:dm:42"]
+
+
 def test_handoff_does_not_release_gateway_while_source_turn_is_active(monkeypatch):
     from hermes_storage import cluster as cluster_module
 

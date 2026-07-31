@@ -10328,8 +10328,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.error("Messaging acquire health-check failed: %s", exc)
                         return False
 
-                def _notify(msg: str) -> None:
+                def _notify(msg: str, session_keys=None) -> None:
                     logger.info("Cluster notify: %s", msg)
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self._announce_cluster_handoff(
+                                str(msg),
+                                list(session_keys or []),
+                            ),
+                            gateway_loop,
+                        ).result(timeout=45)
+                    except Exception as exc:
+                        logger.warning("Cluster chat announce failed: %s", exc)
 
                 register_messaging_callbacks(
                     on_release=_release_messaging,
@@ -13362,6 +13372,119 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
         await adapter.send(source.chat_id, content, metadata=metadata)
+
+    async def _announce_cluster_handoff(
+        self,
+        content: str,
+        session_keys: Optional[list] = None,
+    ) -> None:
+        """Post a system line into chats affected by a cluster agent move."""
+        keys: list[str] = []
+        seen: set[str] = set()
+        for key in list(session_keys or []) + list(getattr(self, "_running_agents", {}) or {}):
+            text = str(key or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            keys.append(text)
+
+        # Fallback: known gateway session entries on messaging platforms.
+        try:
+            store = getattr(self, "session_store", None)
+            entries = getattr(store, "_entries", None) or {}
+            for key, entry in list(entries.items()):
+                origin = getattr(entry, "origin", None)
+                plat = getattr(origin, "platform", None) if origin else None
+                if plat is None:
+                    continue
+                try:
+                    from hermes_storage.cluster import is_messaging_platform
+
+                    if not is_messaging_platform(plat):
+                        continue
+                except Exception:
+                    continue
+                text = str(key or "").strip()
+                if text and text not in seen:
+                    seen.add(text)
+                    keys.append(text)
+        except Exception:
+            logger.debug("Cluster announce session-store scan failed", exc_info=True)
+
+        if not keys:
+            logger.warning(
+                "Cluster handoff completed but no session keys available to announce in chat"
+            )
+            return
+
+        notified: set[tuple[str, str, Optional[str]]] = set()
+        for session_key in keys:
+            source = None
+            try:
+                if getattr(self, "session_store", None) is not None:
+                    await self.async_session_store._ensure_loaded()
+                    entry = self.session_store._entries.get(session_key)
+                    source = getattr(entry, "origin", None) if entry else None
+            except Exception:
+                logger.debug(
+                    "Cluster announce origin lookup failed for %s",
+                    session_key,
+                    exc_info=True,
+                )
+            if source is None:
+                source = self._get_cached_session_source(session_key)
+
+            platform_str = None
+            chat_id = None
+            thread_id = None
+            if source is not None:
+                platform_str = getattr(getattr(source, "platform", None), "value", None) or str(
+                    getattr(source, "platform", "") or ""
+                )
+                chat_id = str(getattr(source, "chat_id", "") or "")
+                thread_id = getattr(source, "thread_id", None)
+            else:
+                parsed = _parse_session_key(session_key)
+                if not parsed:
+                    continue
+                platform_str = parsed["platform"]
+                chat_id = parsed["chat_id"]
+                thread_id = parsed.get("thread_id")
+
+            if not platform_str or not chat_id:
+                continue
+            dedup = (platform_str, chat_id, str(thread_id) if thread_id else None)
+            if dedup in notified:
+                continue
+            notified.add(dedup)
+
+            try:
+                platform = Platform(platform_str)
+            except Exception:
+                continue
+            adapter = self.adapters.get(platform)
+            if not adapter:
+                continue
+            try:
+                if source is not None:
+                    await self._deliver_platform_notice(source, content)
+                else:
+                    metadata = {}
+                    if thread_id:
+                        metadata["thread_id"] = thread_id
+                    await adapter.send(chat_id, content, metadata=metadata or None)
+                logger.info(
+                    "Cluster move announced to %s chat %s",
+                    platform_str,
+                    chat_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed announcing cluster move to %s/%s",
+                    platform_str,
+                    chat_id,
+                    exc_info=True,
+                )
 
     async def _resolve_async_delegation_session(
         self,

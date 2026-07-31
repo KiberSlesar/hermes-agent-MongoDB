@@ -585,14 +585,35 @@ class GatewaySlashCommandsMixin:
             if not target:
                 return "Usage: /cluster activate <node_id|hostname|machine_id>"
             try:
-                state = storage.activate(target, reason="slash")
+                announce_keys = []
+                try:
+                    from gateway.session_context import get_session_env
+
+                    sk = (get_session_env("HERMES_SESSION_KEY", "") or "").strip()
+                    if sk:
+                        announce_keys.append(sk)
+                except Exception:
+                    pass
+                try:
+                    source = getattr(event, "source", None)
+                    if source is not None:
+                        sk2 = self._session_key_for_source(source)
+                        if sk2 and str(sk2) not in announce_keys:
+                            announce_keys.append(str(sk2))
+                except Exception:
+                    pass
+                state = storage.activate(
+                    target,
+                    reason="slash",
+                    announce_session_keys=announce_keys or None,
+                )
                 return (
                     f"Handoff started toward `{target}`.\n"
                     f"handoff_state={state.get('handoff_state')}\n"
                     f"messaging_owner (still)={state.get('messaging_owner')}\n"
                     f"pending={state.get('pending_active_node_id')}\n"
-                    "This chat keeps running here until handoff completes; "
-                    "send another message after that for tools on the target."
+                    "After handoff completes, a system message is posted here; "
+                    "then send another message for tools on the target."
                 )
             except Exception as exc:
                 return f"Activate failed: {exc}"
