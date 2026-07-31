@@ -5,10 +5,41 @@ from __future__ import annotations
 import logging
 import re
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+_TIMESTAMP_FIELDS = frozenset(
+    {"started_at", "ended_at", "last_active", "updated_at", "created_at"}
+)
+
+
+def _session_doc_to_sessiondb_shape(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Convert Mongo BSON datetimes to the float timestamp SessionDB exposes.
+
+    SQLite-backed ``SessionDB`` returns Unix timestamps. Dashboard and gateway
+    callers therefore perform arithmetic and comparisons on these fields. Mongo
+    returns timezone-aware ``datetime`` instances, so normalize at the adapter
+    boundary rather than teaching every consumer about BSON types.
+    """
+    if doc is None:
+        return None
+    out = dict(doc)
+    for field in _TIMESTAMP_FIELDS:
+        value = out.get(field)
+        if not isinstance(value, datetime):
+            continue
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        out[field] = value.timestamp()
+    # Mongo's write path maintains updated_at; SessionDB list consumers expect
+    # last_active, so use it when older Mongo documents do not carry that key.
+    if out.get("last_active") is None and out.get("updated_at") is not None:
+        out["last_active"] = out["updated_at"]
+    return out
 
 
 class MongoSessionAdapter:
@@ -52,7 +83,7 @@ class MongoSessionAdapter:
         self._store.update_session(session_id, ended_at=None, end_reason=None)
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        return self._store.get_session(session_id)
+        return _session_doc_to_sessiondb_shape(self._store.get_session(session_id))
 
     def delete_session(self, session_id: str) -> bool:
         return self._store.delete_session(session_id)
@@ -61,7 +92,10 @@ class MongoSessionAdapter:
         return sum(1 for sid in session_ids if self.delete_session(sid))
 
     def list_sessions_rich(self, *, limit: int = 50, source: Optional[str] = None, **kwargs):
-        return self._store.list_sessions(limit=limit, source=source)
+        return [
+            _session_doc_to_sessiondb_shape(session) or {}
+            for session in self._store.list_sessions(limit=limit, source=source)
+        ]
 
     def search_sessions(self, query: str, *, limit: int = 20, **kwargs):
         msgs = self._store.search_messages(query, limit=limit * 3)
@@ -110,7 +144,12 @@ class MongoSessionAdapter:
         return self._store.append_message(session_id, role, content, **kwargs)
 
     def get_messages(self, session_id: str, include_inactive: bool = False, **kwargs):
-        return self._store.get_messages(session_id, include_inactive=include_inactive)
+        return [
+            _session_doc_to_sessiondb_shape(message) or {}
+            for message in self._store.get_messages(
+                session_id, include_inactive=include_inactive
+            )
+        ]
 
     def get_messages_as_conversation(self, session_id: str, **kwargs):
         messages = self.get_messages(session_id)

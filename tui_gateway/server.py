@@ -2684,6 +2684,26 @@ def _load_cfg_raw() -> dict:
     managed overlay + env expansion on top of this raw read.
     """
     global _cfg_cache, _cfg_mtime, _cfg_path
+    # Mongo is the profile's durable source of truth.  The embedded Dashboard
+    # gateway lives in the dashboard process, so reading only
+    # ``<HERMES_HOME>/config.yaml`` here made it miss Mongo-only model/provider
+    # settings and silently fall back to the GLM default.
+    try:
+        from hermes_storage import is_mongo_mode, require_storage
+
+        if is_mongo_mode():
+            data = require_storage().load_profile_config() or {}
+            return copy.deepcopy(data) if isinstance(data, dict) else {}
+    except Exception:
+        # Mongo mode callers fail later through their normal operation path;
+        # do not fall back to a stale local yaml and split profile state.
+        try:
+            from hermes_storage import is_mongo_mode as _mongo_on
+
+            if _mongo_on():
+                return {}
+        except Exception:
+            pass
     try:
         # Honor a per-session profile override (see session.resume) so a resumed
         # remote profile loads ITS config (model, skills, prompt); otherwise the
@@ -2728,7 +2748,19 @@ def _load_cfg() -> dict:
     round-trips or expanded/overlaid values get persisted into the user's
     file.
     """
-    cfg = _apply_managed(_load_cfg_raw())
+    # The behavioral Mongo read includes shared settings and the local machine
+    # overlay, matching hermes_cli.config.load_config(). `_load_cfg_raw()` is
+    # deliberately profile-only for write-back callers.
+    try:
+        from hermes_storage import is_mongo_mode, require_storage
+
+        if is_mongo_mode():
+            cfg = require_storage().load_effective_config({}) or {}
+        else:
+            cfg = _load_cfg_raw()
+    except Exception:
+        cfg = _load_cfg_raw()
+    cfg = _apply_managed(cfg if isinstance(cfg, dict) else {})
     try:
         from hermes_cli.config import _expand_env_vars
 
@@ -2758,6 +2790,25 @@ def _apply_managed(cfg: dict) -> dict:
 
 def _save_cfg(cfg: dict):
     global _cfg_cache, _cfg_mtime, _cfg_path
+
+    try:
+        from hermes_storage import is_mongo_mode
+
+        _mongo = bool(is_mongo_mode())
+    except Exception:
+        _mongo = False
+
+    if _mongo:
+        # Fail hard rather than silently producing a local-only config write.
+        from hermes_storage import require_storage
+
+        require_storage().save_profile_config(cfg)
+        require_storage().save_machine_overlay_from_config(cfg)
+        with _cfg_lock:
+            _cfg_cache = copy.deepcopy(cfg)
+            _cfg_path = None
+            _cfg_mtime = None
+        return
 
     from hermes_cli.config import atomic_config_write
 
@@ -3202,10 +3253,23 @@ def _ensure_skin_watcher() -> None:
 
 
 def _resolve_model() -> str:
+    # Mongo mode has a profile-level configuration source of truth. Do not let
+    # a stale process/service HERMES_MODEL pin the embedded Dashboard gateway
+    # to a different model than the active Mongo profile.
+    try:
+        from hermes_storage import is_mongo_mode
+
+        _mongo = bool(is_mongo_mode())
+    except Exception:
+        _mongo = False
     env = (
-        os.environ.get("HERMES_MODEL", "")
-        or os.environ.get("HERMES_INFERENCE_MODEL", "")
-    ).strip()
+        ""
+        if _mongo
+        else (
+            os.environ.get("HERMES_MODEL", "")
+            or os.environ.get("HERMES_INFERENCE_MODEL", "")
+        ).strip()
+    )
     if env:
         return env
     m = _load_cfg().get("model", "")

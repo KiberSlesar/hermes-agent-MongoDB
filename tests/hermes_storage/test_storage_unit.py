@@ -3,10 +3,26 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 import yaml
+
+
+def test_mongo_session_doc_uses_sessiondb_timestamp_shape():
+    """BSON datetimes must not leak through the SessionDB adapter."""
+    from hermes_storage.session_bridge import _session_doc_to_sessiondb_shape
+
+    moment = datetime(2026, 7, 31, 8, 33, 17, tzinfo=timezone.utc)
+    row = _session_doc_to_sessiondb_shape(
+        {"session_id": "s1", "started_at": moment, "updated_at": moment}
+    )
+
+    assert row is not None
+    assert row["started_at"] == moment.timestamp()
+    assert row["updated_at"] == moment.timestamp()
+    assert row["last_active"] == moment.timestamp()
 
 
 def test_peer_cert_cn():

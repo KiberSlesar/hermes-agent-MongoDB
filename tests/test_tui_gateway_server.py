@@ -1281,6 +1281,26 @@ def test_voice_toggle_handles_non_dict_voice_cfg(monkeypatch):
         ), f"voice.record_key fell back to default for root={bad_root!r}"
 
 
+def test_tui_gateway_load_cfg_uses_mongo_effective_config(monkeypatch):
+    """Dashboard's in-process gateway must not fall back to local yaml."""
+    import hermes_storage
+
+    profile_cfg = {"model": {"default": "gpt-5.6-luna", "provider": "custom"}}
+    storage = types.SimpleNamespace(
+        load_profile_config=lambda: dict(profile_cfg),
+        load_effective_config=lambda _base: dict(profile_cfg),
+    )
+    monkeypatch.setattr(hermes_storage, "is_mongo_mode", lambda: True)
+    monkeypatch.setattr(hermes_storage, "require_storage", lambda: storage)
+    monkeypatch.setenv("HERMES_MODEL", "stale/glm-5.2")
+
+    cfg = server._load_cfg()
+
+    assert cfg["model"]["default"] == "gpt-5.6-luna"
+    assert cfg["model"]["provider"] == "custom"
+    assert server._resolve_model() == "gpt-5.6-luna"
+
+
 def test_voice_record_start_handles_non_dict_voice_cfg(monkeypatch):
     """Round-7 Copilot review regression on #19835.
 
