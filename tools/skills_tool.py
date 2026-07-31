@@ -150,15 +150,15 @@ def _skills_dir() -> Path:
     Some long-lived runtimes import this module before the active profile has
     set HERMES_HOME. Keep the legacy SKILLS_DIR module attribute for tests and
     external patchers, but when it has not been patched, resolve from the live
-    writable skills root (Mongo cache in mongo mode).
+    skills root. In Mongo mode this materializes from the DB into cache/skills.
     """
     configured = Path(SKILLS_DIR)
     if configured != _SKILLS_DIR_AT_IMPORT:
         return configured
     try:
-        from hermes_storage.skills_sync import writable_skills_dir
+        from hermes_constants import get_skills_dir
 
-        return writable_skills_dir()
+        return get_skills_dir()
     except Exception:
         return get_hermes_home() / "skills"
 
@@ -810,7 +810,9 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                     "success": True,
                     "skills": [],
                     "categories": [],
-                    "message": f"No skills found. Skills directory created at {display_hermes_home()}/skills/",
+                    "message": (
+                        f"No skills found. Skills directory created at {active_skills_dir}/"
+                    ),
                 },
                 ensure_ascii=False,
             )
@@ -824,7 +826,12 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                     "success": True,
                     "skills": [],
                     "categories": [],
-                    "message": "No skills found in skills/ directory.",
+                    "message": (
+                        f"No skills found under {active_skills_dir}/. "
+                        "If Mongo is empty, reseed with: "
+                        "python -c \"from hermes_storage.skills_sync import seed_shared_skills_if_empty, sync_skills_from_mongo; "
+                        "print(seed_shared_skills_if_empty()); sync_skills_from_mongo()\""
+                    ),
                 },
                 ensure_ascii=False,
             )

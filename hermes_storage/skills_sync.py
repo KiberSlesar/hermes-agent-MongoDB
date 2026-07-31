@@ -167,7 +167,7 @@ def seed_shared_skills_if_empty(
     *,
     home: Optional[Path] = None,
 ) -> dict[str, int]:
-    """If Mongo has zero skills, push from local ~/.hermes/skills then bundled tree.
+    """If Mongo has zero skills, push from local cache/classic then bundled tree.
 
     Returns counts: {existing, uploaded, source}.
     """
@@ -183,28 +183,50 @@ def seed_shared_skills_if_empty(
     uploaded = 0
     source = "none"
 
-    local_root = home / "skills"
-    dirs = _iter_skill_dirs(local_root)
-    if dirs:
-        source = str(local_root)
+    # Prefer already-materialized / legacy local trees, then bundled checkout.
+    candidates = [
+        home / "cache" / "skills",
+        home / "skills",
+        home / "hermes-agent" / "skills",
+        Path(__file__).resolve().parents[1] / "skills",
+    ]
+    for cand in candidates:
+        dirs = _iter_skill_dirs(cand)
+        if not dirs:
+            continue
+        source = str(cand)
         for d in dirs:
+            # Skip hidden staging trees under cache/skills
+            try:
+                rel = d.relative_to(cand)
+                if any(p.startswith(".") for p in rel.parts):
+                    continue
+            except ValueError:
+                pass
             upload_local_skill_tree(d, name=d.name)
             uploaded += 1
-    else:
-        # Fall back to checkout / package bundled skills
-        candidates = [
-            home / "hermes-agent" / "skills",
-            Path(__file__).resolve().parents[1] / "skills",
-        ]
-        for cand in candidates:
-            dirs = _iter_skill_dirs(cand)
-            if not dirs:
-                continue
-            source = str(cand)
-            for d in dirs:
+        break
+
+    # If still empty, run classic bundled sync into the writable cache, then upload.
+    if uploaded == 0:
+        try:
+            from tools.skills_sync import sync_skills
+
+            sync_skills(quiet=True)
+            cache = mongo_skills_cache_dir()
+            for d in _iter_skill_dirs(cache):
+                try:
+                    rel = d.relative_to(cache)
+                    if any(p.startswith(".") for p in rel.parts):
+                        continue
+                except ValueError:
+                    pass
                 upload_local_skill_tree(d, name=d.name)
                 uploaded += 1
-            break
+            if uploaded:
+                source = f"sync_skills→{cache}"
+        except Exception as exc:
+            logger.warning("bundled sync_skills seed failed: %s", exc)
 
     return {"existing": 0, "uploaded": uploaded, "source": source}
 
