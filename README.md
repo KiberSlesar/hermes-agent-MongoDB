@@ -49,10 +49,8 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/install-agent.ps1 | iex
 ```
 
-При обновлении ответьте на вопросы так:
-
-1. `Update / replace existing Hermes runtime?` → **Y** (меняется только код/launcher; данные `HERMES_HOME` и Mongo-enrollment сохраняются).
-2. `Connect this PC to Hermes DB now?` → **n**, если агент уже подключён к DB.
+При обновлении установщик сам пишет, если нашёл `bootstrap.yaml` (коннект уже есть),
+и по умолчанию предлагает **n** — повторный код не нужен. На замену runtime отвечайте **Y**.
 
 Либо без вопросов:
 

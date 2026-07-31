@@ -74,7 +74,8 @@ confirm_replace_existing_installation() {
   echo "An existing Hermes installation was found:" >&2
   [[ -n "$existing" ]] && echo "  command: $existing" >&2
   [[ -d "$AGENT_DIR" ]] && echo "  checkout: $AGENT_DIR" >&2
-  echo "Replacing it removes its launcher/runtime only; HERMES_HOME data is preserved." >&2
+  echo "Replacing it removes its launcher/runtime only." >&2
+  echo "HERMES_HOME data and the existing DB connection (bootstrap.yaml + certs) are kept." >&2
   if [[ "$YES" == "1" ]]; then
     say "HERMES_YES=1 / --yes: replacing existing install"
   elif can_prompt; then
@@ -399,17 +400,35 @@ if [[ "$FORCE_CONNECT" -eq 1 ]]; then
 fi
 
 if ! can_prompt; then
-  warn "No TTY вЂ” run: hermes db connect --host IP:8743 --code ABCD-EFGH"
+  warn "No TTY — run: hermes db connect --host IP:8743 --code ABCD-EFGH"
   echo "  Launcher: $HERMES_HOME_DIR/bin/hermes"
   exit 0
 fi
 
-ask ans "Connect this PC to Hermes DB now? (already enrolled: n) [Y/n] " "Y"
+already_connected=0
+if [[ -f "$HERMES_HOME_DIR/bootstrap.yaml" ]]; then
+  already_connected=1
+  echo ""
+  echo "Existing DB connection found:"
+  echo "  $HERMES_HOME_DIR/bootstrap.yaml"
+  [[ -f "$HERMES_HOME_DIR/certs/agent.pem" ]] && echo "  $HERMES_HOME_DIR/certs/agent.pem"
+  echo "It was not removed by the update. Choose n unless you want a new one-time code."
+fi
+
+if [[ "$already_connected" -eq 1 ]]; then
+  ask ans "Connect again with a new code? [y/N] " "N"
+else
+  ask ans "Connect this PC to Hermes DB now? [Y/n] " "Y"
+fi
 if [[ "$ans" =~ ^[Yy] ]]; then
   echo "Enter values from the DB server (agent-add):"
   do_connect "" ""
 else
-  echo "Later: hermes db connect"
-  echo "  $HERMES_HOME_DIR/bin/hermes db connect"
+  if [[ "$already_connected" -eq 1 ]]; then
+    echo "Keeping existing DB connection."
+  else
+    echo "Later: hermes db connect"
+    echo "  $HERMES_HOME_DIR/bin/hermes db connect"
+  fi
 fi
 echo ""

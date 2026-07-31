@@ -62,7 +62,8 @@ function Confirm-ReplaceExistingInstallation {
     if ($hasExistingCheckout) {
         Write-Host "  checkout: $AgentDir"
     }
-    Write-Host "Replacing it removes its launcher/runtime only; HERMES_HOME data is preserved."
+    Write-Host "Replacing it removes its launcher/runtime only."
+    Write-Host "HERMES_HOME data and the existing DB connection (bootstrap.yaml + certs) are kept."
     if (-not $Yes) {
         $answer = Read-Host "Update / replace existing Hermes runtime? [y/N]"
         if ($answer -notmatch '^[Yy]') {
@@ -146,10 +147,25 @@ if (-not (($userPath -split ';') | Where-Object {
 
 Write-Host ""
 Write-Host "Mongo fork installed. No upstream Hermes runtime was installed."
-$ans = Read-Host "Connect this PC to Hermes DB now? (already enrolled: n) [Y/n]"
-if (-not $ans) { $ans = "Y" }
+$bootstrap = Join-Path $HermesHome "bootstrap.yaml"
+$agentPem = Join-Path $HermesHome "certs\agent.pem"
+$alreadyConnected = Test-Path $bootstrap
+if ($alreadyConnected) {
+    Write-Host ""
+    Write-Host "Existing DB connection found:"
+    Write-Host "  $bootstrap"
+    if (Test-Path $agentPem) { Write-Host "  $agentPem" }
+    Write-Host "It was not removed by the update. Choose n unless you want a new one-time code."
+    $ans = Read-Host "Connect again with a new code? [y/N]"
+    if (-not $ans) { $ans = "N" }
+} else {
+    $ans = Read-Host "Connect this PC to Hermes DB now? [Y/n]"
+    if (-not $ans) { $ans = "Y" }
+}
 if ($ans -match '^[Yy]') {
     & $launcher db connect
+} elseif ($alreadyConnected) {
+    Write-Host "Keeping existing DB connection."
 } else {
     Write-Host "Later: $launcher db connect"
 }
