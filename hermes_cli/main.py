@@ -969,6 +969,22 @@ def _sync_bundled_skills_for_startup() -> bool:
             load_hermes_dotenv()
         except Exception:
             pass
+        # If ``cli`` was already imported, refresh CLI_CONFIG so the status
+        # bar / HermesCLI pick up the seeded Mongo model+providers.
+        try:
+            import sys as _sys
+
+            _cli_mod = _sys.modules.get("cli")
+            if _cli_mod is not None and hasattr(_cli_mod, "load_cli_config"):
+                _cli_mod.CLI_CONFIG = _cli_mod.load_cli_config()
+                try:
+                    from hermes_cli.skin_engine import init_skin_from_config
+
+                    init_skin_from_config(_cli_mod.CLI_CONFIG)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         sync_skills_from_mongo()
         return True
 

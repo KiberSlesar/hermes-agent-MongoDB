@@ -407,20 +407,21 @@ def _parse_service_tier_config(raw: str) -> str | None:
 
 def load_cli_config() -> Dict[str, Any]:
     """
-    Load CLI configuration from config files.
-    
+    Load CLI configuration from config files / Mongo.
+
     Config lookup order:
-    1. ~/.hermes/config.yaml (user config - preferred)
-    2. ./cli-config.yaml (project config - fallback)
-    
+    1. Mongo effective config (when mongo mode is on)
+    2. ~/.hermes/config.yaml (user config - preferred in classic mode)
+    3. ./cli-config.yaml (project config - fallback)
+
     Environment variables take precedence over config file values.
     Returns default values if no config file exists.
 
     If HERMES_IGNORE_USER_CONFIG=1 is set (via ``hermes chat --ignore-user-config``),
-    the user config at ``~/.hermes/config.yaml`` is skipped entirely and only the
-    built-in defaults plus the project-level ``cli-config.yaml`` (if any) are used.
-    Credentials in ``.env`` are still loaded — this flag only suppresses
-    behavioral/config settings.
+    the user config at ``~/.hermes/config.yaml`` / Mongo profile config is skipped
+    and only the built-in defaults plus the project-level ``cli-config.yaml``
+    (if any) are used. Credentials in ``.env`` / Mongo secrets are still loaded —
+    this flag only suppresses behavioral/config settings.
     """
     # Check user config first ({HERMES_HOME}/config.yaml)
     user_config_path = _hermes_home / 'config.yaml'
@@ -559,14 +560,42 @@ def load_cli_config() -> Dict[str, Any]:
     # file should be authoritative.
     _file_has_terminal_config = False
 
-    # Load from file if exists
-    if config_path.exists():
+    file_config: Optional[Dict[str, Any]] = None
+
+    # Mongo mode: durable config lives in the DB — do not require local
+    # config.yaml (mongo-only installs leave it absent → model stayed
+    # "unknown" in the status bar).
+    try:
+        from hermes_storage import is_mongo_mode
+
+        _mongo_cli = bool(is_mongo_mode()) and not ignore_user_config
+    except Exception:
+        _mongo_cli = False
+
+    if _mongo_cli:
+        try:
+            from hermes_cli.config import _normalize_root_model_keys
+            from hermes_storage import require_storage
+
+            raw = require_storage().load_effective_config({}) or {}
+            if isinstance(raw, dict) and raw:
+                file_config = _normalize_root_model_keys(raw)
+        except Exception as e:
+            logger.warning("Failed to load Mongo profile config for CLI: %s", e)
+
+    # Classic: load from local yaml if exists
+    if file_config is None and config_path.exists():
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 from hermes_cli.config import _normalize_root_model_keys
 
                 file_config = _normalize_root_model_keys(fast_safe_load(f) or {})
-            
+        except Exception as e:
+            logger.warning("Failed to load cli-config.yaml: %s", e)
+            file_config = None
+
+    if file_config:
+        try:
             _file_has_terminal_config = "terminal" in file_config
 
             # Handle model config - can be string (new format) or dict (old format)
@@ -614,7 +643,7 @@ def load_cli_config() -> Dict[str, Any]:
             ):
                 defaults["agent"]["max_turns"] = file_config["max_turns"]
         except Exception as e:
-            logger.warning("Failed to load cli-config.yaml: %s", e)
+            logger.warning("Failed to apply user config for CLI: %s", e)
 
     # Expand ${ENV_VAR} references in config values before bridging to env vars.
     from hermes_cli.config import _expand_env_vars
