@@ -203,6 +203,9 @@ def cmd_mongo_seed_skills() -> int:
     print(f"Cache: {cache}")
     print(f"Mongo skills now: {len(storage.skills.list_skills())}")
     return 0
+
+
+def cmd_mongo_status(*, as_json: bool = False) -> int:
     """Entry used by ``hermes mongo status``. Returns process exit code."""
     import json
 
