@@ -480,6 +480,7 @@ from hermes_cli.subcommands.storage_cluster import (
     build_cluster_parser,
     build_db_parser,
     build_machine_parser,
+    build_mongo_parser,
     build_storage_parser,
 )
 
@@ -4718,6 +4719,17 @@ def cmd_db(args):
         cmd_db_connect(args)
         return
     print("usage: hermes db connect [--host IP:PORT] [--code ABCD-EFGH]")
+
+
+def cmd_mongo(args):
+    """MongoDB inventory: hermes mongo status."""
+    sub = getattr(args, "mongo_command", None) or "status"
+    if sub == "status":
+        from hermes_cli.mongo_cmds import cmd_mongo_status
+
+        raise SystemExit(cmd_mongo_status(as_json=bool(getattr(args, "json", False))))
+    print("usage: hermes mongo status [--json]")
+    raise SystemExit(2)
 
 
 def cmd_cron(args):
@@ -11519,6 +11531,7 @@ def main():
     build_machine_parser(subparsers, cmd_machine=cmd_machine)
     build_agent_parser(subparsers, cmd_agent=cmd_agent)
     build_db_parser(subparsers, cmd_db=cmd_db)
+    build_mongo_parser(subparsers, cmd_mongo=cmd_mongo)
 
     # =========================================================================
     # cron command  (parser built in hermes_cli/subcommands/cron.py)

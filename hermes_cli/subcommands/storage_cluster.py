@@ -149,3 +149,10 @@ def build_db_parser(subparsers, *, cmd_db: Callable) -> None:
     connect.add_argument("--name", default=None, help="Name for this PC (cert CN)")
     connect.add_argument("--hermes-home", default=None, help="Override HERMES_HOME")
     connect.set_defaults(func=cmd_db)
+
+
+def build_mongo_parser(subparsers, *, cmd_mongo: Callable) -> None:
+    """Delegate to hermes_cli.mongo_cmds (keeps inventory logic out of this file)."""
+    from hermes_cli.mongo_cmds import build_mongo_parser as _build
+
+    _build(subparsers, cmd_mongo=cmd_mongo)
