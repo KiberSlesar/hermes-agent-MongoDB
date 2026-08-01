@@ -57,13 +57,19 @@ HERMES_HOME = get_hermes_home()
 
 
 def _skills_dir() -> Path:
-    """Live skills root — Mongo cache in mongo mode, else ~/.hermes/skills."""
+    """Live skills root — Mongo cache in product mode, classic only in tests."""
     try:
         from hermes_storage.skills_sync import writable_skills_dir
 
         return writable_skills_dir()
     except Exception:
-        return get_hermes_home() / "skills"
+        from hermes_storage import classic_allowed
+
+        if classic_allowed():
+            return get_hermes_home() / "skills"
+        from hermes_storage.skills_sync import mongo_skills_cache_dir
+
+        return mongo_skills_cache_dir()
 
 
 def __getattr__(name: str):

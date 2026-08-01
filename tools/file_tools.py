@@ -618,8 +618,30 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         return (
             f"Refusing to write to Hermes config file: {filepath}\n"
             "Agent cannot modify security-sensitive configuration. "
-            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
+            "Use 'hermes config' / skill_manage / memory tools — disk is not "
+            "durable in this MongoDB fork."
         )
+
+    # Mongo-only fork: classic durable HERMES_HOME paths are not SoT.
+    # Agents writing SOUL.md / .env / skills/ / memories/ think they persisted
+    # state while Mongo remains unchanged.
+    try:
+        from hermes_storage import classic_allowed, is_mongo_mode
+        from hermes_storage.mongo_only import (
+            durable_write_blocked_message,
+            is_classic_durable_path,
+        )
+
+        if is_mongo_mode() and not classic_allowed():
+            for candidate in (resolved, normalized):
+                try:
+                    p = Path(candidate)
+                except Exception:
+                    continue
+                if is_classic_durable_path(p):
+                    return durable_write_blocked_message(p)
+    except Exception:
+        pass
     return None
 
 

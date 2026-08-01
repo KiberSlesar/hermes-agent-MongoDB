@@ -925,14 +925,30 @@ def ensure_hermes_home():
             except Exception:
                 pass
         else:
-            for subdir in (
-                "cron", "sessions", "logs", "logs/curator", "memories",
-                "pairing", "hooks", "image_cache", "audio_cache", "skills",
-            ):
-                d = home / subdir
-                d.mkdir(parents=True, exist_ok=True)
-                _secure_dir(d)
-            _ensure_default_soul_md(home)
+            # Pre-bootstrap (enroll) or test classic: never create classic
+            # durable trees in product mode without Mongo.
+            try:
+                from hermes_storage import classic_allowed
+                _classic = classic_allowed()
+            except Exception:
+                _classic = False
+            if _classic:
+                for subdir in (
+                    "cron", "sessions", "logs", "logs/curator", "memories",
+                    "pairing", "hooks", "image_cache", "audio_cache", "skills",
+                ):
+                    d = home / subdir
+                    d.mkdir(parents=True, exist_ok=True)
+                    _secure_dir(d)
+                _ensure_default_soul_md(home)
+            else:
+                for subdir in (
+                    "logs", "logs/curator", "cache", "cache/skills",
+                    "image_cache", "audio_cache", "certs",
+                ):
+                    d = home / subdir
+                    d.mkdir(parents=True, exist_ok=True)
+                    _secure_dir(d)
 
     _HERMES_HOME_ENSURED.add(key)
 
@@ -3718,7 +3734,9 @@ def save_config(
         # do not leave a local-only write that diverges from the fleet brain.
         # Write only the *normalized* document (below) — never the pre-strip
         # caller payload, or env-ref templates / defaults get corrupted.
-        from hermes_storage import is_mongo_mode
+        from hermes_storage import ensure_mongo_durable, is_mongo_mode
+
+        ensure_mongo_durable(surface="config")
         _mongo_save = is_mongo_mode()
         # Compute explicit user paths BEFORE any normalisation --------
         # _normalize_max_turns_config may inject agent.max_turns from
@@ -4088,13 +4106,10 @@ def save_env_value(key: str, value: str):
     value = _check_non_ascii_credential(key, value)
     ensure_hermes_home()
 
-    # Mongo mode: DB is the only durable secrets store.
-    try:
-        from hermes_storage import is_mongo_mode, require_storage
+    from hermes_storage import ensure_mongo_durable, is_mongo_mode, require_storage
 
-        _mongo = is_mongo_mode()
-    except Exception:
-        _mongo = False
+    ensure_mongo_durable(surface="secrets")
+    _mongo = is_mongo_mode()
 
     if _mongo:
         try:
@@ -4260,12 +4275,10 @@ def remove_env_value(key: str) -> bool:
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
 
-    try:
-        from hermes_storage import is_mongo_mode, require_storage
+    from hermes_storage import ensure_mongo_durable, is_mongo_mode, require_storage
 
-        _mongo = is_mongo_mode()
-    except Exception:
-        _mongo = False
+    ensure_mongo_durable(surface="secrets")
+    _mongo = is_mongo_mode()
 
     if _mongo:
         try:

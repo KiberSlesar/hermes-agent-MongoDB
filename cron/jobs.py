@@ -1074,7 +1074,9 @@ def load_jobs() -> List[Dict[str, Any]]:
 
 def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage. Caller must hold _jobs_lock()."""
-    from hermes_storage import is_mongo_mode
+    from hermes_storage import ensure_mongo_durable, is_mongo_mode
+
+    ensure_mongo_durable(surface="cron jobs")
     if is_mongo_mode():
         from hermes_storage.ledgers import save_cron_jobs
         save_cron_jobs({"jobs": jobs, "updated_at": _hermes_now().isoformat()})

@@ -25,12 +25,13 @@ def mongo_skills_cache_dir() -> Path:
 def writable_skills_dir() -> Path:
     """Directory skill writers should use.
 
-    Mongo mode: ephemeral cache under ``cache/skills`` (durable store is Mongo).
-    Classic mode: ``~/.hermes/skills``.
+    Mongo mode (this fork's product path): ephemeral cache under
+    ``cache/skills`` (durable store is Mongo).
+    Classic mode: only when ``HERMES_ALLOW_CLASSIC`` is set (tests).
     """
-    from hermes_storage import is_mongo_mode
+    from hermes_storage import classic_allowed, is_mongo_mode
 
-    if is_mongo_mode():
+    if is_mongo_mode() or not classic_allowed():
         return mongo_skills_cache_dir()
     from hermes_constants import get_hermes_home
 

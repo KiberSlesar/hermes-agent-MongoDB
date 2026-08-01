@@ -444,9 +444,9 @@ def sync_default_opt_in() -> bool:
 # ---------------------------------------------------------------------------
 
 def _skills_dir() -> Path:
-    from hermes_constants import get_hermes_home
+    from hermes_storage.skills_sync import writable_skills_dir
 
-    return get_hermes_home() / "skills"
+    return writable_skills_dir()
 
 
 def is_sync_eligible(skill_name: str) -> bool:

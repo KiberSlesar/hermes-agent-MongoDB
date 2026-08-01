@@ -617,11 +617,21 @@ async def update_profile_soul(name: str, body: ProfileSoulUpdate):
     profile_dir = _resolve_profile_dir(name)
     try:
         from hermes_constants import get_hermes_home
-        from hermes_storage import is_mongo_mode, require_storage
+        from hermes_storage import classic_allowed, is_mongo_mode, require_storage
 
         if is_mongo_mode() and Path(profile_dir).resolve() == get_hermes_home().resolve():
             require_storage().save_soul(body.content)
             return {"ok": True}
+        if is_mongo_mode() and not classic_allowed():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "SOUL is stored in Mongo for the active profile only. "
+                    "Switch profile / use Mongo APIs — local SOUL.md is not durable."
+                ),
+            )
+    except HTTPException:
+        raise
     except Exception as e:
         _log.exception("PUT /api/profiles/%s/soul mongo failed", name)
         raise HTTPException(status_code=500, detail=f"Could not write SOUL to Mongo: {e}")

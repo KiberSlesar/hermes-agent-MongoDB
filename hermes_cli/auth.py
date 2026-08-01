@@ -1229,6 +1229,10 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # specific store — e.g. the global-root write-through for rotating xAI
     # OAuth grants (#43589) — reusing this function's atomic O_EXCL + 0o600
     # write so the root auth.json gets the same TOCTOU-safe treatment.
+    if target_path is None:
+        from hermes_storage import ensure_mongo_durable
+
+        ensure_mongo_durable(surface="auth store")
     if target_path is None and _mongo_auth_enabled():
         _save_auth_store_to_mongo(auth_store)
         # Best-effort scrub of leftover local durable copy

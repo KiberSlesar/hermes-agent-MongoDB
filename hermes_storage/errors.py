@@ -15,7 +15,8 @@ def raise_mongo_unavailable(reason: str, *, cause: BaseException | None = None) 
     msg = (
         f"Mongo remote storage required but unavailable: {reason}. "
         "Refusing local durable fallback (would split active/passive fleet state). "
-        "Fix connectivity/certs or disable Mongo mode (remove bootstrap.yaml)."
+        "Fix connectivity/certs or re-run `hermes db connect` / "
+        "`hermes storage init-bootstrap`."
     )
     if cause is not None:
         raise MongoStorageError(msg) from cause

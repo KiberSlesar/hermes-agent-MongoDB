@@ -923,78 +923,65 @@ def _mark_termux_bundled_skills_synced() -> None:
 
 
 def _sync_bundled_skills_for_startup() -> bool:
-    """Sync bundled skills, but skip unchanged Termux checkouts cheaply.
+    """Sync bundled skills for runtime startup.
 
-    Hashing every bundled skill is safe but expensive on older Android
-    storage. The git/ref stamp keeps post-update correctness: a changed
-    checkout revision forces one real sync, then later starts skip it.
-
-    Mongo mode: only materialize from GridFS (incremental cache). Do not run
-    classic bundled sync + full re-upload — that was multi‑MB up/down every
-    ``hermes chat`` start.
+    This MongoDB fork requires Mongo mode for chat/gateway/agent runtimes.
+    Materialize skills from GridFS into ``cache/skills`` only — never classic
+    ``~/.hermes/skills`` as durable SoT.
     """
+    from hermes_storage import require_mongo_mode, scrub_classic_durable_home
+    from hermes_storage.skills_sync import (
+        seed_profile_defaults_if_empty,
+        sync_skills_from_mongo,
+    )
+
+    require_mongo_mode(surface="startup skill sync")
+
+    # Fill missing config/secrets independently (soul alone must not
+    # block importing providers/API keys from leftover local files).
     try:
-        from hermes_storage import is_mongo_mode
-
-        _mongo = bool(is_mongo_mode())
-    except Exception:
-        _mongo = False
-
-    if _mongo:
-        from hermes_storage.skills_sync import (
-            seed_profile_defaults_if_empty,
-            sync_skills_from_mongo,
-        )
-
-        # Fill missing config/secrets independently (soul alone must not
-        # block importing providers/API keys from leftover local files).
+        seed_profile_defaults_if_empty()
+        # Seed may have just written profile config/secrets — drop load caches
+        # so the banner/picker sees providers immediately.
         try:
-            seed_profile_defaults_if_empty()
-            # Seed may have just written profile config/secrets — drop load caches
-            # so the banner/picker sees providers immediately.
-            try:
-                from hermes_cli import config as _cfg_mod
+            from hermes_cli import config as _cfg_mod
 
-                _cfg_mod._LOAD_CONFIG_CACHE.clear()
-                _cfg_mod._RAW_CONFIG_CACHE.clear()
-                _cfg_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+            _cfg_mod._invalidate_load_config_cache()
+            _cfg_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+        except Exception:
+            pass
+        # Quarantine leftover classic durable files so agents cannot treat
+        # disk as SoT after enroll/migrate.
+        try:
+            scrub_classic_durable_home()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # Re-apply secrets into os.environ after a late seed.
+    try:
+        from hermes_cli.env_loader import load_hermes_dotenv
+
+        load_hermes_dotenv()
+    except Exception:
+        pass
+    # If ``cli`` was already imported, refresh CLI_CONFIG so the status
+    # bar / HermesCLI pick up the seeded Mongo model+providers.
+    try:
+        import sys as _sys
+
+        _cli_mod = _sys.modules.get("cli")
+        if _cli_mod is not None and hasattr(_cli_mod, "load_cli_config"):
+            _cli_mod.CLI_CONFIG = _cli_mod.load_cli_config()
+            try:
+                from hermes_cli.skin_engine import init_skin_from_config
+
+                init_skin_from_config(_cli_mod.CLI_CONFIG)
             except Exception:
                 pass
-        except Exception:
-            pass
-        # Re-apply secrets into os.environ after a late seed.
-        try:
-            from hermes_cli.env_loader import load_hermes_dotenv
-
-            load_hermes_dotenv()
-        except Exception:
-            pass
-        # If ``cli`` was already imported, refresh CLI_CONFIG so the status
-        # bar / HermesCLI pick up the seeded Mongo model+providers.
-        try:
-            import sys as _sys
-
-            _cli_mod = _sys.modules.get("cli")
-            if _cli_mod is not None and hasattr(_cli_mod, "load_cli_config"):
-                _cli_mod.CLI_CONFIG = _cli_mod.load_cli_config()
-                try:
-                    from hermes_cli.skin_engine import init_skin_from_config
-
-                    init_skin_from_config(_cli_mod.CLI_CONFIG)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        sync_skills_from_mongo()
-        return True
-
-    if _is_termux_startup_environment() and not _termux_bundled_skills_sync_needed():
-        return False
-
-    from tools.skills_sync import sync_skills
-
-    sync_skills(quiet=True)
-    _mark_termux_bundled_skills_synced()
+    except Exception:
+        pass
+    sync_skills_from_mongo()
     return True
 
 
@@ -2523,21 +2510,20 @@ def _pin_kanban_board_env() -> None:
 
 
 def _sync_bundled_skills_quietly() -> None:
-    """Seed ``~/.hermes/skills/`` with the bundled skill library on first launch.
+    """Materialize Mongo skills (and scrub classic leftovers) on gateway/dashboard.
 
-    Called from any CLI entrypoint that the user might use as their first
-    interaction with Hermes — chat, dashboard (the desktop GUI's backend),
-    and gateway. The skills_sync module is manifest-based and idempotent:
-    skipped skills cost ~milliseconds, so calling this repeatedly is fine.
-
-    Failures are swallowed because skills are an enhancement, not a hard
-    dependency. Hermes still functions without them; the user just sees an
-    empty skills library.
+    Failures that are not MongoStorageError are swallowed — skills enhance
+    the product but are not always hard-required mid-command. Missing Mongo
+    bootstrap fails hard (this fork is Mongo-only).
     """
     try:
-        from tools.skills_sync import sync_skills
+        from hermes_storage import require_mongo_mode
+        from hermes_storage.errors import MongoStorageError
 
-        sync_skills(quiet=True)
+        require_mongo_mode(surface="gateway/dashboard startup")
+        _sync_bundled_skills_for_startup()
+    except MongoStorageError:
+        raise
     except Exception:
         pass
 
@@ -2712,11 +2698,23 @@ def cmd_chat(args):
         except Exception:
             pass
 
-    # Sync bundled skills on every CLI launch (fast -- skips unchanged skills)
+    # Sync bundled skills on every CLI launch (fast -- skips unchanged skills).
+    # Mongo-only fork: missing bootstrap must abort chat, not silently continue.
+    try:
+        from hermes_storage import require_mongo_mode
+
+        require_mongo_mode(surface="hermes chat")
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
     try:
         _sync_bundled_skills_for_startup()
-    except Exception:
-        pass
+    except Exception as exc:
+        from hermes_storage.errors import MongoStorageError
+
+        if isinstance(exc, MongoStorageError):
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
 
     # --yolo: bypass all dangerous command approvals.
     # Also set in main() before _prepare_agent_startup() — that is the
@@ -2799,7 +2797,11 @@ def cmd_chat(args):
 
 def cmd_gateway(args):
     """Gateway management commands."""
-    _sync_bundled_skills_quietly()
+    try:
+        _sync_bundled_skills_quietly()
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     from hermes_cli.gateway import gateway_command
 

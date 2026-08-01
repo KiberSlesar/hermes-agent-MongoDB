@@ -73,7 +73,13 @@ def _skills_dir() -> Path:
 
         return writable_skills_dir()
     except Exception:
-        return _hermes_home() / "skills"
+        from hermes_storage import classic_allowed
+
+        if classic_allowed():
+            return _hermes_home() / "skills"
+        from hermes_storage.skills_sync import mongo_skills_cache_dir
+
+        return mongo_skills_cache_dir()
 
 
 def _hub_dir() -> Path:

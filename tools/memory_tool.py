@@ -911,7 +911,9 @@ class MemoryStore:
         """
         content = ENTRY_DELIMITER.join(entries) if entries else ""
         # Mongo is authoritative when enabled — never write only local files.
-        from hermes_storage import is_mongo_mode
+        from hermes_storage import ensure_mongo_durable, is_mongo_mode
+
+        ensure_mongo_durable(surface="memories")
         if is_mongo_mode():
             from hermes_storage import require_storage
             storage = require_storage()

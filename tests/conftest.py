@@ -63,6 +63,10 @@ if not os.environ.get("HERMES_HOME"):
     os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
     atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
 
+# MongoDB fork product is Mongo-only; classic durable writers remain for the
+# sandboxed upstream suite unless a test opts into require_mongo_mode.
+os.environ.setdefault("HERMES_ALLOW_CLASSIC", "1")
+
 #: HERMES_HOME as it stood when conftest was imported - i.e. before any test
 #: module could import code that configures logging. Recorded so the guard in
 #: tests/test_log_isolation.py can assert the sandbox existed AT THAT MOMENT.
@@ -438,6 +442,9 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "cron").mkdir()
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
+    # Product fork is Mongo-only; allow classic durable FS inside the sandbox
+    # so the upstream unit suite keeps exercising local writers.
+    monkeypatch.setenv("HERMES_ALLOW_CLASSIC", "1")
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
 
     # 3b. hermes_state computes ``DEFAULT_DB_PATH = get_hermes_home() / "state.db"``

@@ -1173,12 +1173,14 @@ def get_config_path() -> Path:
 
 
 def get_skills_dir() -> Path:
-    """Return the path to the skills directory under HERMES_HOME.
+    """Return the skills directory for discovery / skill_view.
 
-    When Mongo remote storage is enabled, materialize shared skills into a
-    local cache and return that tree. Failures raise (no classic-dir fallback).
+    Product path (this MongoDB fork): materialize from Mongo into
+    ``cache/skills``. Classic ``HERMES_HOME/skills`` only when
+    ``HERMES_ALLOW_CLASSIC`` is set (tests).
     """
-    from hermes_storage import is_mongo_mode
+    from hermes_storage import classic_allowed, is_mongo_mode
+
     if is_mongo_mode():
         from hermes_storage.skills_sync import sync_skills_from_mongo
         cached = sync_skills_from_mongo()
@@ -1186,7 +1188,13 @@ def get_skills_dir() -> Path:
             return cached
         from hermes_storage.errors import raise_mongo_unavailable
         raise_mongo_unavailable("skills cache materialize returned None")
-    return get_hermes_home() / "skills"
+    if classic_allowed():
+        return get_hermes_home() / "skills"
+    # Pre-bootstrap / misconfigured product install: still use cache root
+    # rather than reintroducing classic skills as SoT.
+    from hermes_storage.skills_sync import mongo_skills_cache_dir
+
+    return mongo_skills_cache_dir()
 
 
 

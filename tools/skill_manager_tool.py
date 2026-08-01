@@ -176,13 +176,17 @@ def _skills_dir() -> Path:
     except Exception as exc:
         try:
             from hermes_storage.errors import MongoStorageError
-            from hermes_storage import is_mongo_mode
+            from hermes_storage import classic_allowed, is_mongo_mode
 
             if is_mongo_mode() or isinstance(exc, MongoStorageError):
                 raise
+            if classic_allowed():
+                return get_hermes_home() / "skills"
         except ImportError:
             pass
-        return get_hermes_home() / "skills"
+        from hermes_storage.skills_sync import mongo_skills_cache_dir
+
+        return mongo_skills_cache_dir()
 
 
 def _commit_skill_dir(skill_dir: Path, *, name: Optional[str] = None) -> None:

@@ -1991,7 +1991,8 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
     """
     # Mongo remote soul is authoritative when configured — never fall back to
     # local SOUL.md (would diverge across fleet nodes).
-    from hermes_storage import is_mongo_mode
+    from hermes_storage import is_mongo_mode, require_mongo_mode
+
     if is_mongo_mode():
         from hermes_storage import require_storage
         storage = require_storage()
@@ -2004,6 +2005,8 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
             read_path="mongo://soul",
         )
         return content
+
+    require_mongo_mode(surface="SOUL identity")
 
     try:
         from hermes_cli.config import ensure_hermes_home
