@@ -27,6 +27,12 @@ def build_storage_parser(subparsers, *, cmd_storage: Callable) -> None:
     status = storage_sub.add_parser("status", help="Show Mongo storage status")
     status.set_defaults(func=cmd_storage)
 
+    flush = storage_sub.add_parser(
+        "flush-outbox",
+        help="Replay locally queued durable writes into Mongo after reconnect",
+    )
+    flush.set_defaults(func=cmd_storage)
+
     init = storage_sub.add_parser(
         "init-bootstrap",
         help="Write a bootstrap.yaml template",

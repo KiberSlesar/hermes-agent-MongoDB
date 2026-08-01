@@ -254,56 +254,82 @@ def commit_skill_tree(skill_dir: Path, *, name: Optional[str] = None) -> None:
     """Persist a skill directory to Mongo and refresh its cache entry.
 
     No-op outside Mongo mode (classic FS remains durable).
-    Fail-hard in Mongo mode — never leave cache-only skills.
+    On transient Mongo failure, spool into the local outbox and keep the
+    cache tree (agent continues); flush happens on reconnect.
     """
     from hermes_storage import is_mongo_mode, require_storage
+    from hermes_storage.outbox import KIND_SKILL_PUT, run_or_enqueue
 
     if not is_mongo_mode():
         return
     skill_dir = Path(skill_dir)
     skill_name = name or skill_dir.name
-    try:
+    skill_md_path = skill_dir / "SKILL.md"
+    body = skill_md_path.read_text(encoding="utf-8") if skill_md_path.is_file() else ""
+    files: dict[str, bytes] = {}
+    for f in skill_dir.rglob("*"):
+        if not f.is_file():
+            continue
+        if f.name in {".mongo_updated_at", ".mongo_skills_stamp", ".bundled_manifest"}:
+            continue
+        if f.name.startswith(".") and f.suffix == ".lock":
+            continue
+        rel = str(f.relative_to(skill_dir)).replace("\\", "/")
+        files[rel] = f.read_bytes()
+
+    def _apply() -> None:
         upload_local_skill_tree(skill_dir, name=skill_name)
         invalidate_skills_sync_cache()
         _refresh_skill_cache_entry(skill_name, skill_dir)
-    except Exception as exc:
-        from hermes_storage.errors import raise_mongo_unavailable
-        raise_mongo_unavailable(
-            f"failed to commit skill {skill_name!r} to Mongo: {exc}",
-            cause=exc,
+
+    status = run_or_enqueue(
+        KIND_SKILL_PUT,
+        {"name": skill_name, "skill_md": body},
+        _apply,
+        blob_files=files,
+    )
+    if status.get("queued"):
+        logger.warning(
+            "Skill %r queued in Mongo outbox (cache kept locally until flush)",
+            skill_name,
         )
 
 
 def delete_remote_skill(name: str) -> bool:
     """Delete a skill from Mongo and drop its local cache dir.
 
-    No-op outside Mongo mode (returns False). Fail-hard on Mongo errors.
+    No-op outside Mongo mode (returns False). Transient Mongo failures spool
+    a delete into the outbox and still drop the local cache.
     """
     from hermes_storage import is_mongo_mode, require_storage
+    from hermes_storage.outbox import KIND_SKILL_DELETE, run_or_enqueue
 
     if not is_mongo_mode():
         return False
     name = str(name or "").strip()
     if not name:
         return False
-    try:
-        deleted = require_storage().skills.delete_skill(name)
-    except Exception as exc:
-        from hermes_storage.errors import raise_mongo_unavailable
-        raise_mongo_unavailable(
-            f"failed to delete skill {name!r} from Mongo: {exc}",
-            cause=exc,
-        )
+    result = {"deleted": False}
+
+    def _apply() -> None:
+        result["deleted"] = bool(require_storage().skills.delete_skill(name))
+
+    status = run_or_enqueue(
+        KIND_SKILL_DELETE,
+        {"name": name},
+        _apply,
+    )
     invalidate_skills_sync_cache()
     cache_dir = mongo_skills_cache_dir() / name
     if cache_dir.exists():
         shutil.rmtree(cache_dir, ignore_errors=True)
-    # Drop collection stamp so next sync rebuilds fingerprint
     try:
         (mongo_skills_cache_dir() / ".mongo_skills_stamp").unlink(missing_ok=True)
     except OSError:
         pass
-    return bool(deleted)
+    if status.get("queued"):
+        return True
+    return bool(result["deleted"])
 
 
 def commit_all_skill_trees(root: Optional[Path] = None) -> int:

@@ -44,7 +44,14 @@ def load_cron_jobs() -> Optional[Any]:
 def save_cron_jobs(data: Any) -> bool:
     if not mongo_ledger_enabled():
         return False
-    save_json_document("cron_jobs", data)
+    from hermes_storage.outbox import KIND_CRON_JOBS, run_or_enqueue
+
+    doc = data
+    run_or_enqueue(
+        KIND_CRON_JOBS,
+        {"doc": doc},
+        lambda: save_json_document("cron_jobs", doc),
+    )
     return True
 
 

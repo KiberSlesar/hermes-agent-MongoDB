@@ -22,18 +22,26 @@ from hermes_storage.mongo_only import (
     require_mongo_mode,
     scrub_classic_durable_home,
 )
+from hermes_storage.outbox import (
+    flush_outbox,
+    pending_count,
+    try_flush_outbox_best_effort,
+)
 
 __all__ = [
     "BootstrapConfig",
     "MongoStorageError",
     "classic_allowed",
     "ensure_mongo_durable",
+    "flush_outbox",
     "get_bootstrap",
     "is_mongo_mode",
     "load_bootstrap",
+    "pending_count",
     "require_mongo_mode",
     "reset_bootstrap_cache",
     "scrub_classic_durable_home",
+    "try_flush_outbox_best_effort",
     "get_storage",
     "require_storage",
     "reset_storage",

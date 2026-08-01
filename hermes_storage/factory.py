@@ -57,12 +57,23 @@ class HermesStorage:
         return doc if isinstance(doc, dict) else {}
 
     def save_profile_config(self, config: dict) -> None:
+        from hermes_storage.outbox import KIND_PROFILE_CONFIG, run_or_enqueue
         from hermes_storage.overlay import strip_machine_local
 
-        self.config.put(strip_machine_local(config))
-        self._invalidate_config_readers()
+        cleaned = strip_machine_local(config)
+
+        def _apply() -> None:
+            self.config.put(cleaned)
+            self._invalidate_config_readers()
+
+        run_or_enqueue(
+            KIND_PROFILE_CONFIG,
+            {"config": cleaned},
+            _apply,
+        )
 
     def save_machine_overlay_from_config(self, config: dict) -> None:
+        from hermes_storage.outbox import KIND_MACHINE_OVERLAY, run_or_enqueue
         from hermes_storage.overlay import extract_machine_overlay
 
         existing = self.machines.get_overlay(self.machine_id) or {}
@@ -71,8 +82,16 @@ class HermesStorage:
         secrets = existing.get("secrets")
         if isinstance(secrets, dict) and secrets:
             overlay["secrets"] = dict(secrets)
-        self.machines.set_overlay(self.machine_id, overlay)
-        self._invalidate_config_readers()
+
+        def _apply() -> None:
+            self.machines.set_overlay(self.machine_id, overlay)
+            self._invalidate_config_readers()
+
+        run_or_enqueue(
+            KIND_MACHINE_OVERLAY,
+            {"overlay": overlay},
+            _apply,
+        )
 
     @staticmethod
     def _invalidate_config_readers() -> None:
@@ -124,6 +143,7 @@ class HermesStorage:
     def get_effective_secrets(self) -> dict[str, str]:
         """Profile secrets ⊕ this machine's proxy/network secrets (machine wins)."""
         from hermes_storage.overlay import MACHINE_LOCAL_SECRET_KEYS
+        from hermes_storage.outbox import apply_secret_overlay
 
         profile = {
             str(k): str(v)
@@ -135,17 +155,16 @@ class HermesStorage:
         for key in MACHINE_LOCAL_SECRET_KEYS:
             if key in machine:
                 out[key] = machine[key]
-        return out
+        return apply_secret_overlay(out)
 
-    def set_secret(self, key: str, value: str) -> None:
-        """Persist one secret; proxy/network keys go to this machine only."""
+    def _set_secret_direct(self, key: str, value: str) -> None:
+        """Write secret without outbox (used by flush + internal paths)."""
         from hermes_storage.overlay import is_machine_local_secret
 
         if is_machine_local_secret(key):
             local = self.get_machine_secrets()
             local[str(key)] = str(value)
             self._put_machine_secrets(local)
-            # Drop from shared profile so other PCs don't inherit this egress.
             profile = dict(self.secrets.get_all() or {})
             if key in profile:
                 del profile[key]
@@ -155,7 +174,19 @@ class HermesStorage:
         self.secrets.set(key, value)
         self._sync_process_env_after_secret_write({str(key): str(value)})
 
-    def remove_secret(self, key: str) -> bool:
+    def set_secret(self, key: str, value: str) -> None:
+        """Persist one secret; proxy/network keys go to this machine only."""
+        from hermes_storage.outbox import KIND_SECRET_SET, run_or_enqueue
+
+        run_or_enqueue(
+            KIND_SECRET_SET,
+            {"key": str(key), "value": str(value)},
+            lambda: self._set_secret_direct(key, value),
+        )
+        # Keep process env usable even if Mongo was down and write was queued.
+        self._sync_process_env_after_secret_write({str(key): str(value)})
+
+    def _remove_secret_direct(self, key: str) -> bool:
         from hermes_storage.overlay import is_machine_local_secret
         import os
 
@@ -181,13 +212,47 @@ class HermesStorage:
                 pass
         return found
 
-    def set_secrets_many(self, values: dict[str, str], *, replace_profile: bool = True) -> None:
-        """Write secrets, routing proxy/network keys to this machine.
+    def remove_secret(self, key: str) -> bool:
+        from hermes_storage.outbox import KIND_SECRET_REMOVE, run_or_enqueue
+        import os
 
-        ``replace_profile=True`` (default) replaces the shared profile secrets
-        document with the non-local keys from *values* (migrate / full import).
-        Machine-local keys are merged into this PC's overlay.
-        """
+        result = {"found": False}
+
+        def _apply() -> None:
+            result["found"] = self._remove_secret_direct(key)
+
+        status = run_or_enqueue(
+            KIND_SECRET_REMOVE,
+            {"key": str(key)},
+            _apply,
+        )
+        os.environ.pop(str(key), None)
+        try:
+            from hermes_cli.config import invalidate_env_cache
+
+            invalidate_env_cache()
+        except Exception:
+            pass
+        # Queued removes still "succeed" from the caller's POV — durable
+        # once Mongo is back.
+        if status.get("queued"):
+            return True
+        return bool(result["found"])
+
+    def save_memory_entry(self, target: str, content: str) -> None:
+        from hermes_storage.outbox import KIND_MEMORY, run_or_enqueue
+
+        tgt = str(target or "memory")
+        text = str(content or "")
+        run_or_enqueue(
+            KIND_MEMORY,
+            {"target": tgt, "content": text},
+            lambda: self.memories.save(tgt, text),
+        )
+
+    def _set_secrets_many_direct(
+        self, values: dict[str, str], *, replace_profile: bool = True
+    ) -> None:
         from hermes_storage.overlay import (
             MACHINE_LOCAL_SECRET_KEYS,
             split_machine_local_secrets,
@@ -211,12 +276,40 @@ class HermesStorage:
             {str(k): str(v) for k, v in values.items() if v is not None}
         )
 
+    def set_secrets_many(self, values: dict[str, str], *, replace_profile: bool = True) -> None:
+        """Write secrets, routing proxy/network keys to this machine.
+
+        ``replace_profile=True`` (default) replaces the shared profile secrets
+        document with the non-local keys from *values* (migrate / full import).
+        Machine-local keys are merged into this PC's overlay.
+        """
+        from hermes_storage.outbox import KIND_SECRETS_MANY, run_or_enqueue
+
+        payload_values = {
+            str(k): str(v) for k, v in (values or {}).items() if v is not None
+        }
+        run_or_enqueue(
+            KIND_SECRETS_MANY,
+            {"values": payload_values, "replace_profile": bool(replace_profile)},
+            lambda: self._set_secrets_many_direct(
+                payload_values, replace_profile=replace_profile
+            ),
+        )
+        self._sync_process_env_after_secret_write(payload_values)
+
     def load_soul(self) -> str:
         doc = self.soul.get("default") or {}
         return str(doc.get("content") or "")
 
     def save_soul(self, content: str) -> None:
-        self.soul.put({"content": content})
+        from hermes_storage.outbox import KIND_SOUL, run_or_enqueue
+
+        text = str(content or "")
+        run_or_enqueue(
+            KIND_SOUL,
+            {"content": text},
+            lambda: self.soul.put({"content": text}),
+        )
 
     def register_presence(
         self,
@@ -244,6 +337,12 @@ class HermesStorage:
             "node_id": self.node_id,
             "last_seen": True,
         })
+        try:
+            from hermes_storage.outbox import try_flush_outbox_best_effort
+
+            try_flush_outbox_best_effort()
+        except Exception:
+            pass
 
     def cluster_status(self) -> dict[str, Any]:
         state = self.cluster.get_state()

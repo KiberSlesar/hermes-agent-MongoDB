@@ -982,6 +982,12 @@ def _sync_bundled_skills_for_startup() -> bool:
     except Exception:
         pass
     sync_skills_from_mongo()
+    try:
+        from hermes_storage.outbox import try_flush_outbox_best_effort
+
+        try_flush_outbox_best_effort()
+    except Exception:
+        pass
     return True
 
 
@@ -4674,6 +4680,13 @@ def cmd_storage(args):
         print(f"  profile: {boot.profile} → DB {boot.profile_db}")
         print(f"  shared DB: {boot.shared_db}")
         try:
+            from hermes_storage.outbox import pending_count
+
+            pending = pending_count()
+            print(f"  outbox pending: {pending}")
+        except Exception:
+            pass
+        try:
             storage = get_storage(force=True)
             storage.client.admin.command("ping")
             print("  connection: OK")
@@ -4685,6 +4698,22 @@ def cmd_storage(args):
             print(format_mongo_inventory(collect_mongo_inventory(storage)))
         except Exception as exc:
             print(f"  connection: FAILED ({exc})")
+        return
+
+    if sub == "flush-outbox":
+        if not is_mongo_mode():
+            print("Error: Mongo mode required")
+            raise SystemExit(1)
+        from hermes_storage.outbox import flush_outbox, pending_count
+
+        before = pending_count()
+        result = flush_outbox()
+        print(
+            f"Outbox flush: before={before} flushed={result.get('flushed', 0)} "
+            f"failed={result.get('failed', 0)} remaining={result.get('remaining', 0)}"
+        )
+        if result.get("failed"):
+            raise SystemExit(1)
         return
 
     if sub == "migrate":
@@ -4701,7 +4730,7 @@ def cmd_storage(args):
         print(_json.dumps(counts, indent=2))
         return
 
-    print("usage: hermes storage <status|migrate|init-bootstrap>")
+    print("usage: hermes storage <status|migrate|init-bootstrap|flush-outbox>")
 
 
 def cmd_cluster(args):

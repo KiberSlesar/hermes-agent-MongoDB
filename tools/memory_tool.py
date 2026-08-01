@@ -918,7 +918,7 @@ class MemoryStore:
             from hermes_storage import require_storage
             storage = require_storage()
             target = "user" if path.name.upper().startswith("USER") else "memory"
-            storage.memories.save(target, content)
+            storage.save_memory_entry(target, content)
             return
         try:
             atomic_write_text(path, content, tmp_prefix=".mem_")
