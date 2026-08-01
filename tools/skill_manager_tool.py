@@ -1624,6 +1624,39 @@ def skill_manage(
             clear_skills_system_prompt_cache(clear_snapshot=True)
         except Exception:
             pass
+        try:
+            from tools.skills_tool import clear_skills_discovery_cache
+
+            clear_skills_discovery_cache()
+        except Exception:
+            pass
+        # Content fingerprint so the agent can confirm skill_view matches the
+        # write it just performed (avoids trusting a stale prior tool result).
+        if action in {"create", "edit", "patch", "write_file"} and "content_hash" not in result:
+            try:
+                from tools.skills_tool import skill_content_hash
+
+                hashed = None
+                if action == "write_file" and file_path:
+                    existing = _find_skill(name)
+                    if existing:
+                        target, _ = _resolve_skill_target(existing["path"], file_path)
+                        if target and target.is_file():
+                            hashed = skill_content_hash(
+                                target.read_text(encoding="utf-8")
+                            )
+                else:
+                    existing = _find_skill(name)
+                    if existing:
+                        md = existing["path"] / "SKILL.md"
+                        if md.is_file():
+                            hashed = skill_content_hash(
+                                md.read_text(encoding="utf-8")
+                            )
+                if hashed:
+                    result["content_hash"] = hashed
+            except Exception:
+                pass
         # Curator telemetry: bump patch_count on edit/patch/write_file (the actions
         # that mutate an existing skill's guidance), drop the record on delete.
         # Only mark a skill as agent-created when the background self-improvement

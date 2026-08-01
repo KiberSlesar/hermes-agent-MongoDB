@@ -200,6 +200,55 @@ def upload_local_skill_tree(skill_dir: Path, *, name: Optional[str] = None) -> N
     )
 
 
+def _refresh_skill_cache_entry(skill_name: str, skill_dir: Path) -> None:
+    """Rematerialize *skill_name* into the tree the writer just edited.
+
+    Mongo materialize defaults to a flat ``cache/skills/<name>/`` path. Agent
+    edits may land under a category (``cache/skills/<cat>/<name>/``). Refresh
+    the edited directory's parent so skill_view cannot keep reading a stale
+    sibling copy, and keep the flat cache entry in sync when it differs.
+    """
+    from hermes_storage import require_storage
+
+    storage = require_storage()
+    cache_root = mongo_skills_cache_dir()
+    skill_dir = Path(skill_dir).resolve()
+    targets: list[Path] = []
+
+    try:
+        skill_dir.relative_to(cache_root.resolve())
+        parent = skill_dir.parent
+        if parent.resolve() != cache_root.resolve() or skill_dir.name == skill_name:
+            targets.append(parent)
+    except (ValueError, OSError):
+        pass
+
+    flat_parent = cache_root
+    if not any(t.resolve() == flat_parent.resolve() for t in targets):
+        targets.append(flat_parent)
+
+    meta = storage.skills.get_skill(skill_name) or {}
+    remote_ts = _fmt_updated_at(meta.get("updated_at"))
+    for parent in targets:
+        storage.skills.materialize(skill_name, parent)
+        try:
+            stamp = Path(parent) / skill_name / ".mongo_updated_at"
+            stamp.write_text(remote_ts, encoding="utf-8")
+        except OSError:
+            pass
+
+    # Collection fingerprint must match list_skills() or the next
+    # sync_skills_from_mongo will treat the cache as stale and may race.
+    try:
+        listed = storage.skills.list_skills()
+        fingerprint = _skills_collection_fingerprint(listed)
+        (cache_root / ".mongo_skills_stamp").write_text(fingerprint, encoding="utf-8")
+        global _SYNC_ONCE
+        _SYNC_ONCE = fingerprint
+    except OSError:
+        pass
+
+
 def commit_skill_tree(skill_dir: Path, *, name: Optional[str] = None) -> None:
     """Persist a skill directory to Mongo and refresh its cache entry.
 
@@ -215,14 +264,7 @@ def commit_skill_tree(skill_dir: Path, *, name: Optional[str] = None) -> None:
     try:
         upload_local_skill_tree(skill_dir, name=skill_name)
         invalidate_skills_sync_cache()
-        require_storage().skills.materialize(skill_name, mongo_skills_cache_dir())
-        # Refresh per-skill stamp from Mongo so the next sync skips this skill.
-        try:
-            meta = require_storage().skills.get_skill(skill_name) or {}
-            stamp = mongo_skills_cache_dir() / skill_name / ".mongo_updated_at"
-            stamp.write_text(_fmt_updated_at(meta.get("updated_at")), encoding="utf-8")
-        except OSError:
-            pass
+        _refresh_skill_cache_entry(skill_name, skill_dir)
     except Exception as exc:
         from hermes_storage.errors import raise_mongo_unavailable
         raise_mongo_unavailable(

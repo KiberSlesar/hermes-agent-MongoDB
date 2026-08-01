@@ -250,6 +250,11 @@ _LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
 _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
+# Mongo mode: durable config lives in the DB, but leftover local config.yaml
+# still has an mtime. Caching on that mtime would serve stale Mongo merges
+# after overlay/profile writes that do not touch the yaml. Bumped by
+# ``_invalidate_load_config_cache`` on every Mongo config writer.
+_MONGO_CONFIG_CACHE_GEN: int = 0
 # Serializes all config read/write paths. libyaml's C extension is not
 # thread-safe for concurrent safe_load() on the same file, and multiple
 # tool threads (approval.py, browser_tool.py, setup flows) hit
@@ -3234,6 +3239,20 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     atomic_yaml_write(config_path, data, **kwargs)
 
 
+def _invalidate_load_config_cache() -> None:
+    """Drop in-process config caches after a durable config write.
+
+    Classic mode writers usually rely on yaml mtime; Mongo writers and any
+    path that mutates profile/overlay without touching leftover yaml MUST
+    call this so the next ``load_config()`` re-merges from the DB.
+    """
+    global _MONGO_CONFIG_CACHE_GEN
+    with _CONFIG_LOCK:
+        _MONGO_CONFIG_CACHE_GEN += 1
+        _LOAD_CONFIG_CACHE.clear()
+        _RAW_CONFIG_CACHE.clear()
+
+
 def load_config() -> Dict[str, Any]:
     """Load configuration from ~/.hermes/config.yaml.
 
@@ -3243,6 +3262,10 @@ def load_config() -> Dict[str, Any]:
     The cache is keyed on ``str(config_path)`` so profile switches
     (which change ``HERMES_HOME`` and therefore ``get_config_path()``)
     don't collide.
+
+    In Mongo mode the cache is keyed on an explicit generation counter
+    (not leftover ``config.yaml`` mtime) so profile/overlay writes invalidate
+    correctly.
 
     Read-only callers should use ``load_config_readonly()`` to skip the
     defensive deepcopy — that path matters in agent-loop hot spots like
@@ -3417,10 +3440,30 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         except OSError:
             managed_sig = (0, 0)
 
+        # Mongo mode: skip local config.yaml merge — durable settings come from
+        # load_effective_config below. A leftover/stale yaml must not seed the
+        # merge base (would reintroduce deleted keys / unexpanded ${VAR}).
+        _mongo_load = False
+        try:
+            from hermes_storage import is_mongo_mode as _is_mongo_load
+
+            _mongo_load = bool(_is_mongo_load())
+        except Exception:
+            _mongo_load = False
+
         # Combined cache signature: user file + managed file. None only when the
         # user config is absent AND no managed file exists (nothing to cache on).
-        if user_sig is not None:
+        # Mongo mode must NOT key on leftover config.yaml mtime — writers update
+        # the DB without touching that file.
+        if _mongo_load:
             cache_sig: Optional[Tuple[int, int, int, int]] = (
+                _MONGO_CONFIG_CACHE_GEN,
+                0,
+                managed_sig[0],
+                managed_sig[1],
+            )
+        elif user_sig is not None:
+            cache_sig = (
                 user_sig[0],
                 user_sig[1],
                 managed_sig[0],
@@ -3443,17 +3486,6 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
-
-        # Mongo mode: skip local config.yaml merge — durable settings come from
-        # load_effective_config below. A leftover/stale yaml must not seed the
-        # merge base (would reintroduce deleted keys / unexpanded ${VAR}).
-        _mongo_load = False
-        try:
-            from hermes_storage import is_mongo_mode as _is_mongo_load
-
-            _mongo_load = bool(_is_mongo_load())
-        except Exception:
-            _mongo_load = False
 
         if user_sig is not None and not _mongo_load:
             try:
@@ -3739,9 +3771,8 @@ def save_config(
             storage = require_storage()
             storage.save_profile_config(normalized)
             storage.save_machine_overlay_from_config(normalized)
-            _RAW_CONFIG_CACHE.pop(str(config_path), None)
             _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
-            _LOAD_CONFIG_CACHE.pop(str(config_path), None)
+            _invalidate_load_config_cache()
             return
 
         # Build optional commented-out sections for features that are off by
@@ -4359,12 +4390,28 @@ def reload_env() -> int:
 
 
 def get_env_value(key: str) -> Optional[str]:
-    """Get a value from ~/.hermes/.env or environment."""
-    # Check environment first
+    """Get a value from ~/.hermes/.env or environment.
+
+    In Mongo mode the durable secrets store is the DB — prefer ``load_env()``
+    over ``os.environ`` so a rotated Mongo secret is not shadowed by a stale
+    process env left over from an earlier ``save_env_value`` / shell export.
+    Runtime-only keys that exist solely in ``os.environ`` still resolve.
+    """
+    try:
+        from hermes_storage import is_mongo_mode
+
+        if is_mongo_mode():
+            env_vars = load_env()
+            if key in env_vars:
+                return env_vars[key]
+            return os.environ.get(key)
+    except Exception:
+        pass
+
+    # Classic: process env first (matches historical behaviour), then .env.
     if key in os.environ:
         return os.environ[key]
 
-    # Then check .env file
     env_vars = load_env()
     return env_vars.get(key)
 
@@ -5153,9 +5200,8 @@ def set_config_value(key: str, value: str, force: bool = False):
         from hermes_storage import require_storage
 
         require_storage().save_profile_config(user_config)
-        _RAW_CONFIG_CACHE.pop(str(config_path), None)
-        _LOAD_CONFIG_CACHE.pop(str(config_path), None)
         _LAST_EXPANDED_CONFIG_BY_PATH.pop(str(config_path), None)
+        _invalidate_load_config_cache()
     else:
         from utils import atomic_yaml_write
         atomic_yaml_write(config_path, user_config, sort_keys=False)

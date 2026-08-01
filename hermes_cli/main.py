@@ -4789,6 +4789,12 @@ def cmd_machine(args):
             print("Overlay file must contain a mapping/object")
             raise SystemExit(1)
         storage.machines.set_overlay(mid, data)
+        try:
+            from hermes_cli.config import _invalidate_load_config_cache
+
+            _invalidate_load_config_cache()
+        except Exception:
+            pass
         print(f"Updated overlay for {mid}")
         return
     print("usage: hermes machine <show|list|set-overlay>")

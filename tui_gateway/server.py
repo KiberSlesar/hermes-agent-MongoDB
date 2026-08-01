@@ -2804,6 +2804,12 @@ def _save_cfg(cfg: dict):
 
         require_storage().save_profile_config(cfg)
         require_storage().save_machine_overlay_from_config(cfg)
+        try:
+            from hermes_cli.config import _invalidate_load_config_cache
+
+            _invalidate_load_config_cache()
+        except Exception:
+            pass
         with _cfg_lock:
             _cfg_cache = copy.deepcopy(cfg)
             _cfg_path = None

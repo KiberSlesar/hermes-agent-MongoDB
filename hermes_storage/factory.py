@@ -60,6 +60,7 @@ class HermesStorage:
         from hermes_storage.overlay import strip_machine_local
 
         self.config.put(strip_machine_local(config))
+        self._invalidate_config_readers()
 
     def save_machine_overlay_from_config(self, config: dict) -> None:
         from hermes_storage.overlay import extract_machine_overlay
@@ -71,6 +72,34 @@ class HermesStorage:
         if isinstance(secrets, dict) and secrets:
             overlay["secrets"] = dict(secrets)
         self.machines.set_overlay(self.machine_id, overlay)
+        self._invalidate_config_readers()
+
+    @staticmethod
+    def _invalidate_config_readers() -> None:
+        """Best-effort drop hermes_cli load_config cache after Mongo writes."""
+        try:
+            from hermes_cli.config import _invalidate_load_config_cache
+
+            _invalidate_load_config_cache()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _sync_process_env_after_secret_write(values: dict[str, str]) -> None:
+        """Keep os.environ + load_env memo aligned with Mongo secret writes."""
+        import os
+
+        try:
+            from hermes_cli.config import invalidate_env_cache
+
+            for key, value in values.items():
+                k = str(key)
+                if k.startswith("__"):
+                    continue
+                os.environ[k] = str(value)
+            invalidate_env_cache()
+        except Exception:
+            pass
 
     def get_machine_secrets(self) -> dict[str, str]:
         overlay = self.machines.get_overlay(self.machine_id) or {}
@@ -121,11 +150,14 @@ class HermesStorage:
             if key in profile:
                 del profile[key]
                 self.secrets.set_many(profile)
+            self._sync_process_env_after_secret_write({str(key): str(value)})
             return
         self.secrets.set(key, value)
+        self._sync_process_env_after_secret_write({str(key): str(value)})
 
     def remove_secret(self, key: str) -> bool:
         from hermes_storage.overlay import is_machine_local_secret
+        import os
 
         found = False
         if is_machine_local_secret(key):
@@ -139,6 +171,14 @@ class HermesStorage:
             del profile[key]
             self.secrets.set_many(profile)
             found = True
+        if found:
+            try:
+                from hermes_cli.config import invalidate_env_cache
+
+                os.environ.pop(str(key), None)
+                invalidate_env_cache()
+            except Exception:
+                pass
         return found
 
     def set_secrets_many(self, values: dict[str, str], *, replace_profile: bool = True) -> None:
@@ -167,6 +207,9 @@ class HermesStorage:
         machine = self.get_machine_secrets()
         machine.update(local)
         self._put_machine_secrets(machine)
+        self._sync_process_env_after_secret_write(
+            {str(k): str(v) for k, v in values.items() if v is not None}
+        )
 
     def load_soul(self) -> str:
         doc = self.soul.get("default") or {}

@@ -103,6 +103,23 @@ _SKILLS_CACHE_KEY_DISABLED = "with_disabled"
 _SKILLS_CACHE_KEY_FILTERED = "filtered"
 
 
+def clear_skills_discovery_cache() -> None:
+    """Drop the in-process skills_list / discovery cache.
+
+    Call after skill_manage mutations so the next skills_list/skill_view
+    resolution cannot keep serving a pre-edit description or miss a create.
+    """
+    _SKILLS_CACHE.clear()
+
+
+def skill_content_hash(content: str) -> str:
+    """Stable content fingerprint for skill_view / skill_manage results."""
+    import hashlib
+
+    digest = hashlib.sha256((content or "").encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
 def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
     """Cheap change-signature for the skill scan inputs.
 
@@ -971,6 +988,7 @@ def _serve_plugin_skill(
             "success": True,
             "name": f"{namespace}:{bare}",
             "content": f"{banner}{rendered_content}" if banner else rendered_content,
+            "content_hash": skill_content_hash(content),
             "description": description,
             "linked_files": None,
             "readiness_status": SkillReadinessStatus.AVAILABLE.value,
@@ -1417,6 +1435,7 @@ def skill_view(
                     "name": name,
                     "file": file_path,
                     "content": content,
+                    "content_hash": skill_content_hash(content),
                     "file_type": target_file.suffix,
                 },
                 ensure_ascii=False,
@@ -1656,6 +1675,7 @@ def skill_view(
             "tags": tags,
             "related_skills": related_skills,
             "content": rendered_content,
+            "content_hash": skill_content_hash(content),
             "path": rel_path,
             "skill_dir": str(skill_dir) if skill_dir else None,
             "org_provenance": org_provenance,

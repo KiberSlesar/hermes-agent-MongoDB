@@ -1238,6 +1238,9 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
                 local.unlink()
         except OSError:
             pass
+        # Mongo writes do not bump auth.json mtime — clear the status memo
+        # so UI surfaces do not serve a pre-login/logout snapshot for ≤15s.
+        invalidate_nous_auth_status_cache()
         return _auth_file_path()
 
     auth_file = target_path if target_path is not None else _auth_file_path()
@@ -1285,6 +1288,7 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
         auth_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass
+    invalidate_nous_auth_status_cache()
     return auth_file
 
 

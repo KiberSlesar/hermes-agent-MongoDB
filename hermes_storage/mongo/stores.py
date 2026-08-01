@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -131,7 +132,7 @@ class MongoSkillsStore(SkillsStore):
         file_ids: dict[str, Any] = {}
         if files:
             # Remove old files for this skill
-            for old in self._fs.find({"filename": {"$regex": f"^{name}/"}}):
+            for old in self._fs.find({"filename": {"$regex": f"^{re.escape(name)}/"}}):
                 self._fs.delete(old._id)
             for rel, data in files.items():
                 fid = self._fs.put(data, filename=f"{name}/{rel}", skill=name)
@@ -143,7 +144,7 @@ class MongoSkillsStore(SkillsStore):
         self._col.update_one({"name": name}, {"$set": doc}, upsert=True)
 
     def delete_skill(self, name: str) -> bool:
-        for old in self._fs.find({"filename": {"$regex": f"^{name}/"}}):
+        for old in self._fs.find({"filename": {"$regex": f"^{re.escape(name)}/"}}):
             self._fs.delete(old._id)
         result = self._col.delete_one({"name": name})
         return result.deleted_count > 0
@@ -155,13 +156,22 @@ class MongoSkillsStore(SkillsStore):
         if not skill:
             raise FileNotFoundError(f"Skill not found: {name}")
         body = skill.get("skill_md") or skill.get("body") or ""
-        (dest / "SKILL.md").write_text(body, encoding="utf-8")
-        for grid_file in self._fs.find({"filename": {"$regex": f"^{name}/"}}):
+        # Supporting files from GridFS first. SKILL.md from GridFS is skipped
+        # when the document carries skill_md — otherwise a stale GridFS blob
+        # (failed delete / duplicate filename) can overwrite a just-committed
+        # edit and make skill_view serve the previous revision until restart.
+        for grid_file in self._fs.find({"filename": {"$regex": f"^{re.escape(name)}/"}}):
             rel = grid_file.filename.split("/", 1)[-1]
+            if not rel or rel in {".mongo_updated_at", ".mongo_skills_stamp"}:
+                continue
+            if body and rel.replace("\\", "/") == "SKILL.md":
+                continue
             out = dest / rel
             out.parent.mkdir(parents=True, exist_ok=True)
             with open(out, "wb") as fh:
                 fh.write(grid_file.read())
+        if body or not (dest / "SKILL.md").is_file():
+            (dest / "SKILL.md").write_text(body, encoding="utf-8")
         return dest
 
 
