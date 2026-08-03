@@ -61,15 +61,19 @@ def main() -> None:
     if not version:
         # Best-effort: try reading hermes_cli version from a sibling agent checkout
         for candidate in (
+            Path(os.environ.get("HERMES_DB_HOME", "") or "") / "hermes-agent" / "hermes_cli" / "__init__.py",
+            Path(os.environ.get("HERMES_CONTROL_DIR", "") or "") / "hermes-agent" / "hermes_cli" / "__init__.py",
+            Path.home() / "hermes-db" / "hermes-agent" / "hermes_cli" / "__init__.py",
             Path.home() / ".hermes" / "hermes-agent" / "hermes_cli" / "__init__.py",
             Path.home() / "hermes-agent" / "hermes_cli" / "__init__.py",
         ):
-            if candidate.is_file():
-                text = candidate.read_text(encoding="utf-8", errors="replace")
-                for line in text.splitlines():
-                    if line.startswith("__version__"):
-                        version = line.split("=", 1)[1].strip().strip("\"'")
-                        break
+            if not candidate.is_file():
+                continue
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+            for line in text.splitlines():
+                if line.startswith("__version__"):
+                    version = line.split("=", 1)[1].strip().strip("\"'")
+                    break
             if version:
                 break
     if not version:

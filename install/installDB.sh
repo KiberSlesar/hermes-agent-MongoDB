@@ -1,6 +1,6 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # ============================================================================
-# Hermes DB вЂ” self-hosted installer (NO Docker)
+# Hermes DB — self-hosted installer (native Mongo, no Docker)
 # ============================================================================
 # Native MongoDB + systemd user services for enroll (:8743) and
 # mTLS orchestrator (:8744). Ubuntu/Debian.
@@ -8,9 +8,10 @@
 #   curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/installDB.sh | bash
 #
 # Env (non-interactive):
-#   HERMES_LISTEN_MODE=lo|lan|wan     where to listen / advertise
-#   HERMES_ADVERTISE_HOST=1.2.3.4     override advertised IP/DNS
+#   HERMES_LISTEN_MODE=lo|lan|wan
+#   HERMES_ADVERTISE_HOST=1.2.3.4
 #   HERMES_DB_HOME=~/hermes-db
+#   HERMES_FLEET_VERSION=0.19.5   # published for agents (default: from tarball)
 #   HERMES_SKIP_CONNECT=1
 # ============================================================================
 set -euo pipefail
@@ -19,18 +20,20 @@ HERMES_DB_HOME="${HERMES_DB_HOME:-$HOME/hermes-db}"
 SKIP_CONNECT="${HERMES_SKIP_CONNECT:-0}"
 REPO="${HERMES_MONGO_REPO:-KiberSlesar/hermes-agent-MongoDB}"
 REF="${HERMES_MONGO_REF:-main}"
+if [[ "$REPO" == "KiberSlesar/hermes-agent-MongoDB-private" ]]; then
+  REPO="KiberSlesar/hermes-agent-MongoDB"
+fi
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'; BOLD=$'\033[1m'; NC=$'\033[0m'
-say() { echo "${GREEN}в†’${NC} $*"; }
+say() { echo "${GREEN}->${NC} $*"; }
 warn() { echo "${YELLOW}!${NC} $*"; }
 die() { echo "${RED}ERROR:${NC} $*" >&2; exit 1; }
 
-# curl|bash leaves stdin as the pipe вЂ” prompts must use the real terminal.
+# curl|bash leaves stdin as the pipe — prompts must use the real terminal.
 can_prompt() {
   [[ "$SKIP_CONNECT" != "1" ]] && [[ -r /dev/tty ]]
 }
 ask() {
-  # usage: ask VAR "prompt" [default]
   local __var="$1" __prompt="$2" __def="${3:-}" __ans=""
   if [[ -n "$__def" ]]; then
     printf "%s" "$__prompt" > /dev/tty
@@ -45,8 +48,6 @@ ask() {
 
 auth_curl() {
   if [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]]; then
-    # A stale token must not make a public installation fail. Retain the
-    # authenticated attempt for private forks, then retry anonymously.
     curl -fsSL -H "Authorization: Bearer ${GH_TOKEN:-$GITHUB_TOKEN}" "$@" || \
       curl -fsSL "$@"
     return
@@ -69,6 +70,17 @@ guess_wan_ip() {
   [[ -z "$ip" ]] && ip=$(curl -4 -fsS --max-time 4 https://api.ipify.org 2>/dev/null || true)
   [[ -z "$ip" ]] && ip=$(curl -4 -fsS --max-time 4 https://icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)
   echo "${ip}"
+}
+
+read_version_from_tree() {
+  local init="$1/hermes_cli/__init__.py"
+  [[ -f "$init" ]] || return 0
+  python3 -c "
+import re, pathlib
+t = pathlib.Path(r'''$init''').read_text(encoding='utf-8', errors='replace')
+m = re.search(r'^__version__\s*=\s*[\"\\']([^\"\\']+)[\"\\']', t, re.M)
+print(m.group(1) if m else '')
+" 2>/dev/null || true
 }
 
 # Sets: MODE, BIND_IP, ADVERTISE_HOST, LISTEN_HINT
@@ -106,7 +118,7 @@ resolve_listen_mode() {
       esac
     else
       mode=lan
-      warn "No TTY вЂ” default listen mode: LAN (${lan}). Set HERMES_LISTEN_MODE=lo|lan|wan"
+      warn "No TTY — default listen mode: LAN (${lan}). Set HERMES_LISTEN_MODE=lo|lan|wan"
     fi
   fi
 
@@ -130,16 +142,10 @@ resolve_listen_mode() {
         ADVERTISE_HOST="$HERMES_ADVERTISE_HOST"
       elif [[ -n "$wan" ]]; then
         ADVERTISE_HOST="$wan"
-        if can_prompt; then
-          ask custom "Public IP to advertise [${wan}]: " "$wan"
-          ADVERTISE_HOST="$custom"
-        fi
       else
-        can_prompt || die "WAN mode needs HERMES_ADVERTISE_HOST=..."
-        ask ADVERTISE_HOST "Public IP / DNS to advertise: "
-        [[ -n "$ADVERTISE_HOST" ]] || die "empty WAN host"
+        die "WAN mode needs HERMES_ADVERTISE_HOST or a reachable public IP"
       fi
-      LISTEN_HINT="WAN (${ADVERTISE_HOST}) - open firewall 27017,8743,8744"
+      LISTEN_HINT="WAN (${ADVERTISE_HOST})"
       ;;
     custom)
       MODE=custom
@@ -152,11 +158,65 @@ resolve_listen_mode() {
       ;;
   esac
 
-  say "Listen mode: ${MODE} вЂ” bind ${BIND_IP}, advertise ${ADVERTISE_HOST}"
+  say "Listen mode: ${MODE} — bind ${BIND_IP}, advertise ${ADVERTISE_HOST}"
+}
+
+install_db_hermes_cli() {
+  # Install Mongo-fork hermes on the DB box so `hermes cluster update` works.
+  local src_root="$1"
+  local dest="$HERMES_DB_HOME/hermes-agent"
+  [[ -d "$src_root/hermes_cli" ]] || { warn "No hermes_cli in tree — skip DB hermes CLI"; return 0; }
+
+  say "Installing hermes CLI into $dest (for cluster update)…"
+  rm -rf "$dest"
+  mkdir -p "$dest"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --exclude '.venv' --exclude '.git' --exclude 'node_modules' \
+      --exclude 'uv.lock' "$src_root/" "$dest/"
+  else
+    tar -C "$src_root" --exclude='.venv' --exclude='.git' --exclude='node_modules' \
+      -cf - . | tar -C "$dest" -xf -
+  fi
+
+  local py=""
+  if command -v uv >/dev/null 2>&1 || curl -fsSL https://astral.sh/uv/install.sh | sh >/dev/null 2>&1; then
+    export PATH="$HOME/.local/bin:$PATH"
+    (cd "$dest" && uv venv .venv --python 3.12 && uv pip install -e .) \
+      || (cd "$dest" && uv venv .venv && uv pip install -e .) \
+      || warn "uv install failed — trying pip"
+  fi
+  if [[ -x "$dest/.venv/bin/python" ]]; then
+    py="$dest/.venv/bin/python"
+  else
+    python3 -m venv "$dest/.venv" 2>/dev/null || true
+    if [[ -x "$dest/.venv/bin/python" ]]; then
+      "$dest/.venv/bin/pip" install -U pip -q || true
+      "$dest/.venv/bin/pip" install -e "$dest" || warn "pip install -e failed"
+      py="$dest/.venv/bin/python"
+    else
+      warn "Could not create venv for DB hermes CLI"
+      return 0
+    fi
+  fi
+
+  local launcher="$HERMES_DB_HOME/bin/hermes"
+  mkdir -p "$HERMES_DB_HOME/bin"
+  cat > "$launcher" <<EOF
+#!/usr/bin/env bash
+export HERMES_HOME="\${HERMES_HOME:-$HERMES_DB_HOME}"
+export HERMES_DB_HOME="$HERMES_DB_HOME"
+export HERMES_CONTROL_DIR="$HERMES_DB_HOME"
+cd "$dest" || exit 1
+export PYTHONPATH="$dest\${PYTHONPATH:+:\$PYTHONPATH}"
+exec "$py" -m hermes_cli.main "\$@"
+EOF
+  chmod +x "$launcher"
+  install_control_command hermes "$launcher" || true
+  say "hermes CLI: $launcher ($("$py" -c 'from hermes_cli import __version__; print(__version__)' 2>/dev/null || echo '?'))"
 }
 
 echo ""
-echo "${BOLD}⚕ Hermes DB installer${NC}"
+echo "${BOLD}Hermes DB installer${NC}"
 echo ""
 
 command -v openssl >/dev/null || die "openssl required"
@@ -167,11 +227,16 @@ command -v sudo >/dev/null || die "sudo required (to apt-install mongodb-org)"
 
 resolve_listen_mode
 
-# --- Fetch control-plane scripts into HERMES_DB_HOME ---
+# --- Fetch control-plane (+ full repo for hermes CLI) ---
 SRC=""
+REPO_ROOT=""
+TMP=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
   HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  [[ -d "$HERE/../deploy/control-plane" ]] && SRC="$(cd "$HERE/../deploy/control-plane" && pwd)"
+  if [[ -d "$HERE/../deploy/control-plane" ]]; then
+    SRC="$(cd "$HERE/../deploy/control-plane" && pwd)"
+    REPO_ROOT="$(cd "$HERE/.." && pwd)"
+  fi
 fi
 
 mkdir -p "$HERMES_DB_HOME"
@@ -189,7 +254,7 @@ if [[ -n "$SRC" ]]; then
 else
   TMP=$(mktemp -d)
   trap 'rm -rf "$TMP"' EXIT
-  say "Downloading control-plane from GitHubвЂ¦"
+  say "Downloading control-plane from GitHub…"
   auth_curl -L "https://api.github.com/repos/${REPO}/tarball/${REF}" -o "$TMP/pack.tgz" \
     || auth_curl -L "https://codeload.github.com/${REPO}/tar.gz/${REF}" -o "$TMP/pack.tgz"
   mkdir -p "$TMP/out"
@@ -197,10 +262,17 @@ else
   CP=$(find "$TMP/out" -type d -path '*/deploy/control-plane' | head -1)
   [[ -n "$CP" ]] || die "deploy/control-plane missing in archive"
   tar -C "$CP" -cf - . | tar -C "$HERMES_DB_HOME" -xf -
+  INIT=$(find "$TMP/out" -type f -path '*/hermes_cli/__init__.py' | head -1)
+  [[ -n "$INIT" ]] && REPO_ROOT="$(cd "$(dirname "$INIT")/.." && pwd)"
 fi
 mkdir -p "$HERMES_DB_HOME/certs" "$HERMES_DB_HOME/bundles" "$HERMES_DB_HOME/enroll_pending" \
-  "$HERMES_DB_HOME/data" "$HERMES_DB_HOME/logs"
+  "$HERMES_DB_HOME/data" "$HERMES_DB_HOME/logs" "$HERMES_DB_HOME/releases"
 chmod +x "$HERMES_DB_HOME/scripts/"*.sh 2>/dev/null || true
+
+# Default fleet version from the downloaded tree (not a stale PATH hermes).
+TREE_VER=""
+[[ -n "$REPO_ROOT" ]] && TREE_VER="$(read_version_from_tree "$REPO_ROOT")"
+export HERMES_FLEET_VERSION="${HERMES_FLEET_VERSION:-${TREE_VER}}"
 
 upsert_env() {
   local f="$1" k="$2" v="$3"
@@ -222,6 +294,8 @@ write_env_listen_vars() {
   upsert_env "$f" HERMES_MONGO_RS_HOST "${ADVERTISE_HOST}:27017"
   upsert_env "$f" HERMES_ORCHESTRATOR_URL "https://${ADVERTISE_HOST}:8744"
   upsert_env "$f" HERMES_MONGO_PORT "27017"
+  upsert_env "$f" HERMES_CONTROL_DIR "$HERMES_DB_HOME"
+  upsert_env "$f" HERMES_DB_HOME "$HERMES_DB_HOME"
 }
 
 if [[ ! -f "$HERMES_DB_HOME/.env" ]]; then
@@ -239,34 +313,61 @@ fi
 write_env_listen_vars
 set -a && source "$HERMES_DB_HOME/.env" && set +a
 
-say "Generating CA / server certificatesвЂ¦"
+install_control_command() {
+  local name="$1" target="$2" destination="/usr/local/bin/$1"
+  if [[ -w /usr/local/bin ]]; then
+    ln -sfn "$target" "$destination"
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo ln -sfn "$target" "$destination"
+    return 0
+  fi
+  mkdir -p "$HOME/.local/bin"
+  ln -sfn "$target" "$HOME/.local/bin/$name"
+  warn "Installed $name in ~/.local/bin; add it to PATH before opening a new shell."
+}
+
+# Install hermes CLI before services so publish can use it.
+if [[ -n "$REPO_ROOT" ]]; then
+  install_db_hermes_cli "$REPO_ROOT"
+fi
+
+say "Generating CA / server certificates…"
 export HERMES_CERT_EXTRA_SAN="IP:${ADVERTISE_HOST}"
-# Also include LAN if advertise is WAN
 LAN_IP=$(guess_lan_ip)
 if [[ "$ADVERTISE_HOST" != "$LAN_IP" && "$ADVERTISE_HOST" != "127.0.0.1" ]]; then
   export HERMES_CERT_EXTRA_SAN="IP:${ADVERTISE_HOST},IP:${LAN_IP}"
 fi
 bash "$HERMES_DB_HOME/scripts/gen-ca.sh"
 
-say "Installing native MongoDBвЂ¦"
+say "Installing native MongoDB…"
 bash "$HERMES_DB_HOME/scripts/install-mongo-native.sh"
 
-say "Starting enroll + orchestrator servicesвЂ¦"
+say "Starting enroll + orchestrator services…"
 bash "$HERMES_DB_HOME/scripts/install-services.sh"
 
-# Publish desired agent runtime for fleet auto-update (best-effort).
-if [[ -f "$HERMES_DB_HOME/scripts/publish_fleet_release.py" ]]; then
-  say "Publishing fleet_release for agent auto-update…"
-  export HERMES_MONGO_REF="${HERMES_MONGO_REF:-main}"
-  export HERMES_MONGO_REPO="${HERMES_MONGO_REPO:-KiberSlesar/hermes-agent-MongoDB}"
+# Cache client tarball + publish fleet_release (agents run: hermes update).
+if [[ -f "$HERMES_DB_HOME/scripts/cluster-update.sh" ]]; then
+  say "Publishing fleet_release ${HERMES_FLEET_VERSION:-?}@${REF}…"
+  HERMES_CONTROL_DIR="$HERMES_DB_HOME" HERMES_DB_HOME="$HERMES_DB_HOME" \
+    bash "$HERMES_DB_HOME/scripts/cluster-update.sh" \
+      ${HERMES_FLEET_VERSION:+--version "$HERMES_FLEET_VERSION"} \
+      --ref "$REF" \
+      --repo "$REPO" \
+    || warn "fleet_release publish skipped"
+elif [[ -f "$HERMES_DB_HOME/scripts/publish_fleet_release.py" ]]; then
+  say "Publishing fleet_release ${HERMES_FLEET_VERSION:-?}@${REF}…"
+  export HERMES_MONGO_REF="$REF"
+  export HERMES_MONGO_REPO="$REPO"
+  export HERMES_CONTROL_DIR="$HERMES_DB_HOME"
   python3 "$HERMES_DB_HOME/scripts/publish_fleet_release.py" \
     ${HERMES_FLEET_VERSION:+--version "$HERMES_FLEET_VERSION"} \
-    --ref "$HERMES_MONGO_REF" \
-    --repo "$HERMES_MONGO_REPO" \
+    --ref "$REF" \
+    --repo "$REPO" \
     --published-by installDB \
     || warn "fleet_release publish skipped (set HERMES_FLEET_VERSION=… and retry)"
 fi
-
 
 cat > "$HERMES_DB_HOME/agent-add" <<'EOF'
 #!/usr/bin/env bash
@@ -284,37 +385,25 @@ exec "$ROOT/scripts/agents.sh" "$@"
 EOF
 chmod +x "$HERMES_DB_HOME/agents"
 
-install_control_command() {
-  local name="$1" target="$2" destination="/usr/local/bin/$1"
-  if [[ -w /usr/local/bin ]]; then
-    ln -sfn "$target" "$destination"
-    return 0
-  fi
-  if command -v sudo >/dev/null 2>&1; then
-    sudo ln -sfn "$target" "$destination"
-    return 0
-  fi
-  mkdir -p "$HOME/.local/bin"
-  ln -sfn "$target" "$HOME/.local/bin/$name"
-  warn "Installed $name in ~/.local/bin; add it to PATH before opening a new shell."
-}
-
 install_control_command agent-add "$HERMES_DB_HOME/agent-add"
 install_control_command agents "$HERMES_DB_HOME/agents"
 
 if [[ "$MODE" != "lo" ]]; then
-  warn "If agents are remote, open ports 27017, 8743, 8744 (ufw allow вЂ¦)."
+  warn "If agents are remote, open ports 27017, 8743, 8744 (ufw allow …)."
 fi
 
 echo ""
-echo "${GREEN}вњ“ Hermes DB self-hosted${NC}  в†’  $HERMES_DB_HOME"
-echo "  Mode         : ${MODE} вЂ” ${LISTEN_HINT}"
+echo "${GREEN}OK Hermes DB${NC}  ->  $HERMES_DB_HOME"
+echo "  Mode         : ${MODE} — ${LISTEN_HINT}"
 echo "  Bind         : ${BIND_IP}"
 echo "  Advertise    : ${ADVERTISE_HOST}"
 echo "  Mongo        : ${HERMES_MONGO_HOSTS}"
 echo "  Enroll       : http://${ADVERTISE_HOST}:8743"
 echo "  Orchestrator : https://${ADVERTISE_HOST}:8744  (mTLS)"
+echo "  Fleet        : ${HERMES_FLEET_VERSION:-?}@${REF}"
 echo "  Status       : systemctl --user status hermes-mongod hermes-enroll hermes-orchestrator"
+echo "  Update fleet : hermes cluster update --version ${HERMES_FLEET_VERSION:-0.19.5}"
+echo "                 or: $HERMES_DB_HOME/scripts/cluster-update.sh"
 echo "  Agents       : agents"
 echo "  Add agent    : agent-add [name]"
 echo ""
@@ -325,7 +414,7 @@ if [[ "$SKIP_CONNECT" == "1" ]]; then
 fi
 
 if ! can_prompt; then
-  warn "No TTY for prompts вЂ” run: agent-add"
+  warn "No TTY for prompts — run: agent-add"
   exit 0
 fi
 

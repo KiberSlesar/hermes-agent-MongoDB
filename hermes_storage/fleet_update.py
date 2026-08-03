@@ -667,6 +667,59 @@ def restart_control_plane_units_best_effort() -> dict[str, Any]:
     return {"restarted": bool(ok), "ok": ok, "failed": failed}
 
 
+def publish_fleet_release_via_control_plane(
+    *,
+    version: str,
+    ref: str,
+    repo: str,
+    published_by: str = "cluster-update",
+    artifact: str = "",
+) -> dict[str, Any]:
+    """Publish fleet_release using DB-box credentials (no agent bootstrap)."""
+    import subprocess
+    import sys
+
+    db = hermes_db_home()
+    control = Path(os.environ.get("HERMES_CONTROL_DIR") or db)
+    script = control / "scripts" / "publish_fleet_release.py"
+    if not script.is_file():
+        script = db / "scripts" / "publish_fleet_release.py"
+    if not script.is_file():
+        raise RuntimeError(
+            f"publish_fleet_release.py not found under {control} or {db} "
+            "(set HERMES_DB_HOME / HERMES_CONTROL_DIR)"
+        )
+    env = os.environ.copy()
+    env["HERMES_CONTROL_DIR"] = str(control)
+    env["HERMES_DB_HOME"] = str(db)
+    cmd = [
+        sys.executable,
+        str(script),
+        "--version",
+        version,
+        "--ref",
+        ref,
+        "--repo",
+        repo,
+        "--published-by",
+        published_by,
+    ]
+    proc = subprocess.run(cmd, env=env, check=False, capture_output=True, text=True)
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"publish_fleet_release failed: {err}")
+    doc = {
+        "version": version,
+        "ref": ref,
+        "repo": repo,
+        "published_by": published_by,
+        "artifact": artifact,
+    }
+    if proc.stdout:
+        logger.info("%s", proc.stdout.strip())
+    return normalize_release(doc)
+
+
 def run_cluster_server_update(
     *,
     version: str = "",
@@ -691,15 +744,17 @@ def run_cluster_server_update(
         )
 
     db_home = hermes_db_home()
+    # Prefer explicit control-plane dir when set (installDB sets this).
+    control = os.environ.get("HERMES_CONTROL_DIR", "").strip()
+    if control:
+        db_home = Path(control)
+        os.environ.setdefault("HERMES_DB_HOME", str(db_home))
+
     release_dir = db_home / "releases" / ref
     tarball = release_dir / "src.tgz"
     download_repo_tarball(repo=repo, ref=ref, dest=tarball)
 
     scripts_dir = db_home / "scripts"
-    # Prefer HERMES_CONTROL_DIR/scripts when set
-    control = os.environ.get("HERMES_CONTROL_DIR", "").strip()
-    if control:
-        scripts_dir = Path(control) / "scripts"
     updated_scripts = refresh_control_plane_scripts_from_tarball(
         tarball, scripts_dir=scripts_dir
     )
@@ -715,20 +770,29 @@ def run_cluster_server_update(
             artifact=artifact,
         )
     else:
-        from hermes_storage import get_storage, is_mongo_mode
+        try:
+            from hermes_storage import get_storage, is_mongo_mode
 
-        if not is_mongo_mode():
-            raise RuntimeError("Mongo mode required for hermes cluster update")
-        st = get_storage(force=True)
-        if st.fleet_release is None:
-            raise RuntimeError("fleet_release store unavailable")
-        doc = st.fleet_release.put(
-            version=version,
-            ref=ref,
-            repo=repo,
-            published_by=published_by,
-            artifact=artifact,
-        )
+            if is_mongo_mode():
+                st = get_storage(force=True)
+                if st.fleet_release is not None:
+                    doc = st.fleet_release.put(
+                        version=version,
+                        ref=ref,
+                        repo=repo,
+                        published_by=published_by,
+                        artifact=artifact,
+                    )
+        except Exception:
+            logger.debug("agent storage publish skipped", exc_info=True)
+        if not doc:
+            doc = publish_fleet_release_via_control_plane(
+                version=version,
+                ref=ref,
+                repo=repo,
+                published_by=published_by,
+                artifact=artifact,
+            )
 
     restart = restart_control_plane_units_best_effort()
     return {

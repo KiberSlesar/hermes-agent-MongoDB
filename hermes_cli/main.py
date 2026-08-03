@@ -4769,20 +4769,50 @@ def cmd_storage(args):
 
 
 def cmd_cluster(args):
-    """Multi-PC cluster status / activate."""
+    """Multi-PC cluster status / activate / prune / update."""
     import json as _json
 
     from hermes_storage import get_storage, is_mongo_mode
     from hermes_storage.cluster import start_heartbeat_loop
 
+    sub = getattr(args, "cluster_command", None)
+
+    # DB control-plane update does not require agent Mongo bootstrap.
+    if sub == "update":
+        from hermes_storage.fleet_update import run_cluster_server_update
+
+        storage = None
+        if is_mongo_mode():
+            try:
+                storage = get_storage(force=True)
+            except Exception:
+                storage = None
+        try:
+            result = run_cluster_server_update(
+                version=getattr(args, "version", None) or "",
+                ref=getattr(args, "ref", None) or "",
+                repo=getattr(args, "repo", None) or "",
+                storage=storage,
+                published_by="cluster-update",
+            )
+        except Exception as exc:
+            print(f"Error: hermes cluster update failed: {exc}")
+            raise SystemExit(1) from exc
+        print(_json.dumps(result, indent=2, default=str))
+        print()
+        print(result.get("next_step") or "On each agent PC run: hermes update")
+        return
+
     if not is_mongo_mode():
         print("Error: Mongo/cluster mode is not enabled.")
+        print("On the DB server you can still run:")
+        print("  hermes cluster update --version 0.19.5")
+        print("  or: $HERMES_DB_HOME/scripts/cluster-update.sh --version 0.19.5")
         raise SystemExit(1)
     storage = get_storage(force=True)
     storage.register_presence()
     start_heartbeat_loop()
 
-    sub = getattr(args, "cluster_command", None)
     if sub == "status" or sub is None:
         status = storage.cluster_status()
         print(_json.dumps(status, indent=2, default=str))
@@ -4819,24 +4849,6 @@ def cmd_cluster(args):
             "force": force,
             "kept": storage.node_id,
         }, indent=2))
-        return
-    if sub == "update":
-        from hermes_storage.fleet_update import run_cluster_server_update
-
-        try:
-            result = run_cluster_server_update(
-                version=getattr(args, "version", None) or "",
-                ref=getattr(args, "ref", None) or "",
-                repo=getattr(args, "repo", None) or "",
-                storage=storage,
-                published_by="cluster-update",
-            )
-        except Exception as exc:
-            print(f"Error: hermes cluster update failed: {exc}")
-            raise SystemExit(1) from exc
-        print(_json.dumps(result, indent=2, default=str))
-        print()
-        print(result.get("next_step") or "On each agent PC run: hermes update")
         return
     print("usage: hermes cluster <status|activate|prune|update>")
 
