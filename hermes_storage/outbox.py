@@ -37,8 +37,11 @@ KIND_SECRETS_MANY = "secrets_many"
 KIND_SOUL = "soul"
 KIND_MEMORY = "memory"
 KIND_CRON_JOBS = "cron_jobs"
+KIND_CRON_EXECUTION = "cron_execution"
 KIND_SKILL_PUT = "skill_put"
 KIND_SKILL_DELETE = "skill_delete"
+KIND_WIKI_PUT = "wiki_put"
+KIND_WIKI_DELETE = "wiki_delete"
 
 
 def outbox_root() -> Path:
@@ -80,6 +83,8 @@ def _coalesce_key(kind: str, payload: dict[str, Any]) -> Optional[str]:
         return f"memory:{payload.get('target')}"
     if kind in {KIND_SKILL_PUT, KIND_SKILL_DELETE}:
         return f"skill:{payload.get('name')}"
+    if kind in {KIND_WIKI_PUT, KIND_WIKI_DELETE}:
+        return f"wiki:{payload.get('slug')}"
     return None
 
 
@@ -288,9 +293,8 @@ def _apply_entry(storage: Any, entry: dict[str, Any]) -> None:
         storage._invalidate_config_readers()
         return
     if kind == KIND_MACHINE_OVERLAY:
-        storage.machines.set_overlay(
-            storage.machine_id, payload.get("overlay") or {}
-        )
+        mid = payload.get("machine_id") or storage.machine_id
+        storage.machines.set_overlay(mid, payload.get("overlay") or {})
         storage._invalidate_config_readers()
         return
     if kind == KIND_SECRET_SET:
@@ -321,6 +325,9 @@ def _apply_entry(storage: Any, entry: dict[str, Any]) -> None:
             {"key": "default", "data": payload.get("doc") or {"jobs": []}},
         )
         return
+    if kind == KIND_CRON_EXECUTION:
+        storage.ledgers.insert("cron_executions", payload.get("doc") or {})
+        return
     if kind == KIND_SKILL_PUT:
         name = str(payload.get("name") or "").strip()
         skill_md = str(payload.get("skill_md") or "")
@@ -333,13 +340,35 @@ def _apply_entry(storage: Any, entry: dict[str, Any]) -> None:
                 files[str(rel)] = path.read_bytes()
         if "SKILL.md" not in files and skill_md:
             files["SKILL.md"] = skill_md.encode("utf-8")
-        storage.skills.put_skill(
-            {"name": name, "skill_md": skill_md, "path": name},
-            files=files or None,
-        )
+        meta = {
+            "name": name,
+            "skill_md": skill_md,
+            "path": name,
+            "status": payload.get("status") or "ready",
+            "updated_by": payload.get("updated_by") or getattr(storage, "machine_id", "") or "",
+        }
+        if payload.get("content_hash"):
+            meta["content_hash"] = payload["content_hash"]
+        storage.skills.put_skill(meta, files=files or None)
         return
     if kind == KIND_SKILL_DELETE:
         storage.skills.delete_skill(str(payload.get("name") or ""))
+        return
+    if kind == KIND_WIKI_PUT:
+        if storage.wiki is None:
+            raise RuntimeError("wiki store not available")
+        storage.wiki.put_page(
+            title=str(payload.get("title") or payload.get("slug") or ""),
+            body=str(payload.get("body") or ""),
+            slug=str(payload.get("slug") or ""),
+            tags=list(payload.get("tags") or []),
+            updated_by=str(payload.get("updated_by") or ""),
+        )
+        return
+    if kind == KIND_WIKI_DELETE:
+        if storage.wiki is None:
+            raise RuntimeError("wiki store not available")
+        storage.wiki.delete_page(str(payload.get("slug") or ""))
         return
     raise ValueError(f"unknown outbox kind: {kind!r}")
 

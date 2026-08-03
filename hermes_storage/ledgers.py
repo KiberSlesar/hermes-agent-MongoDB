@@ -46,11 +46,33 @@ def save_cron_jobs(data: Any) -> bool:
         return False
     from hermes_storage.outbox import KIND_CRON_JOBS, run_or_enqueue
 
-    doc = data
+    doc = data if isinstance(data, dict) else {"jobs": data}
+    if isinstance(doc, dict) and "revision" not in doc:
+        # Bump optimistic revision so concurrent replaces can detect races.
+        try:
+            existing = load_json_document("cron_jobs") or {}
+            prev = int((existing or {}).get("revision") or 0) if isinstance(existing, dict) else 0
+        except Exception:
+            prev = 0
+        doc = dict(doc)
+        doc["revision"] = prev + 1
+
+    def _apply() -> None:
+        # Optimistic check: refuse to clobber a newer revision.
+        current = load_json_document("cron_jobs")
+        if isinstance(current, dict) and isinstance(doc, dict):
+            cur_rev = int(current.get("revision") or 0)
+            new_rev = int(doc.get("revision") or 0)
+            if cur_rev and new_rev and new_rev < cur_rev:
+                raise RuntimeError(
+                    f"cron_jobs stale revision {new_rev} < current {cur_rev}"
+                )
+        save_json_document("cron_jobs", doc)
+
     run_or_enqueue(
         KIND_CRON_JOBS,
         {"doc": doc},
-        lambda: save_json_document("cron_jobs", doc),
+        _apply,
     )
     return True
 
@@ -58,10 +80,26 @@ def save_cron_jobs(data: Any) -> bool:
 def record_execution(doc: dict[str, Any]) -> Optional[str]:
     if not mongo_ledger_enabled():
         return None
-    from hermes_storage import require_storage
+    from hermes_storage.outbox import KIND_CRON_EXECUTION, run_or_enqueue
 
-    storage = require_storage()
-    return storage.ledgers.insert("cron_executions", doc)
+    payload = dict(doc or {})
+    result: dict[str, Optional[str]] = {"id": None}
+
+    def _apply() -> None:
+        from hermes_storage import require_storage
+
+        storage = require_storage()
+        result["id"] = storage.ledgers.insert("cron_executions", payload)
+
+    status = run_or_enqueue(
+        KIND_CRON_EXECUTION,
+        {"doc": payload},
+        _apply,
+        coalesce=False,
+    )
+    if status.get("queued"):
+        return "queued"
+    return result["id"]
 
 
 def bridge_json_file(path: Path, collection: str) -> Any:

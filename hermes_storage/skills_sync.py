@@ -46,6 +46,81 @@ def invalidate_skills_sync_cache() -> None:
     _SYNC_ONCE = None
 
 
+def ensure_skill_fresh_from_mongo(skill_name: str) -> bool:
+    """Rematerialize *skill_name* when Mongo is newer than the local cache.
+
+    Returns True when a rematerialize ran. Safe no-op outside Mongo mode or
+    when the skill is missing remotely. Used by ``skill_view`` so cross-node
+    edits appear without restarting the agent process.
+    """
+    from hermes_storage import is_mongo_mode, require_storage
+
+    if not is_mongo_mode():
+        return False
+    name = str(skill_name or "").strip()
+    if not name or "/" in name or "\\" in name or ":" in name:
+        # Bare skill names only — categorized paths resolve after local scan.
+        bare = name.replace("\\", "/").rstrip("/").split("/")[-1] if name else ""
+        name = bare
+    if not name:
+        return False
+    try:
+        storage = require_storage()
+        meta = storage.skills.get_skill(name)
+    except Exception as exc:
+        logger.debug("ensure_skill_fresh: get_skill failed: %s", exc)
+        return False
+    if not meta:
+        return False
+    if str(meta.get("status") or "ready").lower() == "archived":
+        return False
+
+    remote_ts = _fmt_updated_at(meta.get("updated_at"))
+    remote_hash = str(meta.get("content_hash") or "")
+    cache_root = mongo_skills_cache_dir()
+    skill_root = cache_root / name
+    local_stamp = skill_root / ".mongo_updated_at"
+    local_hash = skill_root / ".mongo_content_hash"
+    try:
+        stamp_ok = (
+            (skill_root / "SKILL.md").is_file()
+            and local_stamp.is_file()
+            and local_stamp.read_text(encoding="utf-8").strip() == remote_ts
+            and bool(remote_ts)
+        )
+        hash_ok = True
+        if remote_hash:
+            hash_ok = (
+                local_hash.is_file()
+                and local_hash.read_text(encoding="utf-8").strip() == remote_hash
+            )
+        if stamp_ok and hash_ok:
+            return False
+    except OSError:
+        pass
+
+    try:
+        storage.skills.materialize(name, cache_root)
+        try:
+            local_stamp.write_text(remote_ts, encoding="utf-8")
+            if remote_hash:
+                local_hash.write_text(remote_hash, encoding="utf-8")
+        except OSError:
+            pass
+        invalidate_skills_sync_cache()
+        try:
+            from tools.skills_tool import clear_skills_discovery_cache
+
+            clear_skills_discovery_cache()
+        except Exception:
+            pass
+        logger.info("Rematerialized skill %r from Mongo (stale local cache)", name)
+        return True
+    except Exception as exc:
+        logger.warning("Failed to rematerialize skill %s: %s", name, exc)
+        return False
+
+
 def _fmt_updated_at(value: Any) -> str:
     if value is None:
         return ""
@@ -58,12 +133,20 @@ def _fmt_updated_at(value: Any) -> str:
 
 
 def _skills_collection_fingerprint(listed: list[dict[str, Any]]) -> str:
-    parts = [
-        f"{s.get('name') or ''}:{_fmt_updated_at(s.get('updated_at'))}"
-        for s in listed
-        if s.get("name")
-    ]
+    parts = []
+    for s in listed:
+        name = s.get("name")
+        if not name:
+            continue
+        rev = s.get("revision")
+        ch = s.get("content_hash") or ""
+        ts = _fmt_updated_at(s.get("updated_at"))
+        parts.append(f"{name}:{rev or ''}:{ch}:{ts}")
     return "|".join(sorted(parts))
+
+
+# Cap how many skills one sync pass rematerializes (large fleets).
+_MAX_MATERIALIZE_PER_SYNC = 64
 
 
 def _cache_looks_complete(dest: Path, listed: list[dict[str, Any]]) -> bool:
@@ -130,43 +213,68 @@ def sync_skills_from_mongo() -> Optional[Path]:
 
         pulled = 0
         skipped = 0
+        deferred = 0
         for skill in listed:
             name = skill.get("name")
             if not name:
                 continue
+            status = str(skill.get("status") or "ready").lower()
+            if status == "archived":
+                skipped += 1
+                continue
             remote_ts = _fmt_updated_at(skill.get("updated_at"))
+            remote_hash = str(skill.get("content_hash") or "")
             skill_root = dest / name
             local_stamp = skill_root / ".mongo_updated_at"
+            local_hash_stamp = skill_root / ".mongo_content_hash"
             try:
-                if (
+                stamp_ok = (
                     (skill_root / "SKILL.md").is_file()
                     and local_stamp.is_file()
                     and local_stamp.read_text(encoding="utf-8").strip() == remote_ts
                     and remote_ts
-                ):
+                )
+                hash_ok = True
+                if remote_hash and local_hash_stamp.is_file():
+                    hash_ok = (
+                        local_hash_stamp.read_text(encoding="utf-8").strip() == remote_hash
+                    )
+                elif remote_hash:
+                    hash_ok = False
+                if stamp_ok and hash_ok:
                     skipped += 1
                     continue
             except OSError:
                 pass
+            if pulled >= _MAX_MATERIALIZE_PER_SYNC:
+                deferred += 1
+                continue
             try:
                 storage.skills.materialize(name, dest)
                 try:
                     local_stamp.write_text(remote_ts, encoding="utf-8")
+                    if remote_hash:
+                        local_hash_stamp.write_text(remote_hash, encoding="utf-8")
                 except OSError:
                     pass
                 pulled += 1
             except Exception as exc:
                 logger.warning("Failed to materialize skill %s: %s", name, exc)
         try:
-            stamp_path.write_text(fingerprint, encoding="utf-8")
+            # Only stamp complete sync when nothing was deferred.
+            if deferred == 0:
+                stamp_path.write_text(fingerprint, encoding="utf-8")
+                _SYNC_ONCE = fingerprint
+            else:
+                invalidate_skills_sync_cache()
         except OSError:
             pass
-        _SYNC_ONCE = fingerprint
-        if pulled:
+        if pulled or deferred:
             logger.info(
-                "Mongo skills sync: pulled=%s skipped=%s total=%s",
+                "Mongo skills sync: pulled=%s skipped=%s deferred=%s total=%s",
                 pulled,
                 skipped,
+                deferred,
                 len(listed),
             )
     except Exception as exc:
@@ -177,6 +285,8 @@ def sync_skills_from_mongo() -> Optional[Path]:
 
 def upload_local_skill_tree(skill_dir: Path, *, name: Optional[str] = None) -> None:
     """Push a local skill directory into Mongo (shared skills DB)."""
+    import hashlib
+
     from hermes_storage import require_storage
 
     storage = require_storage()
@@ -189,16 +299,27 @@ def upload_local_skill_tree(skill_dir: Path, *, name: Optional[str] = None) -> N
     for f in skill_dir.rglob("*"):
         if f.is_file():
             # Skip sync metadata / stamps — not part of the skill payload
-            if f.name in {".mongo_updated_at", ".mongo_skills_stamp", ".bundled_manifest"}:
+            if f.name in {
+                ".mongo_updated_at",
+                ".mongo_skills_stamp",
+                ".mongo_content_hash",
+                ".bundled_manifest",
+            }:
                 continue
             if f.name.startswith(".") and f.suffix == ".lock":
                 continue
             rel = str(f.relative_to(skill_dir)).replace("\\", "/")
             files[rel] = f.read_bytes()
-    storage.skills.put_skill(
-        {"name": skill_name, "skill_md": body, "path": skill_name},
-        files=files,
-    )
+    content_hash = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+    meta = {
+        "name": skill_name,
+        "skill_md": body,
+        "path": skill_name,
+        "content_hash": content_hash,
+        "status": "ready",
+        "updated_by": getattr(storage, "machine_id", None) or "",
+    }
+    storage.skills.put_skill(meta, files=files)
 
 
 def _refresh_skill_cache_entry(skill_name: str, skill_dir: Path) -> None:
@@ -230,11 +351,16 @@ def _refresh_skill_cache_entry(skill_name: str, skill_dir: Path) -> None:
 
     meta = storage.skills.get_skill(skill_name) or {}
     remote_ts = _fmt_updated_at(meta.get("updated_at"))
+    remote_hash = str(meta.get("content_hash") or "")
     for parent in targets:
         storage.skills.materialize(skill_name, parent)
         try:
             stamp = Path(parent) / skill_name / ".mongo_updated_at"
             stamp.write_text(remote_ts, encoding="utf-8")
+            if remote_hash:
+                (Path(parent) / skill_name / ".mongo_content_hash").write_text(
+                    remote_hash, encoding="utf-8"
+                )
         except OSError:
             pass
 
@@ -282,9 +408,25 @@ def commit_skill_tree(skill_dir: Path, *, name: Optional[str] = None) -> None:
         invalidate_skills_sync_cache()
         _refresh_skill_cache_entry(skill_name, skill_dir)
 
+    import hashlib
+
+    from hermes_storage import require_storage as _require
+
+    content_hash = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+    updated_by = ""
+    try:
+        updated_by = getattr(_require(), "machine_id", "") or ""
+    except Exception:
+        pass
     status = run_or_enqueue(
         KIND_SKILL_PUT,
-        {"name": skill_name, "skill_md": body},
+        {
+            "name": skill_name,
+            "skill_md": body,
+            "content_hash": content_hash,
+            "status": "ready",
+            "updated_by": updated_by,
+        },
         _apply,
         blob_files=files,
     )
@@ -528,7 +670,10 @@ def seed_profile_defaults_if_empty(
             current = ""
         if not (current or "").strip() and memories.get(key):
             try:
-                st.memories.save(key, memories[key])
+                if hasattr(st, "save_memory_entry"):
+                    st.save_memory_entry(key, memories[key])
+                else:
+                    st.memories.save(key, memories[key])
                 counts["memories"] += 1
             except Exception as exc:
                 logger.warning(

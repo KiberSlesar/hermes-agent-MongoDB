@@ -35,6 +35,7 @@ def test_scrub_classic_durable_home_quarantines_leftovers(tmp_path):
     (tmp_path / "config.yaml").write_text("model: x\n", encoding="utf-8")
     (tmp_path / ".env").write_text("K=v\n", encoding="utf-8")
     (tmp_path / "SOUL.md").write_text("# soul\n", encoding="utf-8")
+    (tmp_path / "state.db").write_text("sqlite", encoding="utf-8")
     (tmp_path / "skills").mkdir()
     (tmp_path / "skills" / "SKILL.md").write_text("x", encoding="utf-8")
     (tmp_path / "memories").mkdir()
@@ -45,13 +46,15 @@ def test_scrub_classic_durable_home_quarantines_leftovers(tmp_path):
     (tmp_path / "bootstrap.yaml").write_text("mongo_uri: x\n", encoding="utf-8")
 
     result = scrub_classic_durable_home(tmp_path)
-    assert result["moved"] >= 5
+    assert result["moved"] >= 6
     assert not (tmp_path / "config.yaml").exists()
     assert not (tmp_path / "skills").exists()
+    assert not (tmp_path / "state.db").exists()
     assert (tmp_path / "bootstrap.yaml").exists()
     assert (tmp_path / "cache" / "skills").is_dir()
     assert (tmp_path / ".orphan" / "config.yaml").exists()
     assert (tmp_path / ".orphan" / "skills").exists()
+    assert (tmp_path / ".orphan" / "state.db").exists()
 
 
 def test_skills_sync_client_uses_writable_skills_dir(monkeypatch, tmp_path):

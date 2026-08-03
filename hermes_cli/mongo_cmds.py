@@ -34,6 +34,13 @@ def build_mongo_parser(subparsers, *, cmd_mongo: Callable) -> None:
     )
     seed.set_defaults(func=cmd_mongo)
 
+    inspect_skill = mongo_sub.add_parser(
+        "inspect-skill",
+        help="Show Mongo skill metadata (hash, revision, updated_by, files)",
+    )
+    inspect_skill.add_argument("name", help="Skill name")
+    inspect_skill.set_defaults(func=cmd_mongo)
+
     # Bare `hermes mongo` → status
     parser.set_defaults(func=cmd_mongo, mongo_command="status")
 
@@ -112,6 +119,15 @@ def collect_mongo_inventory(storage) -> dict[str, Any]:
     except Exception:
         machines_n = _count(profile_db["machines"])
 
+    wiki_n = 0
+    try:
+        if getattr(storage, "wiki", None) is not None:
+            wiki_n = len(storage.wiki.list_pages(limit=5000))
+        else:
+            wiki_n = _count(shared_db["wiki_pages"])
+    except Exception:
+        wiki_n = _count(shared_db["wiki_pages"])
+
     nodes_n = _count(shared_db["cluster_nodes"])
     online_n = 0
     try:
@@ -126,6 +142,21 @@ def collect_mongo_inventory(storage) -> dict[str, Any]:
         cron_n = _count(profile_db["cron_jobs"])
         if cron_n == 0:
             cron_n = _count(profile_db["ledgers"], {"kind": "cron_jobs"})
+    except Exception:
+        pass
+
+    outbox_pending = 0
+    try:
+        from hermes_storage.outbox import pending_count
+
+        outbox_pending = pending_count()
+    except Exception:
+        pass
+
+    messaging_owner = ""
+    try:
+        state = storage.cluster.get_state() or {}
+        messaging_owner = state.get("messaging_owner") or state.get("active_node_id") or ""
     except Exception:
         pass
 
@@ -147,9 +178,12 @@ def collect_mongo_inventory(storage) -> dict[str, Any]:
         "model_default": model.get("default") or model.get("model") or "",
         "model_provider": model.get("provider") or "",
         "machines": machines_n,
+        "wiki_pages": wiki_n,
         "cluster_nodes": nodes_n,
         "cluster_online": online_n,
         "cron_jobs": cron_n,
+        "outbox_pending": outbox_pending,
+        "messaging_owner": messaging_owner,
     }
 
 
@@ -163,6 +197,7 @@ def format_mongo_inventory(inv: dict[str, Any]) -> str:
         f"Machine: {inv.get('machine_id') or '—'}",
         "-" * 55,
         f"Скиллы: {inv.get('skills', 0)}",
+        f"Wiki: {inv.get('wiki_pages', 0)} страниц",
         f"Soul: {inv.get('soul_chars', 0)} символов",
         f"Память (MEMORY): {inv.get('memory_chars', 0)} символов",
         f"Память (USER): {inv.get('user_memory_chars', 0)} символов",
@@ -181,10 +216,42 @@ def format_mongo_inventory(inv: dict[str, Any]) -> str:
     lines.append(
         f"Кластер: {inv.get('cluster_online', 0)} online / {inv.get('cluster_nodes', 0)} nodes"
     )
+    if inv.get("messaging_owner"):
+        lines.append(f"Messaging owner: {inv.get('messaging_owner')}")
     if inv.get("cron_jobs"):
         lines.append(f"Cron jobs: {inv.get('cron_jobs', 0)}")
+    lines.append(f"Outbox pending: {inv.get('outbox_pending', 0)}")
     lines.append("-" * 55)
     return "\n".join(lines)
+
+
+def cmd_mongo_inspect_skill(name: str) -> int:
+    """Print Mongo metadata + GridFS file list for one skill."""
+    import json
+
+    from hermes_storage import get_storage, is_mongo_mode
+
+    if not is_mongo_mode():
+        print("Mongo mode: OFF")
+        return 1
+    storage = get_storage(force=True)
+    skill = storage.skills.get_skill(name)
+    if not skill:
+        print(f"Skill not found in Mongo: {name}")
+        return 1
+    files = sorted((skill.get("file_ids") or {}).keys())
+    payload = {
+        "name": skill.get("name"),
+        "status": skill.get("status") or "ready",
+        "revision": skill.get("revision"),
+        "content_hash": skill.get("content_hash"),
+        "updated_at": skill.get("updated_at"),
+        "updated_by": skill.get("updated_by"),
+        "skill_md_chars": len(str(skill.get("skill_md") or "")),
+        "files": files,
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+    return 0
 
 
 def cmd_mongo_seed_skills() -> int:

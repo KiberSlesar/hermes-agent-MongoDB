@@ -10405,9 +10405,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("Initial cluster presence failed", exc_info=True)
                 api_base = ""
                 try:
-                    api_cfg = getattr(self.config, "platforms", None)
+                    from hermes_storage.api_base import resolve_advertise_api_base
+
+                    api_base = resolve_advertise_api_base()
                 except Exception:
-                    api_cfg = None
+                    api_base = ""
                 self._mongo_defer_messaging = not should_connect_messaging()
                 if self._mongo_defer_messaging:
                     logger.info(
@@ -10416,8 +10418,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 # Heartbeat starts under bootstrapping=True so reconcile cannot
                 # race the connect loop below and open a second getUpdates.
+                # api_base is re-resolved each tick if empty at start.
                 start_heartbeat_loop(api_base=api_base or None)
-                logger.info("Mongo cluster heartbeat started")
+                logger.info(
+                    "Mongo cluster heartbeat started (api_base=%s)",
+                    api_base or "(pending serve advertise)",
+                )
         except Exception as exc:
             logger.debug("Cluster heartbeat not started: %s", exc)
         try:

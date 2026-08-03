@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   Activity,
+  BookOpen,
   Brain,
   Check,
   Clock,
@@ -57,6 +58,7 @@ import type {
   UpdateCheckResponse,
   CuratorStatus,
   ClusterStatus,
+  FleetWikiPage,
   PortalStatus,
   DebugShareResponse,
 } from "@/lib/api";
@@ -205,6 +207,10 @@ export default function SystemPage() {
   const [portal, setPortal] = useState<PortalStatus | null>(null);
   const [cluster, setCluster] = useState<ClusterStatus | null>(null);
   const [switchingAgent, setSwitchingAgent] = useState<string | null>(null);
+  const [wikiPages, setWikiPages] = useState<FleetWikiPage[]>([]);
+  const [wikiTitle, setWikiTitle] = useState("");
+  const [wikiBody, setWikiBody] = useState("");
+  const [wikiSaving, setWikiSaving] = useState(false);
   const [loading, setLoading] = useState(true);
 
   const [activeAction, setActiveAction] = useState<string | null>(null);
@@ -269,8 +275,9 @@ export default function SystemPage() {
       // Cached (non-forced) check so the version row shows update status on
       // load without a separate effect / a forced network round-trip.
       api.checkHermesUpdate(false),
+      api.listFleetWiki(),
     ])
-      .then(([s, st, m, p, c, h, cur, prt, clusterResult, upd]) => {
+      .then(([s, st, m, p, c, h, cur, prt, clusterResult, upd, wiki]) => {
         if (s.status === "fulfilled") setStatus(s.value);
         if (st.status === "fulfilled") setStats(st.value);
         if (m.status === "fulfilled") setMemory(m.value);
@@ -281,6 +288,7 @@ export default function SystemPage() {
         if (prt.status === "fulfilled") setPortal(prt.value);
         if (clusterResult.status === "fulfilled") setCluster(clusterResult.value);
         if (upd.status === "fulfilled") setUpdateInfo(upd.value);
+        if (wiki.status === "fulfilled") setWikiPages(wiki.value.pages ?? []);
       })
       .finally(() => setLoading(false));
   }, []);
@@ -320,6 +328,27 @@ export default function SystemPage() {
       showToast(`Cannot switch agent: ${e}`, "error");
     } finally {
       setSwitchingAgent(null);
+    }
+  };
+
+  const saveWikiPage = async () => {
+    const title = wikiTitle.trim();
+    if (!title) {
+      showToast("Wiki title required", "error");
+      return;
+    }
+    setWikiSaving(true);
+    try {
+      await api.putFleetWikiPage({ title, body: wikiBody });
+      showToast("Wiki page saved", "success");
+      setWikiTitle("");
+      setWikiBody("");
+      const listed = await api.listFleetWiki();
+      setWikiPages(listed.pages ?? []);
+    } catch (e) {
+      showToast(`Wiki save failed: ${e}`, "error");
+    } finally {
+      setWikiSaving(false);
     }
   };
 
@@ -1074,6 +1103,11 @@ export default function SystemPage() {
                 {cluster.nodes.filter((node) => node.online).map((node) => {
                   const nodeId = node.node_id;
                   const active = nodeId === cluster.state.active_node_id;
+                  const chatHint = node.api_base
+                    ? node.chat_ready
+                      ? `chat: ${node.api_base}`
+                      : `api_base set, not ready`
+                    : "no api_base (set HERMES_API_BASE + hermes serve)";
                   return (
                     <Button
                       key={nodeId}
@@ -1081,6 +1115,7 @@ export default function SystemPage() {
                       ghost={!active}
                       disabled={active || switchingAgent !== null}
                       onClick={() => void activateAgent(nodeId)}
+                      title={chatHint}
                     >
                       {switchingAgent === nodeId
                         ? "Switching…"
@@ -1093,11 +1128,60 @@ export default function SystemPage() {
               </div>
               <p className="text-xs text-muted-foreground">
                 A switch is refused while the active agent has a running task. Wait for it to finish or send /stop first.
+                {typeof window !== "undefined" && window.__HERMES_CONTROL_PLANE__
+                  ? " Control plane: chat proxies to the messaging owner's hermes serve."
+                  : ""}
               </p>
             </CardContent>
           </Card>
         </section>
       )}
+
+      {/* ── Fleet wiki ─────────────────────────────────────────────── */}
+      <section className="flex flex-col gap-3">
+        <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
+          <BookOpen className="h-4 w-4" /> Fleet wiki
+        </H2>
+        <Card>
+          <CardContent className="flex flex-col gap-3 py-4">
+            <p className="text-xs text-muted-foreground">
+              Shared reference notes (addresses, nginx, runbooks). Skills stay procedural; wiki stays factual.
+            </p>
+            {wikiPages.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No wiki pages yet.</p>
+            ) : (
+              <ul className="flex max-h-48 flex-col gap-1 overflow-y-auto text-sm">
+                {wikiPages.slice(0, 40).map((page) => (
+                  <li key={page.slug} className="flex items-baseline justify-between gap-2">
+                    <span className="truncate font-medium">{page.title}</span>
+                    <span className="shrink-0 text-xs text-muted-foreground">{page.slug}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <div className="flex flex-col gap-2 border-t border-border pt-3">
+              <Input
+                placeholder="Title"
+                value={wikiTitle}
+                onChange={(e) => setWikiTitle(e.target.value)}
+              />
+              <textarea
+                className="min-h-20 rounded-md border border-border bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring"
+                placeholder="Body (markdown / plain)"
+                value={wikiBody}
+                onChange={(e) => setWikiBody(e.target.value)}
+              />
+              <Button
+                size="sm"
+                disabled={wikiSaving || !wikiTitle.trim()}
+                onClick={() => void saveWikiPage()}
+              >
+                {wikiSaving ? "Saving…" : "Save page"}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      </section>
 
       {/* ── Gateway ───────────────────────────────────────────────── */}
       <section className="flex flex-col gap-3">

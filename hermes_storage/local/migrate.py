@@ -179,7 +179,7 @@ def import_payload_to_storage(storage: Any, payload: dict[str, Any]) -> dict[str
     memories = payload.get("memories") or {}
     for key in ("memory", "user"):
         if memories.get(key):
-            storage.memories.save(key, memories[key])
+            storage.save_memory_entry(key, memories[key])
             counts["memories"] += 1
 
     for skill in payload.get("skills") or []:

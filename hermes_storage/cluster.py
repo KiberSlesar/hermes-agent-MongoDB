@@ -136,14 +136,18 @@ def format_cluster_prompt_block(status: Optional[dict[str, Any]] = None) -> str:
         for n in online:
             caps = ",".join(n.get("capabilities") or []) or "-"
             marker = " *" if n.get("node_id") == state.get("active_node_id") else ""
+            api = (n.get("api_base") or "").strip()
+            chat = "chat_ready" if n.get("chat_ready") else ("no_api_base" if not api else "api_base_set")
             lines.append(
                 f"  - {n.get('hostname') or n.get('machine_id')} "
-                f"[{n.get('node_id')}] caps={caps}{marker}"
+                f"[{n.get('node_id')}] caps={caps} {chat}"
+                f"{(' ' + api) if api else ''}{marker}"
             )
     lines.append(
         "Use cluster_status / cluster_activate tools (or /cluster) to inspect "
         "or switch the active agent. Messaging gateway moves with a lease "
-        "handoff so only one Telegram/Discord gateway is live."
+        "handoff so only one Telegram/Discord gateway is live. Web chat on "
+        "the control plane follows messaging_owner's advertised api_base."
     )
     return "\n".join(lines)
 
@@ -153,7 +157,12 @@ def start_heartbeat_loop(
     interval_s: float = 15.0,
     api_base: Optional[str] = None,
 ) -> None:
-    """Background presence heartbeat for the current process."""
+    """Background presence heartbeat for the current process.
+
+    ``api_base`` may be omitted; each tick re-resolves via
+    :func:`hermes_storage.api_base.resolve_advertise_api_base` so serve can
+    advertise its bind URL after startup.
+    """
     global _HEARTBEAT_THREAD
     storage = get_storage()
     if storage is None:
@@ -163,14 +172,17 @@ def start_heartbeat_loop(
     def _loop() -> None:
         while not _HEARTBEAT_STOP.is_set():
             try:
+                from hermes_storage.api_base import resolve_advertise_api_base
+
                 runtime = {}
                 if _RUNTIME_STATE_CB:
                     try:
                         runtime = _RUNTIME_STATE_CB() or {}
                     except Exception:
                         logger.debug("Cluster runtime-state callback failed", exc_info=True)
+                advertised = (api_base or "").strip() or resolve_advertise_api_base()
                 storage.register_presence(
-                    api_base=api_base,
+                    api_base=advertised or None,
                     active_turns=runtime.get("active_turns", 0),
                     active_session_keys=runtime.get("active_session_keys"),
                 )
@@ -185,7 +197,7 @@ def start_heartbeat_loop(
                             "node_id": storage.node_id,
                             "machine_id": storage.machine_id,
                             "profile": storage.bootstrap.profile,
-                            "api_base": api_base or "",
+                            "api_base": advertised or "",
                             "status": "online",
                             "active_turns": runtime.get("active_turns", 0),
                             "active_session_keys": runtime.get("active_session_keys") or [],

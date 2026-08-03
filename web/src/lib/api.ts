@@ -32,6 +32,8 @@ declare global {
      * WS-upgrade path from legacy ``?token=`` to single-use ``?ticket=``
      * fetched via :func:`getWsTicket`. */
     __HERMES_AUTH_REQUIRED__?: boolean;
+    /** Control-plane dashboard near Mongo: chat uses /api/fleet/ws proxy. */
+    __HERMES_CONTROL_PLANE__?: boolean;
   }
 }
 const SESSION_HEADER = "X-Hermes-Session-Token";
@@ -327,6 +329,8 @@ export interface ClusterNode {
   hostname?: string;
   online?: boolean;
   active_turns?: number;
+  api_base?: string;
+  chat_ready?: boolean;
 }
 
 export interface ClusterStatus {
@@ -336,6 +340,25 @@ export interface ClusterStatus {
     handoff_state?: string | null;
   };
   nodes: ClusterNode[];
+}
+
+export interface FleetActiveChat {
+  control_plane?: boolean;
+  owner_node_id?: string | null;
+  handoff_state?: string;
+  api_base?: string;
+  chat_ready?: boolean;
+  hostname?: string;
+  fleet_proxy_configured?: boolean;
+  health?: { ok?: boolean; reason?: string };
+}
+
+export interface FleetWikiPage {
+  slug: string;
+  title: string;
+  body?: string;
+  tags?: string[];
+  updated_at?: string;
 }
 
 function normalizeSessionQueryOptions(
@@ -368,6 +391,30 @@ export const api = {
   buildWsUrl,
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
   getCluster: () => fetchJSON<ClusterStatus>("/api/cluster"),
+  getFleetActiveChat: () => fetchJSON<FleetActiveChat>("/api/fleet/active-chat"),
+  getFleetStatus: () =>
+    fetchJSON<{
+      control_plane: boolean;
+      wiki_pages: number;
+      active_chat: FleetActiveChat;
+      cluster: ClusterStatus;
+    }>("/api/fleet/status"),
+  listFleetWiki: (tag?: string) =>
+    fetchJSON<{ pages: FleetWikiPage[] }>(
+      tag ? `/api/fleet/wiki?tag=${encodeURIComponent(tag)}` : "/api/fleet/wiki",
+    ),
+  getFleetWikiPage: (slug: string) =>
+    fetchJSON<FleetWikiPage>(`/api/fleet/wiki/${encodeURIComponent(slug)}`),
+  putFleetWikiPage: (body: {
+    title: string;
+    body?: string;
+    slug?: string;
+    tags?: string[];
+  }) =>
+    fetchJSON<{ ok: true; page: FleetWikiPage }>("/api/fleet/wiki", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   activateClusterNode: (target: string) =>
     fetchJSON<{ ok: true; state: ClusterStatus["state"] }>("/api/cluster/activate", {
       method: "POST",

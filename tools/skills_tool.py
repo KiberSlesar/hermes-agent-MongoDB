@@ -1038,6 +1038,14 @@ def skill_view(
                 ensure_ascii=False,
             )
 
+        # Mongo mode: pull newer remote revision before reading local cache.
+        try:
+            from hermes_storage.skills_sync import ensure_skill_fresh_from_mongo
+
+            ensure_skill_fresh_from_mongo(name)
+        except Exception:
+            logger.debug("ensure_skill_fresh_from_mongo skipped", exc_info=True)
+
         local_category_name: str | None = None
         # ── Qualified name dispatch (plugin skills) ──────────────────
         # Names containing ':' are routed to the plugin skill registry.

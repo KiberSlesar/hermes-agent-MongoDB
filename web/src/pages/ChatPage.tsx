@@ -32,6 +32,7 @@ import { useSearchParams } from "react-router-dom";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
 import { ChatSessionList } from "@/components/ChatSessionList";
+import { FleetChatPanel } from "@/components/FleetChatPanel";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
@@ -155,6 +156,16 @@ function terminalLineHeightForWidth(layoutWidthPx: number): number {
 }
 
 export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+  // Control plane near Mongo: do not spawn local PTY/agent — JSON-RPC chat
+  // proxies to messaging_owner via /api/fleet/ws.
+  if (typeof window !== "undefined" && window.__HERMES_CONTROL_PLANE__) {
+    return <FleetChatPanel isActive={isActive} />;
+  }
+
+  return <ChatPagePty isActive={isActive} />;
+}
+
+function ChatPagePty({ isActive = true }: { isActive?: boolean }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -1569,5 +1580,6 @@ declare global {
   interface Window {
     __HERMES_SESSION_TOKEN__?: string;
     __HERMES_AUTH_REQUIRED__?: boolean;
+    __HERMES_CONTROL_PLANE__?: boolean;
   }
 }

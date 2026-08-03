@@ -145,3 +145,47 @@ def test_materialize_prefers_document_skill_md_over_stale_gridfs(tmp_path):
     assert "STALE FROM GRIDFS" not in (out / "SKILL.md").read_text(
         encoding="utf-8"
     )
+
+
+def test_ensure_skill_fresh_rematerializes_when_mongo_newer(tmp_path, monkeypatch):
+    """skill_view path: remote content_hash beats stale local cache stamps."""
+    from hermes_storage import skills_sync as ss
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    cache = tmp_path / "cache" / "skills"
+    skill = cache / "remote-newer"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# old local\n", encoding="utf-8")
+    (skill / ".mongo_updated_at").write_text(
+        "2020-01-01T00:00:00+00:00", encoding="utf-8"
+    )
+    (skill / ".mongo_content_hash").write_text("sha256:old", encoding="utf-8")
+
+    body = "---\nname: remote-newer\n---\n\n# NEW FROM MONGO\n"
+    remote = {
+        "name": "remote-newer",
+        "skill_md": body,
+        "content_hash": "sha256:new",
+        "updated_at": "2026-08-01T00:00:00+00:00",
+        "status": "ready",
+        "revision": 3,
+    }
+
+    storage = MagicMock()
+    storage.skills.get_skill.return_value = remote
+
+    def _materialize(name, dest_dir):
+        root = Path(dest_dir) / name
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "SKILL.md").write_text(body, encoding="utf-8")
+        return root
+
+    storage.skills.materialize.side_effect = _materialize
+    monkeypatch.setattr("hermes_storage.is_mongo_mode", lambda: True)
+    monkeypatch.setattr("hermes_storage.require_storage", lambda: storage)
+    monkeypatch.setattr(ss, "mongo_skills_cache_dir", lambda: cache)
+
+    assert ss.ensure_skill_fresh_from_mongo("remote-newer") is True
+    assert (skill / "SKILL.md").read_text(encoding="utf-8") == body
+    assert (skill / ".mongo_content_hash").read_text(encoding="utf-8") == "sha256:new"
+    assert ss.ensure_skill_fresh_from_mongo("remote-newer") is False

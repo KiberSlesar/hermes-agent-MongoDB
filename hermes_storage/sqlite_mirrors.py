@@ -6,6 +6,10 @@ first (fail-hard) so fleets do not split brain.
 
 Cron is wired in ``cron/jobs.py``. Other ledgers call these helpers from their
 mutation paths.
+
+Follow-up (kanban/projects purity): replace dual SQLite+mirror with
+Mongo-primary ledgers or a mandatory flush contract — tracked separately
+from skill/outbox hardening.
 """
 
 from __future__ import annotations

@@ -100,8 +100,20 @@ def ensure_indexes(shared_db: Any, profile_db: Any) -> None:
         shared_db["cluster_nodes"].create_index("heartbeat_at")
         # _id is already uniquely indexed by Mongo — do not create_index("_id")
         shared_db["skills"].create_index("name", unique=True)
+        shared_db["skills"].create_index("status")
+        shared_db["skills"].create_index("updated_at")
         shared_db["settings"].create_index("key", unique=True)
         shared_db["knowledge"].create_index("key", unique=True)
+        shared_db["wiki_pages"].create_index("slug", unique=True)
+        shared_db["wiki_pages"].create_index("tags")
+        shared_db["wiki_pages"].create_index("updated_at")
+        try:
+            shared_db["wiki_pages"].create_index(
+                [("title", "text"), ("body", "text"), ("tags", "text")]
+            )
+        except Exception:
+            # Text index may already exist under another name
+            pass
         shared_db["agent_registry"].create_index("machine_id", unique=True)
         shared_db["agent_registry"].create_index("cert_cn", unique=True, sparse=True)
 
@@ -111,9 +123,14 @@ def ensure_indexes(shared_db: Any, profile_db: Any) -> None:
         profile_db["memories"].create_index("key", unique=True)
         profile_db["sessions"].create_index("session_id", unique=True)
         profile_db["sessions"].create_index([("source", 1), ("started_at", -1)])
+        profile_db["sessions"].create_index([("archived", 1), ("updated_at", -1)])
         profile_db["messages"].create_index([("session_id", 1), ("message_index", 1)], unique=True)
+        profile_db["messages"].create_index([("session_id", 1), ("active", 1)])
         profile_db["messages"].create_index([("content", "text")])
         profile_db["gateway_routing"].create_index([("scope", 1), ("key", 1)], unique=True)
         profile_db["machines"].create_index("machine_id", unique=True)
+        profile_db["cron_jobs"].create_index("key", unique=True)
+        profile_db["cron_executions"].create_index([("created_at", -1)])
+        profile_db["cron_executions"].create_index("job_id")
     except Exception as exc:
         logger.warning("Failed to ensure Mongo indexes: %s", exc)

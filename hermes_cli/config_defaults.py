@@ -3010,6 +3010,12 @@ DEFAULT_CONFIG = {
         "region": "global",
     },
 
+    # Mongo fleet: URL this node advertises for control-plane chat proxy.
+    # Prefer HERMES_API_BASE env on each agent PC; this is the config.yaml fallback.
+    "cluster": {
+        "api_base": "",
+    },
+
     # Config schema version - bump this when adding new required fields
     "_config_version": 33,
 }
@@ -4178,6 +4184,27 @@ OPTIONAL_ENV_VARS = {
     "HERMES_EPHEMERAL_SYSTEM_PROMPT": {
         "description": "Ephemeral system prompt injected at API-call time (never persisted to sessions)",
         "prompt": "Ephemeral system prompt",
+        "url": None,
+        "password": False,
+        "category": "setting",
+    },
+    "HERMES_API_BASE": {
+        "description": "Public URL of this node's hermes serve for fleet chat proxy (e.g. http://192.168.1.10:9119)",
+        "prompt": "Fleet chat API base URL",
+        "url": None,
+        "password": False,
+        "category": "setting",
+    },
+    "HERMES_FLEET_PROXY_SECRET": {
+        "description": "Shared secret so control-plane can proxy /api/ws to agents (also store in Mongo secrets)",
+        "prompt": "Fleet proxy shared secret",
+        "url": None,
+        "password": True,
+        "category": "setting",
+    },
+    "HERMES_CONTROL_PLANE": {
+        "description": "Set to 1 on the Mongo-adjacent dashboard: chat proxies to messaging owner",
+        "prompt": "Control plane mode (1/0)",
         "url": None,
         "password": False,
         "category": "setting",

@@ -78,9 +78,26 @@ class MongoSecretsStore(SecretsStore):
         return self.get_all().get(name)
 
     def set(self, name: str, value: str) -> None:
-        values = self.get_all()
-        values[name] = value
-        self.set_many(values)
+        # Field-level update — avoids lost updates when two nodes write
+        # different keys concurrently (read-modify-set_many would race).
+        self._col.update_one(
+            {"key": "env"},
+            {
+                "$set": {
+                    "key": "env",
+                    f"values.{name}": str(value),
+                    "updated_at": utcnow(),
+                }
+            },
+            upsert=True,
+        )
+
+    def unset(self, name: str) -> bool:
+        result = self._col.update_one(
+            {"key": "env"},
+            {"$unset": {f"values.{name}": ""}, "$set": {"updated_at": utcnow()}},
+        )
+        return bool(result.modified_count)
 
 
 class MongoMemoryEntriesStore(MemoryEntriesStore):
@@ -121,13 +138,27 @@ class MongoSkillsStore(SkillsStore):
 
             self._fs = GridFS(db, collection="skills_fs")
 
-    def list_skills(self) -> list[dict[str, Any]]:
-        return [_strip_id(d) or {} for d in self._col.find().sort("name", 1)]
+    def list_skills(
+        self, *, include_archived: bool = False, statuses: Optional[list[str]] = None
+    ) -> list[dict[str, Any]]:
+        query: dict[str, Any] = {}
+        if statuses:
+            query["status"] = {"$in": list(statuses)}
+        elif not include_archived:
+            # Default: ready + draft + legacy docs without status.
+            # Archived skills stay in Mongo but are not materialized.
+            query["$or"] = [
+                {"status": {"$exists": False}},
+                {"status": {"$nin": ["archived"]}},
+            ]
+        return [_strip_id(d) or {} for d in self._col.find(query).sort("name", 1)]
 
     def get_skill(self, name: str) -> Optional[dict[str, Any]]:
         return _strip_id(self._col.find_one({"name": name}))
 
     def put_skill(self, skill: dict[str, Any], files: Optional[dict[str, bytes]] = None) -> None:
+        import hashlib
+
         name = skill["name"]
         file_ids: dict[str, Any] = {}
         if files:
@@ -137,11 +168,27 @@ class MongoSkillsStore(SkillsStore):
             for rel, data in files.items():
                 fid = self._fs.put(data, filename=f"{name}/{rel}", skill=name)
                 file_ids[rel] = fid
-        doc = dict(skill)
-        doc["updated_at"] = utcnow()
+        body = str(skill.get("skill_md") or skill.get("body") or "")
+        content_hash = skill.get("content_hash") or (
+            "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+        )
+        now = utcnow()
+        set_doc = dict(skill)
+        set_doc.pop("revision", None)  # owned by $inc
+        set_doc["name"] = name
+        set_doc["skill_md"] = body
+        set_doc["content_hash"] = content_hash
+        set_doc["updated_at"] = now
+        if not set_doc.get("status"):
+            set_doc["status"] = "ready"
         if file_ids:
-            doc["file_ids"] = {k: str(v) for k, v in file_ids.items()}
-        self._col.update_one({"name": name}, {"$set": doc}, upsert=True)
+            set_doc["file_ids"] = {k: str(v) for k, v in file_ids.items()}
+        # Monotonic revision; $inc is applied separately from $set.
+        self._col.update_one(
+            {"name": name},
+            {"$set": set_doc, "$inc": {"revision": 1}},
+            upsert=True,
+        )
 
     def delete_skill(self, name: str) -> bool:
         for old in self._fs.find({"filename": {"$regex": f"^{re.escape(name)}/"}}):
@@ -266,11 +313,27 @@ class MongoSessionStore(SessionStore):
         self.update_session(session_id, ended_at=utcnow(), end_reason=end_reason)
 
     def append_message(self, session_id: str, role: str, content: Any = None, **kwargs: Any) -> int:
-        last = self._messages.find_one(
+        # Atomic next index via session meta counter — avoids duplicate
+        # message_index under concurrent writers (find-last + insert races).
+        from pymongo import ReturnDocument
+
+        result = self._sessions.find_one_and_update(
             {"session_id": session_id},
-            sort=[("message_index", -1)],
+            {
+                "$inc": {"next_message_index": 1},
+                "$set": {"updated_at": utcnow()},
+                "$setOnInsert": {
+                    "session_id": session_id,
+                    "source": kwargs.get("source") or "unknown",
+                    "started_at": utcnow(),
+                },
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
         )
-        idx = int(last["message_index"]) + 1 if last else 0
+        # After $inc, next_message_index is the *next* free slot; use prior value.
+        next_idx = int((result or {}).get("next_message_index") or 1)
+        idx = max(0, next_idx - 1)
         doc = {
             "session_id": session_id,
             "message_index": idx,
@@ -278,13 +341,26 @@ class MongoSessionStore(SessionStore):
             "content": content,
             "created_at": utcnow(),
             "active": True,
-            **kwargs,
+            **{k: v for k, v in kwargs.items() if k != "source"},
         }
-        self._messages.insert_one(doc)
-        self._sessions.update_one(
-            {"session_id": session_id},
-            {"$set": {"updated_at": utcnow()}},
-        )
+        try:
+            self._messages.insert_one(doc)
+        except Exception as exc:
+            # Unique index collision — recover by syncing counter from max index.
+            name = type(exc).__name__
+            if "DuplicateKey" not in name and "duplicate" not in str(exc).lower():
+                raise
+            last = self._messages.find_one(
+                {"session_id": session_id},
+                sort=[("message_index", -1)],
+            )
+            idx = int(last["message_index"]) + 1 if last else 0
+            self._sessions.update_one(
+                {"session_id": session_id},
+                {"$set": {"next_message_index": idx + 1, "updated_at": utcnow()}},
+            )
+            doc["message_index"] = idx
+            self._messages.insert_one(doc)
         return idx
 
     def get_messages(self, session_id: str, *, include_inactive: bool = False) -> list[dict[str, Any]]:

@@ -16,6 +16,33 @@ There are **two installers** in this project:
 | 27017–27019 | MongoDB RS | X.509 (or SCRAM lab fallback) |
 | **8744** | **Orchestrator API** | **mTLS — client cert required or connection dropped** |
 | 8743 | Enroll (one-time code) | Code only (pre-cert bootstrap) |
+| **9119** | **Fleet web UI** (`hermes control-plane`) | Dashboard auth; chat WS proxied to active agent |
+
+### Fleet web UI (chat follows active agent)
+
+On the Mongo-adjacent server:
+
+```bash
+export HERMES_FLEET_PROXY_SECRET='long-random-shared-secret'
+# same secret in Mongo secrets / agent env
+hermes control-plane --host 0.0.0.0 --port 9119
+```
+
+On each agent PC (always-on):
+
+```bash
+export HERMES_API_BASE='http://192.168.1.10:9119'   # reachable from control plane
+export HERMES_FLEET_PROXY_SECRET='long-random-shared-secret'
+hermes serve --host 0.0.0.0 --port 9119
+```
+
+Browser opens the control-plane UI; Chat uses `/api/fleet/ws` → messaging owner's serve
+(short-lived HMAC tickets over `Authorization: Bearer`, never the dashboard loopback token).
+Activate agents on System page as before (`hermes cluster activate` / dashboard buttons).
+
+Agents without `api_base` still own Telegram after activate, but web chat shows “not ready”.
+After activate / handoff, the Chat tab polls `messaging_owner` and reconnects the proxy automatically.
+
 
 Agents call `https://<server>:8744/cluster/*` with the same `agent.pem` used for Mongo.
 Without that cert the TLS handshake fails — no anonymous orchestrator access.

@@ -4687,11 +4687,45 @@ def cmd_storage(args):
         except Exception:
             pass
         try:
+            from hermes_constants import get_hermes_home
+
+            home = get_hermes_home()
+            orphan = home / ".orphan"
+            leftovers = []
+            for name in ("config.yaml", ".env", "SOUL.md", "auth.json", "state.db", "skills", "memories"):
+                if (home / name).exists():
+                    leftovers.append(name)
+            if leftovers:
+                print(f"  classic leftovers (should scrub): {', '.join(leftovers)}")
+            if orphan.is_dir():
+                print(f"  orphan quarantine: {orphan} ({sum(1 for _ in orphan.iterdir())} entries)")
+            stamp = home / "cache" / "skills" / ".mongo_skills_stamp"
+            if stamp.is_file():
+                fp = stamp.read_text(encoding="utf-8").strip()
+                print(f"  skills sync stamp: {fp[:80]}{'…' if len(fp) > 80 else ''}")
+        except Exception:
+            pass
+        try:
             storage = get_storage(force=True)
             storage.client.admin.command("ping")
             print("  connection: OK")
             print(f"  machine_id: {storage.machine_id}")
             print(f"  node_id: {storage.node_id}")
+            try:
+                state = storage.cluster.get_state() or {}
+                owner = state.get("messaging_owner") or state.get("active_node_id")
+                print(f"  messaging owner: {owner or '—'}")
+            except Exception:
+                pass
+            # Index health probe
+            try:
+                idx_ok = True
+                for col_name in ("skills", "sessions", "messages", "cron_jobs"):
+                    db = storage.shared_db if col_name == "skills" else storage.profile_db
+                    list(db[col_name].list_indexes())
+                print("  indexes: OK")
+            except Exception as idx_exc:
+                print(f"  indexes: WARN ({idx_exc})")
             print("")
             from hermes_cli.mongo_cmds import collect_mongo_inventory, format_mongo_inventory
 
@@ -4819,13 +4853,7 @@ def cmd_machine(args):
         if not isinstance(data, dict):
             print("Overlay file must contain a mapping/object")
             raise SystemExit(1)
-        storage.machines.set_overlay(mid, data)
-        try:
-            from hermes_cli.config import _invalidate_load_config_cache
-
-            _invalidate_load_config_cache()
-        except Exception:
-            pass
+        storage.save_machine_overlay(mid, data)
         print(f"Updated overlay for {mid}")
         return
     print("usage: hermes machine <show|list|set-overlay>")
@@ -4854,7 +4882,7 @@ def cmd_db(args):
 
 
 def cmd_mongo(args):
-    """MongoDB inventory: hermes mongo status | seed-skills."""
+    """MongoDB inventory: hermes mongo status | seed-skills | inspect-skill."""
     sub = getattr(args, "mongo_command", None) or "status"
     if sub == "status":
         from hermes_cli.mongo_cmds import cmd_mongo_status
@@ -4864,8 +4892,19 @@ def cmd_mongo(args):
         from hermes_cli.mongo_cmds import cmd_mongo_seed_skills
 
         raise SystemExit(cmd_mongo_seed_skills())
-    print("usage: hermes mongo status [--json] | hermes mongo seed-skills")
+    if sub == "inspect-skill":
+        from hermes_cli.mongo_cmds import cmd_mongo_inspect_skill
+
+        raise SystemExit(cmd_mongo_inspect_skill(getattr(args, "name", "") or ""))
+    print("usage: hermes mongo status [--json] | hermes mongo seed-skills | hermes mongo inspect-skill <name>")
     raise SystemExit(2)
+
+
+def cmd_wiki(args):
+    """Fleet wiki pages in Mongo."""
+    from hermes_cli.wiki_cmds import cmd_wiki as _cmd_wiki
+
+    _cmd_wiki(args)
 
 
 def cmd_cron(args):
@@ -10689,6 +10728,23 @@ def cmd_dashboard(args):
     # fail-closed SystemExit unchanged.
     _maybe_setup_dashboard_auth_interactively(args)
 
+    # Control-plane mode: chat proxies to messaging owner's hermes serve.
+    if getattr(args, "control_plane", False) or os.environ.get(
+        "HERMES_CONTROL_PLANE", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}:
+        os.environ["HERMES_CONTROL_PLANE"] = "1"
+        print("→ Control plane mode: chat follows messaging_owner via /api/fleet/ws")
+
+    # Advertise presence so fleet sees this node's api_base (serve/dashboard).
+    try:
+        from hermes_storage import is_mongo_mode
+        from hermes_storage.cluster import start_heartbeat_loop
+
+        if is_mongo_mode():
+            start_heartbeat_loop()
+    except Exception:
+        logger.debug("Cluster heartbeat at dashboard start failed", exc_info=True)
+
     # The in-browser Chat tab (the embedded TUI over PTY/WebSocket) is always
     # available — the desktop app and the dashboard's own Chat tab both rely on
     # the `/api/ws` + `/api/pty` sockets, so there is no reason to gate them.
@@ -10795,16 +10851,17 @@ _BUILTIN_SUBCOMMANDS = frozenset(
     {
         "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
-        "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
+        "config", "console", "control-plane", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
-        "model", "monitoring", "pairing", "pets", "plugins", "portal", "profile",
+        "model", "monitoring", "mongo", "pairing", "pets", "plugins", "portal", "profile",
         "project", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
-        "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
-        "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
+        "skin", "skills", "slack", "status", "storage", "sync", "tools", "uninstall", "update",
+        "version", "webhook", "whatsapp", "whatsapp-cloud", "wiki", "chat", "secrets", "security",
+        "cluster", "machine", "agent", "db",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
         # expensive eager import of every bundled plugin module.
@@ -11668,6 +11725,9 @@ def main():
     build_agent_parser(subparsers, cmd_agent=cmd_agent)
     build_db_parser(subparsers, cmd_db=cmd_db)
     build_mongo_parser(subparsers, cmd_mongo=cmd_mongo)
+    from hermes_cli.wiki_cmds import build_wiki_parser
+
+    build_wiki_parser(subparsers, cmd_wiki=cmd_wiki)
 
     # =========================================================================
     # cron command  (parser built in hermes_cli/subcommands/cron.py)

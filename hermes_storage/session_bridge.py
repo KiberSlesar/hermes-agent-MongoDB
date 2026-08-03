@@ -6,9 +6,11 @@ import hashlib
 import logging
 import re
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from hermes_storage.backend import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -529,11 +531,77 @@ class MongoSessionAdapter:
         return cleaned
 
     def maybe_auto_archive(self, **kwargs) -> int:
-        """Retention not yet ported to Mongo — no-op (0 archived)."""
-        return 0
+        """Soft-archive sessions idle for ``idle_days`` (Mongo retention)."""
+        idle_days = float(kwargs.get("idle_days") or kwargs.get("days") or 30)
+        if idle_days <= 0:
+            return 0
+        cutoff = datetime.now(timezone.utc) - timedelta(days=idle_days)
+        archived = 0
+        for session in self._store.list_sessions(limit=int(kwargs.get("limit") or 500)):
+            if session.get("archived"):
+                continue
+            updated = session.get("updated_at") or session.get("ended_at") or session.get("started_at")
+            if updated is None:
+                continue
+            if hasattr(updated, "tzinfo") and updated.tzinfo is None:
+                updated = updated.replace(tzinfo=timezone.utc)
+            try:
+                if updated >= cutoff:
+                    continue
+            except TypeError:
+                continue
+            sid = session.get("session_id")
+            if not sid:
+                continue
+            self._store.update_session(sid, archived=True, archived_at=utcnow())
+            archived += 1
+        return archived
 
     def list_prune_candidates(self, **kwargs) -> List[Dict[str, Any]]:
-        return []
+        idle_days = float(kwargs.get("older_than_days") or kwargs.get("idle_days") or 30)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=idle_days) if idle_days > 0 else None
+        archived_filter = kwargs.get("archived")  # None | True | False
+        out: List[Dict[str, Any]] = []
+        for session in self._store.list_sessions(limit=int(kwargs.get("limit") or 500)):
+            is_archived = bool(session.get("archived"))
+            if archived_filter is True and not is_archived:
+                continue
+            if archived_filter is False and is_archived:
+                continue
+            updated = session.get("updated_at") or session.get("ended_at") or session.get("started_at")
+            if cutoff is not None and updated is not None and not is_archived:
+                ts = updated
+                if hasattr(ts, "tzinfo") and ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                try:
+                    if ts >= cutoff:
+                        continue
+                except TypeError:
+                    pass
+            out.append(
+                {
+                    "id": session.get("session_id"),
+                    "session_id": session.get("session_id"),
+                    "title": session.get("title") or "",
+                    "source": session.get("source"),
+                    "updated_at": updated,
+                    "ended_at": session.get("ended_at"),
+                    "message_count": session.get("message_count"),
+                    "archived": is_archived,
+                }
+            )
+        return out
+
+    def set_session_archived(self, session_id: str, archived: bool) -> bool:
+        if not self._store.get_session(session_id):
+            return False
+        fields: Dict[str, Any] = {"archived": bool(archived)}
+        if archived:
+            fields["archived_at"] = utcnow()
+        else:
+            fields["archived_at"] = None
+        self._store.update_session(session_id, **fields)
+        return True
 
     def get_next_title_in_lineage(self, base: str, **kwargs) -> str:
         existing = [

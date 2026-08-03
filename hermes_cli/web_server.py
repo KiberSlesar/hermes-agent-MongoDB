@@ -4700,6 +4700,9 @@ app.include_router(_sessions_routes.list_router)
 from hermes_cli.web_routers import cluster as _cluster_routes  # noqa: E402
 
 app.include_router(_cluster_routes.router)
+from hermes_cli.web_routers import fleet as _fleet_routes  # noqa: E402
+
+app.include_router(_fleet_routes.router)
 from hermes_cli.web_routers.sessions import (  # noqa: E402,F401 — legacy re-exports; tests call these via web_server.<name>
     get_sessions,
 )
@@ -14498,6 +14501,31 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     issues from the log.
     """
     auth_required = bool(getattr(app.state, "auth_required", False))
+
+    # Fleet control-plane proxy: shared secret (never injected into SPA).
+    fleet_q = ws.query_params.get("fleet_proxy", "")
+    if fleet_q:
+        try:
+            from hermes_storage.fleet_proxy_auth import verify_fleet_proxy_credential
+
+            if verify_fleet_proxy_credential(fleet_q):
+                return None, "fleet_proxy"
+        except Exception:
+            pass
+    auth_header = ""
+    try:
+        auth_header = ws.headers.get("authorization") or ws.headers.get("Authorization") or ""
+    except Exception:
+        auth_header = ""
+    if auth_header.lower().startswith("bearer "):
+        try:
+            from hermes_storage.fleet_proxy_auth import verify_fleet_proxy_credential
+
+            if verify_fleet_proxy_credential(auth_header[7:].strip()):
+                return None, "fleet_proxy"
+        except Exception:
+            pass
+
     if auth_required:
         # Lazy import — keeps this function importable in test harnesses
         # that don't bring in the dashboard_auth layer.
@@ -15895,12 +15923,17 @@ def mount_spa(application: FastAPI):
         chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
         gated = bool(getattr(app.state, "auth_required", False))
         gated_js = "true" if gated else "false"
+        cp = os.environ.get("HERMES_CONTROL_PLANE", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        cp_js = "true" if cp else "false"
         if gated:
             bootstrap_script = (
                 f"<script>"
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
+                f"window.__HERMES_CONTROL_PLANE__={cp_js};"
                 f"</script>"
             )
         else:
@@ -15909,6 +15942,7 @@ def mount_spa(application: FastAPI):
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
+                f"window.__HERMES_CONTROL_PLANE__={cp_js};"
                 f"</script>"
             )
         if prefix:
@@ -17306,6 +17340,31 @@ def start_server(
 
             actual_port = _read_bound_port(server, fallback=port)
             app.state.bound_port = actual_port
+
+            # Advertise this bind for Mongo fleet chat proxy (control plane).
+            try:
+                from hermes_storage.api_base import (
+                    normalize_api_base,
+                    resolve_advertise_api_base,
+                    set_process_api_base,
+                )
+
+                existing = resolve_advertise_api_base()
+                if existing:
+                    set_process_api_base(existing)
+                else:
+                    # Prefer a non-loopback bind as-is; for 0.0.0.0 use hostname.
+                    adv_host = host
+                    if host in ("0.0.0.0", "::", "[::]"):
+                        import socket as _sock
+
+                        adv_host = _sock.gethostname()
+                    scheme = "https" if bool(app.state.auth_required) else "http"
+                    set_process_api_base(
+                        normalize_api_base(f"{scheme}://{adv_host}:{actual_port}")
+                    )
+            except Exception:
+                _log.debug("api_base advertise failed", exc_info=True)
 
             _write_dashboard_ready_file(actual_port)
             # Port-discovery sentinel parsed by the desktop spawn. `serve` is a

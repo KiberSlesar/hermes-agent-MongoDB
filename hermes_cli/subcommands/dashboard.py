@@ -169,6 +169,27 @@ def build_dashboard_parser(
     # unset and serves the browser UI as before.
     serve_parser.set_defaults(func=cmd_dashboard, no_open=True, headless_backend=True)
 
+    # =========================================================================
+    # control-plane — dashboard near Mongo; chat proxies to messaging owner
+    # =========================================================================
+    cp_parser = subparsers.add_parser(
+        "control-plane",
+        help="Fleet control-plane UI (near Mongo; chat follows active agent)",
+        description=(
+            "Run the Hermes web UI as a fleet control plane. Cluster activate, "
+            "wiki, and status live here; Chat WebSocket is proxied to the "
+            "messaging owner's hermes serve (requires HERMES_FLEET_PROXY_SECRET "
+            "on control plane and agents, and HERMES_API_BASE on each agent)."
+        ),
+    )
+    _add_server_runtime_args(cp_parser)
+    cp_parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Don't open a browser automatically",
+    )
+    cp_parser.set_defaults(func=cmd_dashboard, control_plane=True)
+
     # `hermes dashboard register` — register a self-hosted dashboard OAuth
     # client with Nous Portal and write the client_id into ~/.hermes/.env.
     # Nested subparser so bare `hermes dashboard` keeps launching the server

@@ -54,7 +54,7 @@ export class GatewayClient extends JsonRpcGatewayClient {
       buildHermesWebSocketUrl({
         authParam,
         basePath: HERMES_BASE_PATH,
-        path: "/api/ws",
+        path: window.__HERMES_CONTROL_PLANE__ ? "/api/fleet/ws" : "/api/ws",
       }),
     );
   }

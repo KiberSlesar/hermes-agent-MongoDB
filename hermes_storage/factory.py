@@ -36,6 +36,7 @@ class HermesStorage:
     cluster: Any
     machine_id: str
     node_id: str
+    wiki: Any = None
 
     def load_effective_config(self, base: Optional[dict] = None) -> dict:
         """shared settings ⊕ profile config ⊕ machine overlay."""
@@ -69,6 +70,23 @@ class HermesStorage:
         run_or_enqueue(
             KIND_PROFILE_CONFIG,
             {"config": cleaned},
+            _apply,
+        )
+
+    def save_machine_overlay(self, machine_id: str, overlay: dict) -> None:
+        """Persist a machine overlay through the outbox-aware path."""
+        from hermes_storage.outbox import KIND_MACHINE_OVERLAY, run_or_enqueue
+
+        mid = str(machine_id or self.machine_id)
+        data = dict(overlay or {})
+
+        def _apply() -> None:
+            self.machines.set_overlay(mid, data)
+            self._invalidate_config_readers()
+
+        run_or_enqueue(
+            KIND_MACHINE_OVERLAY,
+            {"overlay": data, "machine_id": mid},
             _apply,
         )
 
@@ -167,8 +185,11 @@ class HermesStorage:
             self._put_machine_secrets(local)
             profile = dict(self.secrets.get_all() or {})
             if key in profile:
-                del profile[key]
-                self.secrets.set_many(profile)
+                if hasattr(self.secrets, "unset"):
+                    self.secrets.unset(key)
+                else:
+                    profile.pop(key, None)
+                    self.secrets.set_many(profile)
             self._sync_process_env_after_secret_write({str(key): str(value)})
             return
         self.secrets.set(key, value)
@@ -199,8 +220,11 @@ class HermesStorage:
                 found = True
         profile = dict(self.secrets.get_all() or {})
         if key in profile:
-            del profile[key]
-            self.secrets.set_many(profile)
+            if hasattr(self.secrets, "unset"):
+                self.secrets.unset(key)
+            else:
+                profile.pop(key, None)
+                self.secrets.set_many(profile)
             found = True
         if found:
             try:
@@ -311,6 +335,77 @@ class HermesStorage:
             lambda: self.soul.put({"content": text}),
         )
 
+    def put_wiki_page(
+        self,
+        *,
+        title: str,
+        body: str,
+        slug: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+    ) -> dict:
+        from hermes_storage.outbox import KIND_WIKI_PUT, run_or_enqueue
+        from hermes_storage.wiki import slugify
+
+        page_slug = slugify(slug or title)
+        tag_list = list(tags or [])
+        text = str(body or "")
+        title_s = str(title or page_slug)
+        result: dict = {}
+
+        def _apply() -> None:
+            store = self.wiki
+            if store is None:
+                raise RuntimeError("wiki store not available")
+            result["page"] = store.put_page(
+                title=title_s,
+                body=text,
+                slug=page_slug,
+                tags=tag_list,
+                updated_by=self.machine_id,
+            )
+
+        status = run_or_enqueue(
+            KIND_WIKI_PUT,
+            {
+                "slug": page_slug,
+                "title": title_s,
+                "body": text,
+                "tags": tag_list,
+                "updated_by": self.machine_id,
+            },
+            _apply,
+        )
+        if status.get("queued"):
+            return {
+                "slug": page_slug,
+                "title": title_s,
+                "body": text,
+                "tags": tag_list,
+                "queued": True,
+            }
+        return result.get("page") or {"slug": page_slug}
+
+    def delete_wiki_page(self, slug: str) -> bool:
+        from hermes_storage.outbox import KIND_WIKI_DELETE, run_or_enqueue
+        from hermes_storage.wiki import slugify
+
+        page_slug = slugify(slug)
+        result = {"deleted": False}
+
+        def _apply() -> None:
+            if self.wiki is None:
+                raise RuntimeError("wiki store not available")
+            result["deleted"] = bool(self.wiki.delete_page(page_slug))
+
+        status = run_or_enqueue(
+            KIND_WIKI_DELETE,
+            {"slug": page_slug},
+            _apply,
+        )
+        if status.get("queued"):
+            return True
+        return bool(result["deleted"])
+
     def register_presence(
         self,
         *,
@@ -347,12 +442,20 @@ class HermesStorage:
     def cluster_status(self) -> dict[str, Any]:
         state = self.cluster.get_state()
         nodes = self.cluster.list_nodes()
+        # Annotate chat readiness from advertised api_base (no live probe here —
+        # control plane probes on /api/fleet/active-chat).
+        enriched = []
+        for node in nodes:
+            row = dict(node)
+            api = str(row.get("api_base") or "").strip()
+            row["chat_ready"] = bool(api)
+            enriched.append(row)
         return {
             "profile": self.bootstrap.profile,
             "this_node_id": self.node_id,
             "this_machine_id": self.machine_id,
             "state": state,
-            "nodes": nodes,
+            "nodes": enriched,
         }
 
     def activate(
@@ -405,6 +508,7 @@ def _build_storage(boot: BootstrapConfig) -> HermesStorage:
         MongoSessionStore,
         MongoSkillsStore,
     )
+    from hermes_storage.wiki import MongoWikiStore
 
     client = get_client(boot.mongo_uri)
     shared = client[boot.shared_db]
@@ -433,6 +537,7 @@ def _build_storage(boot: BootstrapConfig) -> HermesStorage:
         cluster=MongoClusterStore(shared),
         machine_id=machine_id,
         node_id=node_id,
+        wiki=MongoWikiStore(shared["wiki_pages"]),
     )
 
 

@@ -27,6 +27,9 @@ _SCRUB_FILES = (
     ".env",
     "SOUL.md",
     "auth.json",
+    "state.db",
+    "state.db-wal",
+    "state.db-shm",
 )
 _SCRUB_DIRS = (
     "memories",
