@@ -5,11 +5,101 @@
 > резервных копий и собственной проверки.
 
 Форк [Nous Research Hermes Agent](https://github.com/NousResearch/hermes-agent):
-«мозг» агента в **self-hosted MongoDB** на сервере; на ПК — `bootstrap.yaml` +
-сертификаты (и локальный runtime Hermes).
+агентский runtime остаётся на домашних ПК, а **долговечное состояние**
+(конфиг, память, скиллы, сессии, флот) живёт в **self-hosted MongoDB** на
+сервере. На ПК после enroll нужны в основном `bootstrap.yaml` + сертификаты.
 
 Полные доки Hermes: [оригинал](https://github.com/NousResearch/hermes-agent) /
 [docs](https://hermes-agent.nousresearch.com/docs/).
+
+## Что меняется относительно классического Hermes
+
+| | Классика (`~/.hermes`) | Этот форк (Mongo) |
+|--|----------------------|-------------------|
+| Источник правды | файлы на диске ПК | MongoDB на сервере |
+| Несколько ПК | независимые копии | один профиль / флот, handoff messaging |
+| Память / soul / secrets | `MEMORY.md`, `SOUL.md`, `.env` | коллекции профиля в Mongo |
+| Skills | только локальная папка | shared Mongo + GridFS, кэш на ПК |
+| Справочник инфраструктуры | часто пихали в skills / MEMORY | отдельный **fleet wiki** |
+| Веб | `hermes dashboard` на том же ПК, что и агент | **control-plane UI у Mongo** + чат на активном агенте |
+
+Локально в Mongo-режиме не правят `config.yaml` / `MEMORY.md` «как SoT» —
+они либо кэш, либо путь миграции. Пишите через CLI / tools / веб; при обрыве
+Mongo durable-записи могут уйти в локальный outbox и догрузиться позже.
+
+## Где что хранится
+
+### Mongo
+
+| Что | Где | Зачем |
+|-----|-----|--------|
+| Общие настройки флота | `hermes_shared.settings` | модель, политики, то что общее для ПК |
+| Конфиг профиля | `hermes_profile_<name>.config` | профиль агента |
+| Secrets / API keys | profile `secrets` | не в git, не в wiki |
+| Личность | profile `soul` (SOUL) | кто агент |
+| Личная память | profile `memories` (MEMORY / USER) | предпочтения пользователя, личные факты |
+| Skills (как делать) | `hermes_shared` + GridFS | процедуры; на ПК — кэш `cache/skills` |
+| Wiki (что где лежит) | `hermes_shared.wiki_pages` | адреса, nginx, хосты, runbooks флота |
+| Сессии / сообщения | profile `sessions` / `messages` | история чатов |
+| Per-PC overlay | `machine_<id>` | cwd, docker, browser, локальный MCP |
+| Состояние флота | `hermes_shared` cluster | кто online, `messaging_owner`, `api_base` |
+
+Эффективный конфиг:
+
+```
+shared.settings ⊕ profile.config ⊕ machine_<id> overlay
+```
+
+### Роли «памяти» — не смешивать
+
+| Слой | Хранит | Не хранит |
+|------|--------|-----------|
+| **MEMORY / USER** | личные предпочтения, факты о пользователе | IP/nginx/флот-справочник |
+| **Skills** | *как* делать (процедуры, шаги) | длинные списки адресов |
+| **Wiki** | *что/где* (хосты, URL, порты, runbooks) | пароли, личные секреты |
+| **SOUL** | характер / роль агента | операционные факты инфраструктуры |
+
+CLI для wiki: `hermes wiki list|show|put|search|delete`.
+
+### На агент-ПК (локально)
+
+```
+$HERMES_HOME/bootstrap.yaml     # URI / enroll
+$HERMES_HOME/certs/             # ca.crt, agent.pem
+$HERMES_HOME/cache/             # skills cache, mongo outbox, …
+$HERMES_HOME/logs/              # логи
+```
+
+## Веб-интерфейс (control plane)
+
+Один веб рядом с Mongo — **пульт флота**, а не второй агентский loop на сервере.
+
+- **System / cluster:** статус узлов, activate (messaging owner)
+- **Wiki:** просмотр / сохранение справочных страниц
+- **Chat:** JSON-RPC через прокси `/api/fleet/ws` → `hermes serve` **активного**
+  агента (`messaging_owner`). После handoff UI переподключается сам.
+
+На DB-сервере (после установки агентского runtime на эту же машину или с
+доступа к `hermes`):
+
+```bash
+export HERMES_FLEET_PROXY_SECRET='<shared-secret>'
+hermes control-plane --host 0.0.0.0 --port 9119
+```
+
+На каждом агент-ПК (чат должен быть доступен с control plane по сети/VPN):
+
+```bash
+export HERMES_API_BASE='http://<agent-lan-ip>:9119'
+export HERMES_FLEET_PROXY_SECRET='<shared-secret>'   # тот же секрет
+hermes serve --host 0.0.0.0 --port 9119
+```
+
+Браузер → `http://<db-server>:9119`. Без `api_base` узел может владеть
+Telegram после activate, но веб-чат покажет «not ready».
+
+Порты control plane: `27017` Mongo, `8743` enroll, `8744` orchestrator (mTLS),
+`9119` веб (по умолчанию).
 
 ## Install
 
@@ -25,15 +115,14 @@ curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/ma
 - MongoDB Community (apt) + single-node replica set
 - systemd user: `hermes-mongod`, `hermes-enroll` (:8743), `hermes-orchestrator` (:8744 mTLS)
 
-После установки на сервере создайте одноразовый код для нового ПК:
+После установки создайте одноразовый код для нового ПК:
 
 ```bash
 agent-add <agent-name>
 ```
 
-Пример: `agent-add home-pc`. Команда выведет адрес control plane и готовую
-команду подключения. `agent-add` и `agents` добавляются в `PATH` для новых
-установок.
+Пример: `agent-add home-pc`. Команда выведет адрес control plane и команду
+подключения. `agent-add` / `agents` попадают в `PATH`.
 
 ### 2) Агент-ПК
 
@@ -49,13 +138,13 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/install-agent.ps1 | iex
 ```
 
-Подключите установленный агент кодом с DB-сервера:
+Подключение кодом с DB-сервера:
 
 ```bash
 hermes db connect --host <DB_SERVER_IP>:8743 --code <ONE_TIME_CODE>
 ```
 
-Установщик также предлагает это подключение интерактивно.
+Установщик может предложить это интерактивно.
 
 ### 3) Проверка
 
@@ -63,65 +152,47 @@ hermes db connect --host <DB_SERVER_IP>:8743 --code <ONE_TIME_CODE>
 # на DB
 systemctl --user status hermes-mongod hermes-enroll hermes-orchestrator
 
-# на агенте — сразу после install / db connect
+# на агенте
 hermes mongo status
-
-# mTLS к orchestrator
 hermes cluster status
 ```
 
-Открой фаервол при необходимости: `27017`, `8743`, `8744`.
+Фаервол при необходимости: `27017`, `8743`, `8744` (+ `9119` для веб).
 
 ## Update
 
-Данные (`HERMES_HOME` на агенте, Mongo data / certs / `.env` на DB) при
-обновлении сохраняются. Меняется runtime и скрипты control plane.
+Данные (`HERMES_HOME` на агенте; Mongo `data/` / `certs/` / `.env` на DB)
+сохраняются. Обновляется runtime и скрипты. **Та же команда**, что и для
+установки.
 
 ### Агент-ПК
 
-Повторно запустите тот же установщик. Если найден `bootstrap.yaml`, повторный
-`db connect` **не нужен** — по умолчанию установщик предлагает **n** (пропустить
-коннект). На замену runtime отвечайте **Y**.
+Повторный запуск установщика. Если есть `bootstrap.yaml`, повторный
+`db connect` не нужен (по умолчанию **n**). На замену runtime — **Y**.
 
-Linux (без вопросов — заменить runtime, не трогать коннект):
+Linux без вопросов:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/install-agent.sh \
   | HERMES_YES=1 HERMES_SKIP_CONNECT=1 bash
 ```
 
-Windows PowerShell:
+Windows:
 
 ```powershell
 $env:HERMES_YES = "1"; $env:HERMES_SKIP_CONNECT = "1"
 irm https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/install-agent.ps1 | iex
 ```
 
-После обновления:
-
-```bash
-hermes mongo status
-hermes cluster status
-```
-
 ### DB-сервер
-
-Снова выполните `installDB.sh` (тот же `curl | bash`). Скрипт обновит файлы
-control plane и unit’ы; каталоги `data/`, `certs/`, `bundles/` и `.env` не
-затираются. Затем проверьте сервисы:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/installDB.sh | bash
 systemctl --user daemon-reload
 systemctl --user restart hermes-mongod hermes-enroll hermes-orchestrator
-systemctl --user status hermes-mongod hermes-enroll hermes-orchestrator
 ```
 
-Новых агентов по-прежнему добавляйте так:
-
-```bash
-agent-add <agent-name>
-```
+Новый ПК по-прежнему: `agent-add <agent-name>`.
 
 ## License
 
