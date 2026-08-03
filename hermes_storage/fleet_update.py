@@ -429,25 +429,40 @@ def run_mongo_fork_install(desired: dict[str, Any]) -> int:
 
 
 def _restart_gateway_best_effort() -> None:
+    """Restart/start gateway after fleet apply.
+
+    Prefer ``gateway start``: after install-agent the process is already stopped,
+    and Windows ``restart`` via detached Popen often no-ops silently.
+    """
     import shutil
     import subprocess
     import sys
 
     hermes_bin = shutil.which("hermes")
+    # On Windows the launcher is hermes.cmd — prefer explicit start.
+    action = "start"
     if hermes_bin:
-        cmd = [hermes_bin, "gateway", "restart"]
+        cmd = [hermes_bin, "gateway", action]
     else:
-        cmd = [sys.executable, "-m", "hermes_cli.main", "gateway", "restart"]
+        cmd = [sys.executable, "-m", "hermes_cli.main", "gateway", action]
     try:
-        subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        logger.info("Requested gateway restart after fleet update: %s", cmd)
+        kwargs: dict = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if sys.platform == "win32":
+            # Detach so the updater process can exit without killing the gateway.
+            kwargs["creationflags"] = (
+                getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            )
+            kwargs["close_fds"] = True
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(cmd, **kwargs)
+        logger.info("Requested gateway %s after fleet update: %s", action, cmd)
     except Exception as exc:
-        logger.warning("Could not restart gateway after fleet update: %s", exc)
+        logger.warning("Could not start gateway after fleet update: %s", exc)
 
 
 def is_mongo_agent_install() -> bool:
