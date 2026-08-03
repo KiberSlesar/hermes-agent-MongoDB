@@ -1,6 +1,6 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # ============================================================================
-# Hermes DB — self-hosted installer (NO Docker)
+# Hermes DB вЂ” self-hosted installer (NO Docker)
 # ============================================================================
 # Native MongoDB + systemd user services for enroll (:8743) and
 # mTLS orchestrator (:8744). Ubuntu/Debian.
@@ -21,11 +21,11 @@ REPO="${HERMES_MONGO_REPO:-KiberSlesar/hermes-agent-MongoDB}"
 REF="${HERMES_MONGO_REF:-main}"
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'; BOLD=$'\033[1m'; NC=$'\033[0m'
-say() { echo "${GREEN}→${NC} $*"; }
+say() { echo "${GREEN}в†’${NC} $*"; }
 warn() { echo "${YELLOW}!${NC} $*"; }
 die() { echo "${RED}ERROR:${NC} $*" >&2; exit 1; }
 
-# curl|bash leaves stdin as the pipe — prompts must use the real terminal.
+# curl|bash leaves stdin as the pipe вЂ” prompts must use the real terminal.
 can_prompt() {
   [[ "$SKIP_CONNECT" != "1" ]] && [[ -r /dev/tty ]]
 }
@@ -106,7 +106,7 @@ resolve_listen_mode() {
       esac
     else
       mode=lan
-      warn "No TTY — default listen mode: LAN (${lan}). Set HERMES_LISTEN_MODE=lo|lan|wan"
+      warn "No TTY вЂ” default listen mode: LAN (${lan}). Set HERMES_LISTEN_MODE=lo|lan|wan"
     fi
   fi
 
@@ -152,11 +152,11 @@ resolve_listen_mode() {
       ;;
   esac
 
-  say "Listen mode: ${MODE} — bind ${BIND_IP}, advertise ${ADVERTISE_HOST}"
+  say "Listen mode: ${MODE} вЂ” bind ${BIND_IP}, advertise ${ADVERTISE_HOST}"
 }
 
 echo ""
-echo "${BOLD}⚕ Hermes DB installer (self-hosted, no Docker)${NC}"
+echo "${BOLD}⚕ Hermes DB installer${NC}"
 echo ""
 
 command -v openssl >/dev/null || die "openssl required"
@@ -189,7 +189,7 @@ if [[ -n "$SRC" ]]; then
 else
   TMP=$(mktemp -d)
   trap 'rm -rf "$TMP"' EXIT
-  say "Downloading control-plane from GitHub…"
+  say "Downloading control-plane from GitHubвЂ¦"
   auth_curl -L "https://api.github.com/repos/${REPO}/tarball/${REF}" -o "$TMP/pack.tgz" \
     || auth_curl -L "https://codeload.github.com/${REPO}/tar.gz/${REF}" -o "$TMP/pack.tgz"
   mkdir -p "$TMP/out"
@@ -239,7 +239,7 @@ fi
 write_env_listen_vars
 set -a && source "$HERMES_DB_HOME/.env" && set +a
 
-say "Generating CA / server certificates…"
+say "Generating CA / server certificatesвЂ¦"
 export HERMES_CERT_EXTRA_SAN="IP:${ADVERTISE_HOST}"
 # Also include LAN if advertise is WAN
 LAN_IP=$(guess_lan_ip)
@@ -248,11 +248,25 @@ if [[ "$ADVERTISE_HOST" != "$LAN_IP" && "$ADVERTISE_HOST" != "127.0.0.1" ]]; the
 fi
 bash "$HERMES_DB_HOME/scripts/gen-ca.sh"
 
-say "Installing native MongoDB…"
+say "Installing native MongoDBвЂ¦"
 bash "$HERMES_DB_HOME/scripts/install-mongo-native.sh"
 
-say "Starting enroll + orchestrator services…"
+say "Starting enroll + orchestrator servicesвЂ¦"
 bash "$HERMES_DB_HOME/scripts/install-services.sh"
+
+# Publish desired agent runtime for fleet auto-update (best-effort).
+if [[ -f "$HERMES_DB_HOME/scripts/publish_fleet_release.py" ]]; then
+  say "Publishing fleet_release for agent auto-update…"
+  export HERMES_MONGO_REF="${HERMES_MONGO_REF:-main}"
+  export HERMES_MONGO_REPO="${HERMES_MONGO_REPO:-KiberSlesar/hermes-agent-MongoDB}"
+  python3 "$HERMES_DB_HOME/scripts/publish_fleet_release.py" \
+    ${HERMES_FLEET_VERSION:+--version "$HERMES_FLEET_VERSION"} \
+    --ref "$HERMES_MONGO_REF" \
+    --repo "$HERMES_MONGO_REPO" \
+    --published-by installDB \
+    || warn "fleet_release publish skipped (set HERMES_FLEET_VERSION=… and retry)"
+fi
+
 
 cat > "$HERMES_DB_HOME/agent-add" <<'EOF'
 #!/usr/bin/env bash
@@ -289,12 +303,12 @@ install_control_command agent-add "$HERMES_DB_HOME/agent-add"
 install_control_command agents "$HERMES_DB_HOME/agents"
 
 if [[ "$MODE" != "lo" ]]; then
-  warn "If agents are remote, open ports 27017, 8743, 8744 (ufw allow …)."
+  warn "If agents are remote, open ports 27017, 8743, 8744 (ufw allow вЂ¦)."
 fi
 
 echo ""
-echo "${GREEN}✓ Hermes DB self-hosted${NC}  →  $HERMES_DB_HOME"
-echo "  Mode         : ${MODE} — ${LISTEN_HINT}"
+echo "${GREEN}вњ“ Hermes DB self-hosted${NC}  в†’  $HERMES_DB_HOME"
+echo "  Mode         : ${MODE} вЂ” ${LISTEN_HINT}"
 echo "  Bind         : ${BIND_IP}"
 echo "  Advertise    : ${ADVERTISE_HOST}"
 echo "  Mongo        : ${HERMES_MONGO_HOSTS}"
@@ -311,7 +325,7 @@ if [[ "$SKIP_CONNECT" == "1" ]]; then
 fi
 
 if ! can_prompt; then
-  warn "No TTY for prompts — run: agent-add"
+  warn "No TTY for prompts вЂ” run: agent-add"
   exit 0
 fi
 

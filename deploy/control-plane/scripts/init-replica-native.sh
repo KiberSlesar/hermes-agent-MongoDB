@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Init single-node replica set + admin/app users (native mongosh, no Docker).
+# Init single-node replica set + admin/app users (mongosh).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

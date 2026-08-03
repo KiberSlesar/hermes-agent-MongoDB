@@ -6,7 +6,7 @@
 
 Форк [Nous Research Hermes Agent](https://github.com/NousResearch/hermes-agent):
 агентский runtime остаётся на домашних ПК, а **долговечное состояние**
-(конфиг, память, скиллы, сессии, флот) живёт в **self-hosted MongoDB** на
+(конфиг, память, скиллы, сессии, флот) живёт в **MongoDB** на
 сервере. На ПК после enroll нужны в основном `bootstrap.yaml` + сертификаты.
 
 Полные доки Hermes: [оригинал](https://github.com/NousResearch/hermes-agent) /
@@ -161,38 +161,76 @@ hermes cluster status
 
 ## Update
 
-Данные (`HERMES_HOME` на агенте; Mongo `data/` / `certs/` / `.env` на DB)
-сохраняются. Обновляется runtime и скрипты. **Та же команда**, что и для
-установки.
+Данные не трогаем: на агенте `HERMES_HOME`, на DB — Mongo `data/` / `certs/` /
+`.env`. Меняется runtime агентов (и при полном `installDB` — софт control plane).
 
-### Агент-ПК
+### Обычный путь (рекомендуется)
 
-Повторный запуск установщика. Если есть `bootstrap.yaml`, повторный
-`db connect` не нужен (по умолчанию **n**). На замену runtime — **Y**.
+**1. DB-сервер — `hermes cluster update`**
 
-Linux без вопросов:
+Скачивает клиентский tarball, обновляет scripts control plane, публикует
+`fleet_release` в Mongo. Данные Mongo не трогает.
+
+```bash
+# на DB (нужен hermes + Mongo bootstrap / доступ к hermes_shared)
+export HERMES_FLEET_VERSION=0.19.5   # или --version
+hermes cluster update --version 0.19.5 --ref main
+```
+
+Полный reinstall control plane по-прежнему через `installDB.sh` при необходимости;
+после него тоже можно вызвать `hermes cluster update`.
+
+**2. На каждом агенте — `hermes update`**
+
+На Mongo-агентах штатный `hermes update` **не** тянет Nous ZIP: читает
+`fleet_release` с оркестратора/Mongo и ставит tarball форка (как install-agent).
+
+```bash
+hermes update          # применить
+hermes update --check  # только сравнить версии
+```
+
+Автообновление по heartbeat **отключено**.
+
+**3. Проверка**
+
+```bash
+hermes update --check
+hermes cluster status
+```
+
+В веб UI (System): у нод версия / `in_sync` или `stale`, плюс Fleet release.
+
+### Запасной путь: install-agent
+
+Если `hermes update` не смог (Windows lock и т.п.):
+
+Linux:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/install-agent.sh \
   | HERMES_YES=1 HERMES_SKIP_CONNECT=1 bash
 ```
 
-Windows:
+Windows (PowerShell):
 
 ```powershell
 $env:HERMES_YES = "1"; $env:HERMES_SKIP_CONNECT = "1"
 irm https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/install-agent.ps1 | iex
 ```
 
-### DB-сервер
+### Activate и рассинхрон
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/installDB.sh | bash
-systemctl --user daemon-reload
-systemctl --user restart hermes-mongod hermes-enroll hermes-orchestrator
-```
+`cluster activate` **не блокируется**. При смене owner в чат уходит notice; если
+версия ≠ флота — предупреждение: выполните **`hermes update`** на этой машине.
 
-Новый ПК по-прежнему: `agent-add <agent-name>`.
+### Чего не делать
+
+- На Mongo-агентах не ждать auto-update и не рассчитывать на upstream Nous ZIP —
+  только `hermes update` / install-agent.
+- Агенты не обновляют Mongo/DB — DB: `installDB.sh` и/или `hermes cluster update`.
+- Новый ПК: `agent-add <agent-name>` + install-agent + `db connect`.
+- Низкоуровнево: `hermes fleet release set|show` (предпочтительнее `cluster update`).
 
 ## License
 

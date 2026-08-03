@@ -336,6 +336,19 @@ if ! verify_mongo_status; then
 fi
 
 say "Verified: hermes db connect + hermes mongo status"
+
+# Stamp version/ref for fleet auto-update compare.
+VER="$($PY -c "from hermes_cli import __version__; print(__version__)" 2>/dev/null || true)"
+mkdir -p "$HERMES_HOME_DIR"
+cat > "$HERMES_HOME_DIR/.fleet_install_stamp" <<STAMP
+{
+  "version": "${VER}",
+  "ref": "${REF}",
+  "repo": "${REPO}",
+  "applied_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+}
+STAMP
+
 echo "  which hermes: $(command -v hermes)"
 echo "  try: hermes mongo status"
 echo "  try: hermes db connect --help"

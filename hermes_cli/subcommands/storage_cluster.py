@@ -81,6 +81,27 @@ def build_cluster_parser(subparsers, *, cmd_cluster: Callable) -> None:
     )
     prune.set_defaults(func=cmd_cluster)
 
+    upd = cluster_sub.add_parser(
+        "update",
+        help="DB: download client release, refresh CP scripts, publish fleet_release",
+    )
+    upd.add_argument(
+        "--version",
+        default=None,
+        help="Desired agent semver (default: HERMES_FLEET_VERSION or local hermes_cli)",
+    )
+    upd.add_argument(
+        "--ref",
+        default=None,
+        help="Git ref/branch/tag for tarball (default: HERMES_MONGO_REF or main)",
+    )
+    upd.add_argument(
+        "--repo",
+        default=None,
+        help="GitHub owner/repo (default: HERMES_MONGO_REPO)",
+    )
+    upd.set_defaults(func=cmd_cluster)
+
 
 def build_machine_parser(subparsers, *, cmd_machine: Callable) -> None:
     parser = subparsers.add_parser(

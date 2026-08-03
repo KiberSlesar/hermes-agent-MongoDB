@@ -150,7 +150,15 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(400, {"error": "node_id required"})
                     return
                 cluster.heartbeat(node)
-                self._json(200, {"ok": True})
+                release = {}
+                try:
+                    from hermes_storage.fleet_update import get_fleet_release_from_mongo
+
+                    shared_db = cluster._nodes.database
+                    release = get_fleet_release_from_mongo(shared_db)
+                except Exception:
+                    release = {}
+                self._json(200, {"ok": True, "fleet_release": release})
                 return
             if path == "/cluster/activate":
                 target = str(body.get("target") or "").strip()

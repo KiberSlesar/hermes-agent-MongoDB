@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install MongoDB Community natively (Ubuntu/Debian) — no Docker.
+# Install MongoDB Community via apt (Ubuntu/Debian).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -75,7 +75,7 @@ PORT="${HERMES_MONGO_PORT:-27017}"
 
 CONF="$ROOT/mongod.conf"
 cat > "$CONF" <<EOF
-# Hermes self-hosted MongoDB (generated — do not edit by hand unless you know why)
+# Hermes MongoDB (generated — do not edit by hand unless you know why)
 storage:
   dbPath: ${DATA}
 systemLog:
@@ -123,7 +123,7 @@ UNIT="$UNIT_DIR/hermes-mongod.service"
 
 cat > "$UNIT" <<EOF
 [Unit]
-Description=Hermes MongoDB (self-hosted)
+Description=Hermes MongoDB
 After=network.target
 
 [Service]

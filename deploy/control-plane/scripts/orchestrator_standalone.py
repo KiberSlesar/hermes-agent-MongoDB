@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-hosted orchestrator ? mTLS HTTPS on :8744 (no Docker, pymongo only)."""
+"""Fleet orchestrator — mTLS HTTPS on :8744 (pymongo)."""
 
 from __future__ import annotations
 
@@ -185,7 +185,23 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/cluster/heartbeat":
                 heartbeat(body)
-                self._json(200, {"ok": True})
+                release = {}
+                try:
+                    doc = db()["fleet_release"].find_one({"_id": "default"}) or {}
+                    doc = dict(doc)
+                    doc.pop("_id", None)
+                    release = {
+                        "version": str(doc.get("version") or "").strip(),
+                        "ref": str(doc.get("ref") or "").strip(),
+                        "repo": str(doc.get("repo") or "").strip(),
+                        "published_at": doc.get("published_at"),
+                        "published_by": doc.get("published_by") or "",
+                    }
+                    if not release["version"] and not release["ref"]:
+                        release = {}
+                except Exception:
+                    release = {}
+                self._json(200, {"ok": True, "fleet_release": release})
                 return
         except Exception as exc:
             self._json(400, {"error": str(exc)})

@@ -331,6 +331,11 @@ export interface ClusterNode {
   active_turns?: number;
   api_base?: string;
   chat_ready?: boolean;
+  agent_version?: string;
+  install_ref?: string;
+  version_in_sync?: boolean;
+  update_stale?: boolean;
+  update_status?: string;
 }
 
 export interface ClusterStatus {
@@ -340,6 +345,11 @@ export interface ClusterStatus {
     handoff_state?: string | null;
   };
   nodes: ClusterNode[];
+  fleet_release?: {
+    version?: string;
+    ref?: string;
+    repo?: string;
+  };
 }
 
 export interface FleetActiveChat {

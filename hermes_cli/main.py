@@ -483,6 +483,7 @@ from hermes_cli.subcommands.storage_cluster import (
     build_mongo_parser,
     build_storage_parser,
 )
+from hermes_cli.subcommands.fleet import build_fleet_parser, cmd_fleet
 
 
 def _require_tty(command_name: str) -> None:
@@ -4819,7 +4820,25 @@ def cmd_cluster(args):
             "kept": storage.node_id,
         }, indent=2))
         return
-    print("usage: hermes cluster <status|activate|prune>")
+    if sub == "update":
+        from hermes_storage.fleet_update import run_cluster_server_update
+
+        try:
+            result = run_cluster_server_update(
+                version=getattr(args, "version", None) or "",
+                ref=getattr(args, "ref", None) or "",
+                repo=getattr(args, "repo", None) or "",
+                storage=storage,
+                published_by="cluster-update",
+            )
+        except Exception as exc:
+            print(f"Error: hermes cluster update failed: {exc}")
+            raise SystemExit(1) from exc
+        print(_json.dumps(result, indent=2, default=str))
+        print()
+        print(result.get("next_step") or "On each agent PC run: hermes update")
+        return
+    print("usage: hermes cluster <status|activate|prune|update>")
 
 
 def cmd_machine(args):
@@ -9347,6 +9366,32 @@ def cmd_update(args):
         managed_error("update Hermes Agent")
         return
 
+    # Mongo-fork agents follow fleet_release via orchestrator/Mongo — never Nous ZIP.
+    try:
+        from hermes_storage.fleet_update import (
+            is_mongo_agent_install,
+            run_mongo_agent_update_cli,
+        )
+
+        if is_mongo_agent_install():
+            run_mongo_agent_update_cli(args)
+            return
+    except SystemExit:
+        raise
+    except Exception:
+        # If detection/import fails unexpectedly, fall through to upstream only when
+        # we are clearly not a mongo install; re-check bootstrap to be safe.
+        try:
+            from hermes_constants import get_hermes_home
+
+            if (get_hermes_home() / "bootstrap.yaml").is_file():
+                print("Error: Mongo agent update failed; see logs. Do not use upstream update.")
+                raise SystemExit(1)
+        except SystemExit:
+            raise
+        except Exception:
+            pass
+
     # Docker users can't ``git pull`` — the image excludes ``.git`` from
     # the build context.  Bail with a friendly explanation pointing at
     # ``docker pull`` BEFORE any of the apply-path / check-path branches
@@ -10861,7 +10906,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "send", "sessions", "setup",
         "skin", "skills", "slack", "status", "storage", "sync", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "wiki", "chat", "secrets", "security",
-        "cluster", "machine", "agent", "db",
+        "cluster", "fleet", "machine", "agent", "db",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
         # expensive eager import of every bundled plugin module.
@@ -11721,6 +11766,7 @@ def main():
     build_status_parser(subparsers, cmd_status=cmd_status)
     build_storage_parser(subparsers, cmd_storage=cmd_storage)
     build_cluster_parser(subparsers, cmd_cluster=cmd_cluster)
+    build_fleet_parser(subparsers, cmd_fleet=cmd_fleet)
     build_machine_parser(subparsers, cmd_machine=cmd_machine)
     build_agent_parser(subparsers, cmd_agent=cmd_agent)
     build_db_parser(subparsers, cmd_db=cmd_db)

@@ -37,6 +37,7 @@ class HermesStorage:
     machine_id: str
     node_id: str
     wiki: Any = None
+    fleet_release: Any = None
 
     def load_effective_config(self, base: Optional[dict] = None) -> dict:
         """shared settings ⊕ profile config ⊕ machine overlay."""
@@ -415,6 +416,8 @@ class HermesStorage:
         active_turns: int = 0,
         active_session_keys: Optional[list[str]] = None,
     ) -> None:
+        from hermes_storage.fleet_update import presence_version_fields
+
         self.cluster.heartbeat({
             "node_id": self.node_id,
             "machine_id": self.machine_id,
@@ -425,6 +428,7 @@ class HermesStorage:
             "status": "online",
             "active_turns": max(0, int(active_turns)),
             "active_session_keys": list(active_session_keys or []),
+            **presence_version_fields(),
         })
         self.machines.upsert_machine(self.machine_id, {
             "hostname": hostname or socket.gethostname(),
@@ -440,22 +444,30 @@ class HermesStorage:
             pass
 
     def cluster_status(self) -> dict[str, Any]:
+        from hermes_storage.fleet_update import enrich_cluster_nodes, normalize_release
+
         state = self.cluster.get_state()
         nodes = self.cluster.list_nodes()
-        # Annotate chat readiness from advertised api_base (no live probe here —
-        # control plane probes on /api/fleet/active-chat).
+        desired = {}
+        try:
+            if self.fleet_release is not None:
+                desired = normalize_release(self.fleet_release.get())
+        except Exception:
+            desired = {}
         enriched = []
         for node in nodes:
             row = dict(node)
             api = str(row.get("api_base") or "").strip()
             row["chat_ready"] = bool(api)
             enriched.append(row)
+        enriched = enrich_cluster_nodes(enriched, desired)
         return {
             "profile": self.bootstrap.profile,
             "this_node_id": self.node_id,
             "this_machine_id": self.machine_id,
             "state": state,
             "nodes": enriched,
+            "fleet_release": desired,
         }
 
     def activate(
@@ -509,6 +521,7 @@ def _build_storage(boot: BootstrapConfig) -> HermesStorage:
         MongoSkillsStore,
     )
     from hermes_storage.wiki import MongoWikiStore
+    from hermes_storage.fleet_update import MongoFleetReleaseStore
 
     client = get_client(boot.mongo_uri)
     shared = client[boot.shared_db]
@@ -538,6 +551,7 @@ def _build_storage(boot: BootstrapConfig) -> HermesStorage:
         machine_id=machine_id,
         node_id=node_id,
         wiki=MongoWikiStore(shared["wiki_pages"]),
+        fleet_release=MongoFleetReleaseStore(shared["fleet_release"]),
     )
 
 

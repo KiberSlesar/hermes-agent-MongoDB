@@ -327,6 +327,19 @@ if (-not (($userPath -split ';') | Where-Object {
     )
 }
 
+# Stamp version/ref for fleet auto-update compare.
+$ver = ""
+try {
+    $ver = (& $python -c "from hermes_cli import __version__; print(__version__)" 2>$null | Out-String).Trim()
+} catch { }
+$stamp = @{
+    version = $ver
+    ref     = $Ref
+    repo    = $Repo
+    applied_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+} | ConvertTo-Json -Compress
+Set-Content -Path (Join-Path $HermesHome ".fleet_install_stamp") -Value $stamp -Encoding utf8
+
 Write-Host ""
 Write-Host "Mongo fork installed. No upstream Hermes runtime was installed."
 $bootstrap = Join-Path $HermesHome "bootstrap.yaml"

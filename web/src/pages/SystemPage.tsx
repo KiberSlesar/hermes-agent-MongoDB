@@ -1108,6 +1108,11 @@ export default function SystemPage() {
                       ? `chat: ${node.api_base}`
                       : `api_base set, not ready`
                     : "no api_base (set HERMES_API_BASE + hermes serve)";
+                  const verHint = node.agent_version
+                    ? `v${node.agent_version}${node.install_ref ? `@${node.install_ref}` : ""}${
+                        node.update_stale ? " (stale)" : ""
+                      }`
+                    : "";
                   return (
                     <Button
                       key={nodeId}
@@ -1115,13 +1120,14 @@ export default function SystemPage() {
                       ghost={!active}
                       disabled={active || switchingAgent !== null}
                       onClick={() => void activateAgent(nodeId)}
-                      title={chatHint}
+                      title={[chatHint, verHint].filter(Boolean).join(" · ")}
                     >
                       {switchingAgent === nodeId
                         ? "Switching…"
                         : active
                           ? `${node.hostname ?? node.machine_id ?? nodeId} (active)`
                           : `Use ${node.hostname ?? node.machine_id ?? nodeId}`}
+                      {node.update_stale ? " ⚠" : ""}
                     </Button>
                   );
                 })}
@@ -1130,6 +1136,11 @@ export default function SystemPage() {
                 A switch is refused while the active agent has a running task. Wait for it to finish or send /stop first.
                 {typeof window !== "undefined" && window.__HERMES_CONTROL_PLANE__
                   ? " Control plane: chat proxies to the messaging owner's hermes serve."
+                  : ""}
+                {cluster.fleet_release?.version
+                  ? ` Fleet release: ${cluster.fleet_release.version}${
+                      cluster.fleet_release.ref ? `@${cluster.fleet_release.ref}` : ""
+                    }.`
                   : ""}
               </p>
             </CardContent>

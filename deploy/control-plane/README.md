@@ -43,6 +43,19 @@ Activate agents on System page as before (`hermes cluster activate` / dashboard 
 Agents without `api_base` still own Telegram after activate, but web chat shows “not ready”.
 After activate / handoff, the Chat tab polls `messaging_owner` and reconnects the proxy automatically.
 
+### Fleet updates (manual)
+
+Step-by-step (Russian): root [`README.md`](../../README.md) → **Update**.
+
+1. On DB: `hermes cluster update --version … --ref main` (download client
+   tarball, refresh control-plane scripts, publish `fleet_release`).
+2. On each agent: `hermes update` (Mongo installs follow fleet_release; not
+   upstream Nous ZIP). Idle auto-apply is **off**.
+3. Check: `hermes update --check` / `hermes cluster status` / System UI.
+4. Fallback: install-agent with `HERMES_YES=1` + `HERMES_SKIP_CONNECT=1`.
+
+Activate stays unblocked; version skew notice tells the user to run `hermes update`.
+
 
 Agents call `https://<server>:8744/cluster/*` with the same `agent.pem` used for Mongo.
 Without that cert the TLS handshake fails — no anonymous orchestrator access.

@@ -186,8 +186,10 @@ def start_heartbeat_loop(
                     active_turns=runtime.get("active_turns", 0),
                     active_session_keys=runtime.get("active_session_keys"),
                 )
-                # Also publish presence over mTLS orchestrator when configured
+                # Also publish presence over mTLS orchestrator when configured.
+                # Idle auto-update is intentionally OFF — agents run `hermes update`.
                 try:
+                    from hermes_storage.fleet_update import presence_version_fields
                     from hermes_storage.orchestrator_client import (
                         orch_heartbeat,
                         orchestrator_configured,
@@ -197,10 +199,12 @@ def start_heartbeat_loop(
                             "node_id": storage.node_id,
                             "machine_id": storage.machine_id,
                             "profile": storage.bootstrap.profile,
+                            "hostname": __import__("socket").gethostname(),
                             "api_base": advertised or "",
                             "status": "online",
                             "active_turns": runtime.get("active_turns", 0),
                             "active_session_keys": runtime.get("active_session_keys") or [],
+                            **presence_version_fields(),
                         })
                 except Exception as orch_exc:
                     logger.debug("Orchestrator heartbeat skipped: %s", orch_exc)
@@ -308,12 +312,33 @@ def format_cluster_move_notice(
         return f"{host} [{node_id}]"
 
     to_id = to_node_id or storage.node_id
-    return (
+    text = (
         "🔀 Системное сообщение: активный агент переехал на "
         f"{_label(to_id)}"
         + (f" (было: {_label(from_node_id)})" if from_node_id else "")
         + ". Telegram и инструменты теперь выполняются на этой машине."
     )
+
+    try:
+        from hermes_storage.fleet_update import (
+            format_version_skew_warning,
+            normalize_release,
+        )
+
+        desired = {}
+        if getattr(storage, "fleet_release", None) is not None:
+            desired = normalize_release(storage.fleet_release.get())
+        to_node = nodes.get(to_id) or {}
+        skew = format_version_skew_warning(
+            agent_version=str(to_node.get("agent_version") or ""),
+            install_ref=str(to_node.get("install_ref") or ""),
+            desired=desired,
+        )
+        if skew:
+            text = text + " " + skew
+    except Exception:
+        logger.debug("version skew notice append failed", exc_info=True)
+    return text
 
 
 def _run_acquire_for_handoff(storage: Any, node_id: str) -> None:
