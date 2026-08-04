@@ -25,6 +25,8 @@ _LOCAL_MESSAGING_HELD: bool = False
 # acquire so it cannot race the normal connect loop and open a second
 # getUpdates session against the same bot token.
 _GATEWAY_BOOTSTRAPPING: bool = False
+# Debounce auto-failover: owner_id -> consecutive offline observations.
+_FAILOVER_OFFLINE_STREAK: dict[str, int] = {}
 
 # Platforms that stay up on every fleet node (not Telegram/Discord lease).
 NON_MESSAGING_PLATFORMS = frozenset({"api_server", "local", "webhook"})
@@ -606,6 +608,50 @@ def _cluster_health_settings() -> dict[str, float]:
     }
 
 
+def _cluster_failover_settings() -> dict[str, float]:
+    """Grace window before auto-failover steals messaging from a quiet owner.
+
+    Heartbeat interval is ~15s; a gateway restart often gaps 10–40s. Require the
+    owner heartbeat to be older than ``offline_after_s`` AND that condition to
+    hold for ``confirm_ticks`` consecutive local heartbeat loops before moving
+    the lease — otherwise brief flaps roll ownership back and forth.
+    """
+    offline_after_s = 75.0
+    confirm_ticks = 3.0
+    try:
+        from hermes_cli.config import load_config
+
+        cluster = (load_config() or {}).get("cluster") or {}
+        if cluster.get("failover_offline_after_s") is not None:
+            offline_after_s = float(cluster["failover_offline_after_s"])
+        if cluster.get("failover_confirm_ticks") is not None:
+            confirm_ticks = float(cluster["failover_confirm_ticks"])
+    except Exception:
+        logger.debug("cluster failover settings read failed", exc_info=True)
+    return {
+        "offline_after_s": max(30.0, offline_after_s),
+        "confirm_ticks": max(1, int(confirm_ticks)),
+    }
+
+
+def _clear_failover_offline_streak(owner_id: Optional[str] = None) -> None:
+    if owner_id:
+        _FAILOVER_OFFLINE_STREAK.pop(str(owner_id), None)
+        return
+    _FAILOVER_OFFLINE_STREAK.clear()
+
+
+def _note_failover_owner_offline(owner_id: str) -> int:
+    key = str(owner_id)
+    ticks = int(_FAILOVER_OFFLINE_STREAK.get(key) or 0) + 1
+    _FAILOVER_OFFLINE_STREAK[key] = ticks
+    # Drop watches for other owners so a lease change cannot inherit streak.
+    for other in list(_FAILOVER_OFFLINE_STREAK):
+        if other != key:
+            _FAILOVER_OFFLINE_STREAK.pop(other, None)
+    return ticks
+
+
 def _owner_is_degraded(owner_node: dict[str, Any], *, min_score: float) -> bool:
     """True when messaging ownership should consider leaving this owner.
 
@@ -640,19 +686,47 @@ def _maybe_failover(storage: Any) -> None:
     # SIGTERM flap) immediately rolls a manual activate back to the peer.
     handoff = state.get("handoff_state") or "idle"
     if handoff not in (None, "idle", "done", "failed"):
+        _clear_failover_offline_streak()
         return
     # Cool down after a failed acquire so we don't thrash every ~90s.
     if _health_rebalance_cooldown_active(state, 180.0) and state.get("handoff_error"):
         return
     owner = state.get("messaging_owner")
     if not owner:
+        _clear_failover_offline_streak()
         return
-    nodes = {n["node_id"]: n for n in storage.cluster.list_nodes(online_within_s=45.0)}
+    settings = _cluster_failover_settings()
+    # Stricter offline window than presence UI (45s) — gateway restarts must
+    # not look like a dead owner.
+    nodes = {
+        n["node_id"]: n
+        for n in storage.cluster.list_nodes(
+            online_within_s=float(settings["offline_after_s"])
+        )
+    }
     owner_node = nodes.get(owner)
     if owner_node and owner_node.get("online"):
+        _clear_failover_offline_streak(owner)
         return
+    ticks = _note_failover_owner_offline(owner)
+    need = int(settings["confirm_ticks"])
+    if ticks < need:
+        logger.info(
+            "Messaging owner %s looks offline (%s/%s confirms, grace=%.0fs); "
+            "deferring failover",
+            owner,
+            ticks,
+            need,
+            float(settings["offline_after_s"]),
+        )
+        return
+    # Candidates use the normal live window so a recovering peer can take over.
+    live_nodes = {
+        n["node_id"]: n
+        for n in storage.cluster.list_nodes(online_within_s=45.0)
+    }
     # Owner unhealthy — pick the highest health_score among online peers.
-    target = _pick_best_online_candidate(nodes, exclude=owner)
+    target = _pick_best_online_candidate(live_nodes, exclude=owner)
     if not target:
         return
     if _node_is_updating(target):
@@ -661,11 +735,14 @@ def _maybe_failover(storage: Any) -> None:
     if target["node_id"] != storage.node_id:
         return
     logger.warning(
-        "Messaging owner %s unhealthy; initiating failover to %s (health=%s)",
+        "Messaging owner %s unhealthy after %s confirms; initiating failover "
+        "to %s (health=%s)",
         owner,
+        ticks,
         target["node_id"],
         _node_health_score(target),
     )
+    _clear_failover_offline_streak(owner)
     # Remember where to return when the preferred/home node wakes up.
     ensure = getattr(storage.cluster, "ensure_preferred_messaging_node", None)
     if callable(ensure):

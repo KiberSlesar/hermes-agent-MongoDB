@@ -3022,6 +3022,12 @@ DEFAULT_CONFIG = {
         "health_rebalance_min_score": 40,
         # Cooldown between health_rebalance handoffs (seconds).
         "health_rebalance_cooldown_s": 600,
+        # Auto-failover: owner heartbeat must be this stale before considering
+        # the node dead (gateway restarts often gap 10–40s).
+        "failover_offline_after_s": 75,
+        # Require this many consecutive local heartbeat ticks seeing the owner
+        # offline before stealing the messaging lease.
+        "failover_confirm_ticks": 3,
     },
 
     # Config schema version - bump this when adding new required fields

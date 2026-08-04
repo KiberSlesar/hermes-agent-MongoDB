@@ -742,6 +742,13 @@ def test_failback_non_preferred_does_not_initiate(monkeypatch):
 def test_failover_ensures_preferred_before_switch(monkeypatch):
     from hermes_storage import cluster as cluster_module
 
+    cluster_module._clear_failover_offline_streak()
+    monkeypatch.setattr(
+        cluster_module,
+        "_cluster_failover_settings",
+        lambda: {"offline_after_s": 45.0, "confirm_ticks": 1},
+    )
+
     class Cluster:
         def __init__(self):
             self.preferred = None
@@ -789,6 +796,13 @@ def test_failover_ensures_preferred_before_switch(monkeypatch):
 
 def test_failover_picks_highest_health_score(monkeypatch):
     from hermes_storage import cluster as cluster_module
+
+    cluster_module._clear_failover_offline_streak()
+    monkeypatch.setattr(
+        cluster_module,
+        "_cluster_failover_settings",
+        lambda: {"offline_after_s": 45.0, "confirm_ticks": 1},
+    )
 
     class Cluster:
         def __init__(self):
@@ -848,6 +862,13 @@ def test_failover_skips_while_handoff_in_progress(monkeypatch):
     """Manual activate must not be yanked by peer failover mid-release/acquire."""
     from hermes_storage import cluster as cluster_module
 
+    cluster_module._clear_failover_offline_streak()
+    monkeypatch.setattr(
+        cluster_module,
+        "_cluster_failover_settings",
+        lambda: {"offline_after_s": 45.0, "confirm_ticks": 1},
+    )
+
     class Cluster:
         def __init__(self):
             self.activated = []
@@ -881,6 +902,111 @@ def test_failover_skips_while_handoff_in_progress(monkeypatch):
     })()
     cluster_module._maybe_failover(storage)
     assert storage.cluster.activated == []
+
+
+def test_failover_requires_confirm_ticks(monkeypatch):
+    """Brief offline blips must not move the lease on the first sighting."""
+    from hermes_storage import cluster as cluster_module
+
+    cluster_module._clear_failover_offline_streak()
+    monkeypatch.setattr(
+        cluster_module,
+        "_cluster_failover_settings",
+        lambda: {"offline_after_s": 45.0, "confirm_ticks": 3},
+    )
+
+    class Cluster:
+        def __init__(self):
+            self.activated = []
+
+        def get_state(self):
+            return {
+                "handoff_state": "idle",
+                "failover": "auto",
+                "messaging_owner": "linux",
+            }
+
+        def list_nodes(self, **_kwargs):
+            return [
+                {"node_id": "linux", "online": False, "health_score": 100},
+                {"node_id": "win", "online": True, "health_score": 100},
+            ]
+
+        def ensure_preferred_messaging_node(self, _node_id):
+            pass
+
+        def set_active(self, node_id, *, reason="manual"):
+            self.activated.append((node_id, reason))
+
+    monkeypatch.setattr(cluster_module, "ensure_local_gateway_service", lambda: {})
+    storage = type("S", (), {
+        "node_id": "win",
+        "machine_id": "w",
+        "cluster": Cluster(),
+    })()
+
+    cluster_module._maybe_failover(storage)
+    cluster_module._maybe_failover(storage)
+    assert storage.cluster.activated == []
+    cluster_module._maybe_failover(storage)
+    assert storage.cluster.activated == [("win", "failover")]
+
+
+def test_failover_streak_resets_when_owner_returns(monkeypatch):
+    from hermes_storage import cluster as cluster_module
+
+    cluster_module._clear_failover_offline_streak()
+    monkeypatch.setattr(
+        cluster_module,
+        "_cluster_failover_settings",
+        lambda: {"offline_after_s": 45.0, "confirm_ticks": 3},
+    )
+    online = {"linux": False}
+
+    class Cluster:
+        def __init__(self):
+            self.activated = []
+
+        def get_state(self):
+            return {
+                "handoff_state": "idle",
+                "failover": "auto",
+                "messaging_owner": "linux",
+            }
+
+        def list_nodes(self, **_kwargs):
+            return [
+                {
+                    "node_id": "linux",
+                    "online": online["linux"],
+                    "health_score": 100,
+                },
+                {"node_id": "win", "online": True, "health_score": 100},
+            ]
+
+        def ensure_preferred_messaging_node(self, _node_id):
+            pass
+
+        def set_active(self, node_id, *, reason="manual"):
+            self.activated.append((node_id, reason))
+
+    monkeypatch.setattr(cluster_module, "ensure_local_gateway_service", lambda: {})
+    storage = type("S", (), {
+        "node_id": "win",
+        "machine_id": "w",
+        "cluster": Cluster(),
+    })()
+
+    cluster_module._maybe_failover(storage)
+    cluster_module._maybe_failover(storage)
+    online["linux"] = True
+    cluster_module._maybe_failover(storage)  # resets streak
+    online["linux"] = False
+    cluster_module._maybe_failover(storage)
+    cluster_module._maybe_failover(storage)
+    assert storage.cluster.activated == []
+    cluster_module._maybe_failover(storage)
+    assert storage.cluster.activated == [("win", "failover")]
 
 
 def test_health_rebalance_with_hysteresis(monkeypatch):
