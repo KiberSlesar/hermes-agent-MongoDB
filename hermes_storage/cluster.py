@@ -470,6 +470,13 @@ def _run_acquire_for_handoff(storage: Any, node_id: str) -> None:
         return
 
     storage.cluster.rollback_messaging_handoff(reason=reason)
+    mark = getattr(storage.cluster, "mark_health_rebalance", None)
+    if callable(mark):
+        try:
+            # Reuse cooldown field so failover doesn't immediately retry.
+            mark()
+        except Exception:
+            logger.debug("mark cooldown after rollback failed", exc_info=True)
     _notify_cluster(
         "⚠️ Системное сообщение: не удалось перенести активного агента "
         f"сюда ({reason}). Handoff откатан.",
@@ -600,45 +607,36 @@ def _cluster_health_settings() -> dict[str, float]:
 
 
 def _owner_is_degraded(owner_node: dict[str, Any], *, min_score: float) -> bool:
-    if bool(owner_node.get("health_critical_failed")):
-        return True
+    """True when messaging ownership should consider leaving this owner.
+
+    Telegram reachability is the hard gate for rebalance. LLM-only probe
+    failures (AuthError mid-reload, missing /models) must not yank the lease
+    while Telegram still works — that caused the Windows↔Linux thrash loop.
+    """
     checks = owner_node.get("health_checks") or {}
-    for name in ("telegram_api", "llm_provider"):
-        row = checks.get(name) or {}
-        if row.get("applicable") is False:
-            continue
-        if row.get("ok") is False:
-            return True
-    return _node_health_score(owner_node) <= float(min_score)
+    tg = checks.get("telegram_api") or {}
+    if tg.get("applicable") is not False and tg.get("ok") is False:
+        return True
+    # Very low overall score with TG unknown/missing can still qualify.
+    if _node_health_score(owner_node) <= float(min_score):
+        # But if TG is explicitly healthy, require score <= half the threshold.
+        if tg.get("ok") is True:
+            return _node_health_score(owner_node) <= float(min_score) / 2.0
+        return True
+    return False
 
 
-def _health_rebalance_cooldown_active(state: dict[str, Any], cooldown_s: float) -> bool:
-    raw = state.get("last_health_rebalance_at")
-    if raw is None:
-        return False
-    try:
-        from datetime import datetime, timezone
-
-        if isinstance(raw, datetime):
-            ts = raw
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            age = (datetime.now(timezone.utc) - ts).total_seconds()
-            return age < float(cooldown_s)
-        # ISO string
-        text = str(raw).replace("Z", "+00:00")
-        ts = datetime.fromisoformat(text)
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        age = (datetime.now(timezone.utc) - ts).total_seconds()
-        return age < float(cooldown_s)
-    except Exception:
-        return False
+def _node_is_updating(node: dict[str, Any]) -> bool:
+    status = str(node.get("update_status") or "").strip().lower()
+    return status in {"applying", "pending", "downloading", "installing"}
 
 
 def _maybe_failover(storage: Any) -> None:
     state = storage.cluster.get_state()
     if (state.get("failover") or "auto") != "auto":
+        return
+    # Cool down after a failed acquire so we don't thrash every ~90s.
+    if _health_rebalance_cooldown_active(state, 180.0) and state.get("handoff_error"):
         return
     owner = state.get("messaging_owner")
     if not owner:
@@ -650,6 +648,8 @@ def _maybe_failover(storage: Any) -> None:
     # Owner unhealthy — pick the highest health_score among online peers.
     target = _pick_best_online_candidate(nodes, exclude=owner)
     if not target:
+        return
+    if _node_is_updating(target):
         return
     # Only the chosen best node initiates (single initiator, no race).
     if target["node_id"] != storage.node_id:
@@ -698,12 +698,20 @@ def _maybe_health_rebalance(storage: Any) -> None:
     owner_node = nodes.get(owner) or {}
     if not owner_node.get("online"):
         return
+    if _node_is_updating(owner_node):
+        return
     if int(owner_node.get("active_turns") or 0) > 0:
+        return
+    preferred = (state.get("preferred_messaging_node") or "").strip()
+    # Do not steal from preferred while it is online (failback owns that path).
+    if preferred and preferred == owner and owner_node.get("online"):
         return
     if not _owner_is_degraded(owner_node, min_score=settings["min_score"]):
         return
     best = _pick_best_online_candidate(nodes, exclude=None)
     if not best or best.get("node_id") == owner:
+        return
+    if _node_is_updating(best):
         return
     owner_score = _node_health_score(owner_node)
     best_score = _node_health_score(best)
@@ -711,10 +719,6 @@ def _maybe_health_rebalance(storage: Any) -> None:
         return
     # Only the best peer initiates.
     if best["node_id"] != storage.node_id:
-        return
-    preferred = (state.get("preferred_messaging_node") or "").strip()
-    # Do not steal from preferred while it is online (failback owns that path).
-    if preferred and preferred == owner and owner_node.get("online"):
         return
     logger.warning(
         "Health rebalance: owner %s score=%s degraded; moving to %s score=%s",
@@ -735,6 +739,30 @@ def _maybe_health_rebalance(storage: Any) -> None:
         logger.info("Health rebalance deferred: %s", exc)
         return
     ensure_local_gateway_service()
+
+
+def _health_rebalance_cooldown_active(state: dict[str, Any], cooldown_s: float) -> bool:
+    raw = state.get("last_health_rebalance_at")
+    if raw is None:
+        return False
+    try:
+        from datetime import datetime, timezone
+
+        if isinstance(raw, datetime):
+            ts = raw
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - ts).total_seconds()
+            return age < float(cooldown_s)
+        # ISO string
+        text = str(raw).replace("Z", "+00:00")
+        ts = datetime.fromisoformat(text)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - ts).total_seconds()
+        return age < float(cooldown_s)
+    except Exception:
+        return False
 
 
 def _maybe_failback(storage: Any) -> None:

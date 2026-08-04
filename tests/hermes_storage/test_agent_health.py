@@ -19,7 +19,7 @@ def test_compute_score_weights_critical_and_skips_neutral():
     assert compute_health_score(checks) == 100
     assert critical_checks_failed(checks) is False
 
-    # TG + LLM down → low score
+    # TG down → critical; LLM-only miss is score damage, not messaging-critical
     bad = dict(checks)
     bad["llm_provider"] = {"ok": False, "applicable": True}
     bad["telegram_api"] = {"ok": False, "applicable": True}
@@ -27,6 +27,10 @@ def test_compute_score_weights_critical_and_skips_neutral():
     # 15+10 = 25 of 95 → ~26
     assert score < 40
     assert critical_checks_failed(bad) is True
+
+    llm_only = dict(checks)
+    llm_only["llm_provider"] = {"ok": False, "applicable": True}
+    assert critical_checks_failed(llm_only) is False
 
 
 def test_optional_unset_does_not_penalize(monkeypatch):

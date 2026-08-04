@@ -30,7 +30,9 @@ WEIGHTS: dict[str, int] = {
     "tts": 5,
 }
 
-CRITICAL_CHECKS = frozenset({"llm_provider", "telegram_api"})
+# Messaging ownership only treats Telegram as hard-critical. LLM probe noise
+# (AuthError mid-reload) must not flip health_critical_failed and thrash.
+CRITICAL_CHECKS = frozenset({"telegram_api"})
 
 _CACHE: dict[str, Any] = {}
 _CACHE_AT = 0.0
@@ -113,11 +115,31 @@ def _http_get(
 def probe_llm_provider() -> dict[str, Any]:
     """Credential resolve + optional light /models probe (no chat completion)."""
     started = _now()
+    provider = ""
     try:
         from hermes_cli.auth import resolve_provider
 
         provider = resolve_provider("auto")
     except Exception as exc:
+        # AuthError during resolve is common mid-reload / OAuth edge cases.
+        # Fall back to "any known provider secret present" so we don't thrash
+        # messaging ownership while chat still works.
+        if _env_any(
+            "OPENROUTER_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GOOGLE_API_KEY",
+            "GEMINI_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "XAI_API_KEY",
+            "NOUS_API_KEY",
+        ):
+            ms = (_now() - started) * 1000.0
+            return _check_result(
+                True,
+                latency_ms=ms,
+                detail=f"resolve:{type(exc).__name__}:keys_present",
+            )
         return _check_result(False, detail=f"resolve:{type(exc).__name__}")
 
     if not provider:
@@ -203,12 +225,9 @@ def probe_api_base() -> dict[str, Any]:
 
         base = (resolve_advertise_api_base() or "").strip()
         if not base:
-            # Serve may be down — still online as gateway; soft fail.
-            return _check_result(False, detail="missing_api_base")
+            # Messaging gateways often run without hermes serve — neutral.
+            return _check_result(True, applicable=False, detail="no_serve_advertised")
         result = probe_chat_ready(base, timeout_s=PROBE_TIMEOUT_S)
-        ok = bool(result.get("ok")) or bool(base)
-        # Having an advertised URL counts partial success even if probe fails
-        # (firewall / serve not listening yet).
         if result.get("ok"):
             return _check_result(True, detail="chat_ready")
         return _check_result(True, detail=f"advertised:{result.get('reason') or 'probe_fail'}")

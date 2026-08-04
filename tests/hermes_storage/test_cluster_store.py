@@ -832,7 +832,10 @@ def test_health_rebalance_with_hysteresis(monkeypatch):
                     "node_id": "weak",
                     "online": True,
                     "health_score": 25,
-                    "health_critical_failed": True,
+                    "health_checks": {
+                        "telegram_api": {"ok": False, "applicable": True},
+                        "llm_provider": {"ok": True, "applicable": True},
+                    },
                     "active_turns": 0,
                     "hostname": "weak",
                 },
@@ -874,6 +877,50 @@ def test_health_rebalance_with_hysteresis(monkeypatch):
     cluster_module._maybe_health_rebalance(strong_storage)
     assert strong_storage.cluster.activated == [("strong", "health_rebalance")]
     assert strong_storage.cluster.marked is True
+
+
+def test_health_rebalance_skips_llm_only_failure_when_tg_ok(monkeypatch):
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def __init__(self):
+            self.activated = []
+
+        def get_state(self):
+            return {
+                "handoff_state": "idle",
+                "failover": "auto",
+                "messaging_owner": "win",
+                "preferred_messaging_node": None,
+            }
+
+        def list_nodes(self, **_kwargs):
+            return [
+                {
+                    "node_id": "win",
+                    "online": True,
+                    "health_score": 53,
+                    "health_critical_failed": True,
+                    "health_checks": {
+                        "telegram_api": {"ok": True, "applicable": True},
+                        "llm_provider": {"ok": False, "applicable": True},
+                    },
+                    "active_turns": 0,
+                },
+                {"node_id": "linux", "online": True, "health_score": 90},
+            ]
+
+        def set_active(self, node_id, *, reason="manual"):
+            self.activated.append((node_id, reason))
+
+    monkeypatch.setattr(
+        cluster_module,
+        "_cluster_health_settings",
+        lambda: {"hysteresis": 20.0, "min_score": 40.0, "cooldown_s": 600.0},
+    )
+    storage = type("S", (), {"node_id": "linux", "cluster": Cluster()})()
+    cluster_module._maybe_health_rebalance(storage)
+    assert storage.cluster.activated == []
 
 
 def test_health_rebalance_skipped_when_owner_healthy(monkeypatch):
