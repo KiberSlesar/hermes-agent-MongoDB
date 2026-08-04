@@ -98,6 +98,41 @@ def test_first_live_node_claims_preseeded_empty_cluster_state():
     assert state["messaging_owner"] == "first"
 
 
+def test_list_nodes_treats_iso_string_heartbeat_as_online():
+    """Orchestrator/JSON writers persist heartbeat_at as ISO strings.
+
+    Failover must still see the preferred/live node as online — otherwise
+    both peers look dead and ownership never moves.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from hermes_storage.mongo.stores import MongoClusterStore
+
+    now = datetime.now(timezone.utc)
+    db = _Database(
+        {"_id": "default", "messaging_owner": "dead", "handoff_state": "idle"},
+        [
+            {
+                "node_id": "dead",
+                "hostname": "a",
+                "heartbeat_at": (now - timedelta(seconds=120)).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+            },
+            {
+                "node_id": "live",
+                "hostname": "b",
+                "heartbeat_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+        ],
+    )
+    cluster = MongoClusterStore(db)
+    nodes = {n["node_id"]: n for n in cluster.list_nodes(online_within_s=45.0)}
+    assert nodes["live"]["online"] is True
+    assert nodes["dead"]["online"] is False
+    assert isinstance(nodes["live"]["heartbeat_at"], datetime)
+
+
 def test_active_switch_rejects_source_with_running_turn():
     from hermes_storage.mongo.stores import MongoClusterStore
 

@@ -33,6 +33,32 @@ def _strip_id(doc: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     return out
 
 
+def _parse_heartbeat_at(value: Any) -> Optional[datetime]:
+    """Normalize heartbeat timestamps from Mongo (datetime or ISO string).
+
+    Some writers (JSON/orchestrator paths) persist ``heartbeat_at`` as a
+    string. ``list_nodes`` must treat those as real times — otherwise every
+    node looks offline and failover/failback never fire.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        hb = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            hb = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if hb.tzinfo is None:
+        hb = hb.replace(tzinfo=timezone.utc)
+    return hb
+
+
 class MongoDocumentStore(DocumentStore):
     def __init__(self, collection):
         self._col = collection
@@ -511,10 +537,9 @@ class MongoClusterStore(ClusterStore):
         nodes = []
         for doc in self._nodes.find().sort("hostname", 1):
             item = _strip_id(doc) or {}
-            hb = item.get("heartbeat_at")
-            if isinstance(hb, datetime):
-                if hb.tzinfo is None:
-                    hb = hb.replace(tzinfo=timezone.utc)
+            hb = _parse_heartbeat_at(item.get("heartbeat_at"))
+            if hb is not None:
+                item["heartbeat_at"] = hb
                 item["online"] = hb >= cutoff
             else:
                 item["online"] = False
