@@ -99,3 +99,27 @@ def test_refresh_caches_until_interval(monkeypatch):
     c = ah.refresh_agent_health_if_due(force=True)
     assert calls["n"] == 2
     assert c["health_score"] == 77
+
+
+def test_probe_llm_provider_uses_runtime_provider_for_named_custom(monkeypatch):
+    from hermes_storage import agent_health as ah
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda requested="auto": {
+            "provider": "custom",
+            "requested_provider": "custom:codex.sale",
+            "api_key": "secret",
+            "base_url": "https://codex.sale/v1",
+        },
+    )
+    monkeypatch.setattr(
+        ah,
+        "_http_get",
+        lambda url, **kwargs: (False, 12.5, "http_405"),
+    )
+
+    result = ah.probe_llm_provider()
+    assert result["ok"] is True
+    assert result["applicable"] is True
+    assert result["detail"] == "runtime=custom:codex.sale:key_ok:http_405"

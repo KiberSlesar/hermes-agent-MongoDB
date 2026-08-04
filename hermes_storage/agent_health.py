@@ -113,8 +113,48 @@ def _http_get(
 
 
 def probe_llm_provider() -> dict[str, Any]:
-    """Credential resolve + optional light /models probe (no chat completion)."""
+    """Resolve the same provider/runtime path as chat and light-probe it."""
     started = _now()
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(requested="auto") or {}
+        provider = str(
+            runtime.get("requested_provider")
+            or runtime.get("provider")
+            or ""
+        ).strip()
+        api_key = str(runtime.get("api_key") or "").strip()
+        base_url = str(runtime.get("base_url") or "").strip()
+        if provider:
+            if not api_key:
+                # OAuth / process-backed runtimes may not expose a long-lived key.
+                ms = (_now() - started) * 1000.0
+                return _check_result(True, latency_ms=ms, detail=f"runtime={provider}")
+            if not base_url:
+                ms = (_now() - started) * 1000.0
+                return _check_result(
+                    True,
+                    latency_ms=ms,
+                    detail=f"runtime={provider}:key_ok",
+                )
+            models_url = base_url.rstrip("/") + "/models"
+            ok, ms, detail = _http_get(
+                models_url,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if not ok:
+                # Some providers reject /models — key present still counts as soft-ok.
+                return _check_result(
+                    True,
+                    latency_ms=ms,
+                    detail=f"runtime={provider}:key_ok:{detail}",
+                )
+            return _check_result(True, latency_ms=ms, detail=f"runtime={provider}:{detail}")
+    except Exception:
+        logger.debug("probe_llm_provider runtime resolution failed", exc_info=True)
+
+    # Fallback for older/partial paths that only expose auth-level resolution.
     provider = ""
     try:
         from hermes_cli.auth import resolve_provider
