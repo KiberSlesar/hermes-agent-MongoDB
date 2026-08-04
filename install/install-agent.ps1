@@ -12,6 +12,34 @@ $HermesHome = if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:L
 $Yes = ($env:HERMES_YES -eq "1")
 $SkipConnect = ($env:HERMES_SKIP_CONNECT -eq "1")
 
+# Promote Telegram/messaging proxy → HTTPS_PROXY for GitHub downloads.
+$envFile = Join-Path $HermesHome ".env"
+if (Test-Path $envFile) {
+    Get-Content $envFile | ForEach-Object {
+        if ($_ -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') {
+            $k = $Matches[1]; $v = $Matches[2].Trim().Trim('"').Trim("'")
+            if (-not [string]::IsNullOrWhiteSpace($v) -and -not [Environment]::GetEnvironmentVariable($k)) {
+                [Environment]::SetEnvironmentVariable($k, $v, "Process")
+            }
+        }
+    }
+}
+if (-not ($env:HTTPS_PROXY -or $env:HTTP_PROXY -or $env:https_proxy -or $env:http_proxy)) {
+    $msgProxy = $env:TELEGRAM_PROXY
+    if (-not $msgProxy) { $msgProxy = $env:DISCORD_PROXY }
+    if (-not $msgProxy) { $msgProxy = $env:GATEWAY_PROXY_URL }
+    if ($msgProxy) {
+        $env:HTTPS_PROXY = $msgProxy
+        $env:HTTP_PROXY = $msgProxy
+        $env:https_proxy = $msgProxy
+        $env:http_proxy = $msgProxy
+    }
+}
+if (($env:HTTPS_PROXY -or $env:HTTP_PROXY) -and -not ($env:NO_PROXY -or $env:no_proxy)) {
+    $env:NO_PROXY = "127.0.0.1,localhost,::1,192.168.88.33,192.168.88.44,.local"
+    $env:no_proxy = $env:NO_PROXY
+}
+
 function Get-AuthHeaders {
     $h = @{}
     $tok = $env:GH_TOKEN; if (-not $tok) { $tok = $env:GITHUB_TOKEN }

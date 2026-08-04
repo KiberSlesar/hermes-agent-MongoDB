@@ -11,11 +11,36 @@
 #   HERMES_HOME              (default: ~/.hermes)
 #   HERMES_SKIP_CONNECT=1    skip connect prompt
 #   HERMES_YES=1             replace existing install without prompting
+#   HTTPS_PROXY / HTTP_PROXY / TELEGRAM_PROXY — GitHub tarball egress
 #   bash -s -- --yes --host IP:8743 --code ABCD-EFGH
 # ============================================================================
 set -euo pipefail
 
 HERMES_HOME_DIR="${HERMES_HOME:-$HOME/.hermes}"
+
+# Load local .env (TELEGRAM_PROXY etc.) then promote messaging proxy → HTTPS_PROXY
+# so curl can reach GitHub on boxes that only have Telegram egress configured.
+if [[ -f "$HERMES_HOME_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$HERMES_HOME_DIR/.env" 2>/dev/null || true
+  set +a
+fi
+if [[ -z "${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}" ]]; then
+  _msg_proxy="${TELEGRAM_PROXY:-${DISCORD_PROXY:-${GATEWAY_PROXY_URL:-}}}"
+  if [[ -n "$_msg_proxy" ]]; then
+    export HTTPS_PROXY="$_msg_proxy"
+    export HTTP_PROXY="$_msg_proxy"
+    export https_proxy="$_msg_proxy"
+    export http_proxy="$_msg_proxy"
+  fi
+  unset _msg_proxy
+fi
+if [[ -n "${HTTPS_PROXY:-${HTTP_PROXY:-}}" && -z "${NO_PROXY:-${no_proxy:-}}" ]]; then
+  export NO_PROXY="127.0.0.1,localhost,::1,192.168.88.33,192.168.88.44,.local"
+  export no_proxy="$NO_PROXY"
+fi
+
 REPO="${HERMES_MONGO_REPO:-KiberSlesar/hermes-agent-MongoDB}"
 # Old private clone name was renamed; rewrite stale env overrides.
 if [[ "$REPO" == "KiberSlesar/hermes-agent-MongoDB-private" ]]; then

@@ -29,6 +29,66 @@ _APPLY_THREAD: Optional[threading.Thread] = None
 _LAST_APPLY_ATTEMPT = 0.0
 _APPLY_BACKOFF_S = 300.0
 
+# LAN / control-plane hosts should stay direct when an egress proxy is set for GitHub.
+_DEFAULT_NO_PROXY = (
+    "127.0.0.1,localhost,::1,"
+    "192.168.88.33,192.168.88.44,"
+    ".local"
+)
+
+
+def ensure_egress_proxy_env(env: Optional[dict[str, str]] = None) -> dict[str, str]:
+    """Ensure HTTPS_PROXY is set for GitHub tarball downloads.
+
+    Telegram-only boxes often have ``TELEGRAM_PROXY`` / ``telegram.proxy_url``
+    but no generic ``HTTPS_PROXY``. Fleet installs use curl/urllib, which need
+    the latter — promote the messaging proxy when generic egress is unset.
+    """
+    target = env if env is not None else os.environ
+    existing = (
+        (target.get("HTTPS_PROXY") or target.get("https_proxy") or "").strip()
+        or (target.get("HTTP_PROXY") or target.get("http_proxy") or "").strip()
+        or (target.get("ALL_PROXY") or target.get("all_proxy") or "").strip()
+    )
+    if existing:
+        if not (target.get("NO_PROXY") or target.get("no_proxy") or "").strip():
+            target.setdefault("NO_PROXY", _DEFAULT_NO_PROXY)
+            target.setdefault("no_proxy", _DEFAULT_NO_PROXY)
+        return target
+
+    candidates: list[str] = []
+    for key in ("TELEGRAM_PROXY", "DISCORD_PROXY", "GATEWAY_PROXY_URL"):
+        val = (target.get(key) or os.environ.get(key) or "").strip()
+        if val:
+            candidates.append(val)
+    try:
+        from hermes_storage import get_storage, is_mongo_mode
+
+        if is_mongo_mode():
+            storage = get_storage()
+            if storage is not None:
+                cfg = storage.load_effective_config({}) or {}
+                for section in ("telegram", "discord", "gateway"):
+                    block = cfg.get(section) if isinstance(cfg, dict) else None
+                    if isinstance(block, dict):
+                        url = str(block.get("proxy_url") or "").strip()
+                        if url:
+                            candidates.append(url)
+    except Exception:
+        pass
+
+    proxy = next((c for c in candidates if c), "")
+    if proxy:
+        target["HTTPS_PROXY"] = proxy
+        target["HTTP_PROXY"] = proxy
+        target["https_proxy"] = proxy
+        target["http_proxy"] = proxy
+        if not (target.get("NO_PROXY") or target.get("no_proxy") or "").strip():
+            target["NO_PROXY"] = _DEFAULT_NO_PROXY
+            target["no_proxy"] = _DEFAULT_NO_PROXY
+        logger.info("Fleet download egress via messaging proxy %s", proxy)
+    return target
+
 
 def local_agent_version() -> str:
     try:
@@ -360,7 +420,7 @@ def run_mongo_fork_install(desired: dict[str, Any]) -> int:
 
     repo = str(desired.get("repo") or DEFAULT_REPO)
     ref = str(desired.get("ref") or DEFAULT_REF)
-    env = os.environ.copy()
+    env = ensure_egress_proxy_env(os.environ.copy())
     env["HERMES_YES"] = "1"
     env["HERMES_SKIP_CONNECT"] = "1"
     env["HERMES_MONGO_REPO"] = repo
@@ -400,6 +460,9 @@ def run_mongo_fork_install(desired: dict[str, Any]) -> int:
         tmp.mkdir(parents=True, exist_ok=True)
         script = tmp / f"hermes-{raw_name}"
         try:
+            # urllib reads process env; also keep subprocess env in sync.
+            ensure_egress_proxy_env()
+            ensure_egress_proxy_env(env)
             with urllib.request.urlopen(url, timeout=60) as resp:
                 script.write_bytes(resp.read())
         except Exception as exc:
@@ -602,6 +665,7 @@ def download_repo_tarball(*, repo: str, ref: str, dest: Path) -> Path:
     """Download GitHub tarball to ``dest`` (file). Returns dest."""
     import urllib.request
 
+    ensure_egress_proxy_env()
     dest.parent.mkdir(parents=True, exist_ok=True)
     urls = [
         f"https://codeload.github.com/{repo}/tar.gz/{ref}",
