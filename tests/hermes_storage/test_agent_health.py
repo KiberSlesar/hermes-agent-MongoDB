@@ -104,14 +104,29 @@ def test_refresh_caches_until_interval(monkeypatch):
 def test_probe_llm_provider_uses_runtime_provider_for_named_custom(monkeypatch):
     from hermes_storage import agent_health as ah
 
-    monkeypatch.setattr(
-        "hermes_cli.runtime_provider.resolve_runtime_provider",
-        lambda requested="auto": {
+    calls = {"requested": None}
+
+    def _resolve_requested(requested=None):
+        # Config-driven path: None → custom:codex.sale (not literal "auto").
+        assert requested is None
+        return "custom:codex.sale"
+
+    def _resolve_runtime(requested=None):
+        calls["requested"] = requested
+        return {
             "provider": "custom",
             "requested_provider": "custom:codex.sale",
             "api_key": "secret",
             "base_url": "https://codex.sale/v1",
-        },
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_requested_provider",
+        _resolve_requested,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        _resolve_runtime,
     )
     monkeypatch.setattr(
         ah,
@@ -120,6 +135,43 @@ def test_probe_llm_provider_uses_runtime_provider_for_named_custom(monkeypatch):
     )
 
     result = ah.probe_llm_provider()
+    assert calls["requested"] == "custom:codex.sale"
     assert result["ok"] is True
     assert result["applicable"] is True
-    assert result["detail"] == "runtime=custom:codex.sale:key_ok:http_405"
+    assert result["detail"] == "runtime=custom:codex.sale:resolved:http_405"
+
+
+def test_probe_llm_provider_must_not_pass_literal_auto(monkeypatch):
+    """Passing requested='auto' skips config model.provider and false-fails."""
+    from hermes_storage import agent_health as ah
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_requested_provider",
+        lambda requested=None: "custom:codex.sale",
+    )
+
+    def _boom(requested=None):
+        raise AssertionError(f"should use config provider, got {requested!r}")
+
+    # If probe wrongly passes requested="auto", resolve_runtime is never reached
+    # with the config id — guard the call args instead.
+    seen = {}
+
+    def _resolve_runtime(requested=None):
+        seen["requested"] = requested
+        return {
+            "provider": "custom",
+            "requested_provider": requested,
+            "api_key": "k",
+            "base_url": "https://example.test/v1",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        _resolve_runtime,
+    )
+    monkeypatch.setattr(ah, "_http_get", lambda *a, **k: (True, 1.0, "http_200"))
+    result = ah.probe_llm_provider()
+    assert seen["requested"] == "custom:codex.sale"
+    assert seen["requested"] != "auto"
+    assert result["ok"] is True

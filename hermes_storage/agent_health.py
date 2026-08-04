@@ -116,41 +116,50 @@ def probe_llm_provider() -> dict[str, Any]:
     """Resolve the same provider/runtime path as chat and light-probe it."""
     started = _now()
     try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_cli.runtime_provider import (
+            resolve_requested_provider,
+            resolve_runtime_provider,
+        )
 
-        runtime = resolve_runtime_provider(requested="auto") or {}
+        # IMPORTANT: do NOT pass requested="auto". That short-circuits
+        # resolve_requested_provider() and skips config model.provider
+        # (e.g. custom:codex.sale), so the probe falsely fails while chat works.
+        requested = resolve_requested_provider(None)
+        runtime = resolve_runtime_provider(requested=requested) or {}
         provider = str(
             runtime.get("requested_provider")
             or runtime.get("provider")
+            or requested
             or ""
         ).strip()
         api_key = str(runtime.get("api_key") or "").strip()
         base_url = str(runtime.get("base_url") or "").strip()
         if provider:
-            if not api_key:
-                # OAuth / process-backed runtimes may not expose a long-lived key.
-                ms = (_now() - started) * 1000.0
-                return _check_result(True, latency_ms=ms, detail=f"runtime={provider}")
+            # Successful runtime resolve means chat can dial this provider.
+            # /models is optional and often hangs/rejects on custom gateways.
             if not base_url:
                 ms = (_now() - started) * 1000.0
                 return _check_result(
                     True,
                     latency_ms=ms,
-                    detail=f"runtime={provider}:key_ok",
+                    detail=f"runtime={provider}:resolved",
                 )
             models_url = base_url.rstrip("/") + "/models"
-            ok, ms, detail = _http_get(
-                models_url,
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
+            headers = {}
+            if api_key and api_key not in {"no-key-required", "moa-virtual-provider"}:
+                headers["Authorization"] = f"Bearer {api_key}"
+            ok, ms, detail = _http_get(models_url, headers=headers or None)
             if not ok:
-                # Some providers reject /models — key present still counts as soft-ok.
                 return _check_result(
                     True,
                     latency_ms=ms,
-                    detail=f"runtime={provider}:key_ok:{detail}",
+                    detail=f"runtime={provider}:resolved:{detail}",
                 )
-            return _check_result(True, latency_ms=ms, detail=f"runtime={provider}:{detail}")
+            return _check_result(
+                True,
+                latency_ms=ms,
+                detail=f"runtime={provider}:{detail}",
+            )
     except Exception:
         logger.debug("probe_llm_provider runtime resolution failed", exc_info=True)
 
