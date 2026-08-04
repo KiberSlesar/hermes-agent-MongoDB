@@ -3014,6 +3014,14 @@ DEFAULT_CONFIG = {
     # Prefer HERMES_API_BASE env on each agent PC; this is the config.yaml fallback.
     "cluster": {
         "api_base": "",
+        # Self-diag interval for health_score used in failover priority (seconds).
+        "health_interval_s": 300,
+        # Rebalance when owner degraded and peer score is this many points higher.
+        "health_rebalance_hysteresis": 20,
+        # Minimum owner score (or critical check fail) to consider rebalance.
+        "health_rebalance_min_score": 40,
+        # Cooldown between health_rebalance handoffs (seconds).
+        "health_rebalance_cooldown_s": 600,
     },
 
     # Config schema version - bump this when adding new required fields

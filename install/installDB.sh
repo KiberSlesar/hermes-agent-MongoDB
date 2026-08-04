@@ -11,7 +11,7 @@
 #   HERMES_LISTEN_MODE=lo|lan|wan
 #   HERMES_ADVERTISE_HOST=1.2.3.4
 #   HERMES_DB_HOME=~/hermes-db
-#   HERMES_FLEET_VERSION=0.19.5   # published for agents (default: from tarball)
+#   HERMES_FLEET_VERSION=0.19.7   # published for agents (default: from tarball)
 #   HERMES_SKIP_CONNECT=1
 # ============================================================================
 set -euo pipefail
@@ -402,7 +402,7 @@ echo "  Enroll       : http://${ADVERTISE_HOST}:8743"
 echo "  Orchestrator : https://${ADVERTISE_HOST}:8744  (mTLS)"
 echo "  Fleet        : ${HERMES_FLEET_VERSION:-?}@${REF}"
 echo "  Status       : systemctl --user status hermes-mongod hermes-enroll hermes-orchestrator"
-echo "  Update fleet : hermes cluster update --version ${HERMES_FLEET_VERSION:-0.19.5}"
+echo "  Update fleet : hermes cluster update --version ${HERMES_FLEET_VERSION:-0.19.7}"
 echo "                 or: $HERMES_DB_HOME/scripts/cluster-update.sh"
 echo "  Agents       : agents"
 echo "  Add agent    : agent-add [name]"

@@ -4806,8 +4806,8 @@ def cmd_cluster(args):
     if not is_mongo_mode():
         print("Error: Mongo/cluster mode is not enabled.")
         print("On the DB server you can still run:")
-        print("  hermes cluster update --version 0.19.5")
-        print("  or: $HERMES_DB_HOME/scripts/cluster-update.sh --version 0.19.5")
+        print("  hermes cluster update --version 0.19.7")
+        print("  or: $HERMES_DB_HOME/scripts/cluster-update.sh --version 0.19.7")
         raise SystemExit(1)
     storage = get_storage(force=True)
     storage.register_presence()

@@ -138,9 +138,11 @@ def format_cluster_prompt_block(status: Optional[dict[str, Any]] = None) -> str:
             marker = " *" if n.get("node_id") == state.get("active_node_id") else ""
             api = (n.get("api_base") or "").strip()
             chat = "chat_ready" if n.get("chat_ready") else ("no_api_base" if not api else "api_base_set")
+            score = n.get("health_score")
+            score_s = f" health={score}" if score is not None else ""
             lines.append(
                 f"  - {n.get('hostname') or n.get('machine_id')} "
-                f"[{n.get('node_id')}] caps={caps} {chat}"
+                f"[{n.get('node_id')}] caps={caps} {chat}{score_s}"
                 f"{(' ' + api) if api else ''}{marker}"
             )
     lines.append(
@@ -194,6 +196,14 @@ def start_heartbeat_loop(
                         orch_heartbeat,
                         orchestrator_configured,
                     )
+
+                    health_fields = {}
+                    try:
+                        from hermes_storage.agent_health import presence_health_fields
+
+                        health_fields = presence_health_fields()
+                    except Exception:
+                        logger.debug("orch health fields failed", exc_info=True)
                     if orchestrator_configured():
                         orch_heartbeat({
                             "node_id": storage.node_id,
@@ -205,12 +215,15 @@ def start_heartbeat_loop(
                             "active_turns": runtime.get("active_turns", 0),
                             "active_session_keys": runtime.get("active_session_keys") or [],
                             **presence_version_fields(),
+                            **health_fields,
                         })
                 except Exception as orch_exc:
                     logger.debug("Orchestrator heartbeat skipped: %s", orch_exc)
                 _maybe_handle_handoff(storage)
                 _maybe_reconcile_messaging(storage)
                 _maybe_failover(storage)
+                _maybe_failback(storage)
+                _maybe_health_rebalance(storage)
             except Exception as exc:
                 logger.warning("Cluster heartbeat failed: %s", exc)
             _HEARTBEAT_STOP.wait(interval_s)
@@ -341,6 +354,63 @@ def format_cluster_move_notice(
     return text
 
 
+def _node_is_online(
+    storage: Any,
+    node_id: Optional[str],
+    *,
+    within_s: float = 45.0,
+) -> bool:
+    if not node_id:
+        return False
+    nodes = {
+        n.get("node_id"): n
+        for n in (storage.cluster.list_nodes(online_within_s=within_s) or [])
+    }
+    return bool((nodes.get(node_id) or {}).get("online"))
+
+
+def _notify_cluster(notice: str, session_keys: Optional[list] = None) -> None:
+    notify = _NOTIFY_CB
+    if not notify:
+        return
+    keys = list(session_keys or [])
+    try:
+        notify(notice, keys)
+    except TypeError:
+        try:
+            notify(notice)
+        except Exception:
+            logger.debug("Cluster notify failed", exc_info=True)
+    except Exception:
+        logger.debug("Cluster notify failed", exc_info=True)
+
+
+def _complete_handoff_as_owner(
+    storage: Any,
+    node_id: str,
+    *,
+    from_id: Optional[str],
+    session_keys: Optional[list],
+    messaging_held: bool,
+    degraded_reason: Optional[str] = None,
+) -> None:
+    """Finish handoff onto ``node_id`` (optionally with degraded messaging)."""
+    global _LOCAL_MESSAGING_HELD
+    _LOCAL_MESSAGING_HELD = bool(messaging_held)
+    notice = format_cluster_move_notice(
+        storage, from_node_id=from_id, to_node_id=node_id
+    )
+    if degraded_reason:
+        notice = (
+            notice
+            + " ⚠️ Messaging platforms failed to connect "
+            f"({degraded_reason}); web/tools stay on this node — Telegram "
+            "will retry. Ownership was NOT rolled back to an offline agent."
+        )
+    storage.cluster.complete_messaging_handoff(node_id)
+    _notify_cluster(notice, session_keys)
+
+
 def _run_acquire_for_handoff(storage: Any, node_id: str) -> None:
     """Complete an in-progress acquiring handoff via the gateway callback."""
     global _LOCAL_MESSAGING_HELD
@@ -363,47 +433,48 @@ def _run_acquire_for_handoff(storage: Any, node_id: str) -> None:
     except Exception as exc:
         ok = False
         err = str(exc)
+    pre = storage.cluster.get_state() or {}
+    session_keys = list(pre.get("handoff_session_keys") or [])
+    from_id = pre.get("handoff_from")
     if ok:
-        _LOCAL_MESSAGING_HELD = True
-        pre = storage.cluster.get_state() or {}
-        session_keys = list(pre.get("handoff_session_keys") or [])
-        from_id = pre.get("handoff_from")
-        notice = format_cluster_move_notice(
-            storage, from_node_id=from_id, to_node_id=node_id
+        _complete_handoff_as_owner(
+            storage,
+            node_id,
+            from_id=from_id,
+            session_keys=session_keys,
+            messaging_held=True,
         )
-        storage.cluster.complete_messaging_handoff(node_id)
-        notify = _NOTIFY_CB
-        if notify:
-            try:
-                notify(notice, session_keys)
-            except TypeError:
-                # Older single-arg callbacks
-                try:
-                    notify(notice)
-                except Exception:
-                    logger.debug("Cluster notify failed", exc_info=True)
-            except Exception:
-                logger.debug("Cluster notify failed", exc_info=True)
-    else:
-        _LOCAL_MESSAGING_HELD = False
-        storage.cluster.rollback_messaging_handoff(
-            reason=err or "messaging health-check failed"
+        return
+
+    # Messaging health-check failed. Never roll ownership back onto a dead
+    # previous owner — web UI / tools still need a live agent. Reconcile will
+    # keep retrying Telegram/Discord while we hold the lease.
+    _LOCAL_MESSAGING_HELD = False
+    reason = err or "messaging health-check failed"
+    if not _node_is_online(storage, from_id):
+        logger.warning(
+            "Messaging acquire failed (%s) but previous owner %s is offline; "
+            "completing handoff to %s in degraded mode",
+            reason,
+            from_id,
+            node_id,
         )
-        notify = _NOTIFY_CB
-        if notify:
-            try:
-                fail_msg = (
-                    "⚠️ Системное сообщение: не удалось перенести активного агента "
-                    f"сюда ({err or 'health-check failed'}). Handoff откатан."
-                )
-                notify(fail_msg, [])
-            except TypeError:
-                try:
-                    notify(fail_msg)
-                except Exception:
-                    pass
-            except Exception:
-                pass
+        _complete_handoff_as_owner(
+            storage,
+            node_id,
+            from_id=from_id,
+            session_keys=session_keys,
+            messaging_held=False,
+            degraded_reason=reason,
+        )
+        return
+
+    storage.cluster.rollback_messaging_handoff(reason=reason)
+    _notify_cluster(
+        "⚠️ Системное сообщение: не удалось перенести активного агента "
+        f"сюда ({reason}). Handoff откатан.",
+        [],
+    )
 
 
 def _maybe_reconcile_messaging(storage: Any) -> None:
@@ -472,6 +543,99 @@ def _maybe_drop_stale_messaging(storage: Any) -> None:
     _LOCAL_MESSAGING_HELD = False
 
 
+def _node_health_score(node: dict[str, Any]) -> int:
+    try:
+        return int(node.get("health_score") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _pick_best_online_candidate(
+    nodes: list[dict[str, Any]] | dict[str, dict[str, Any]],
+    *,
+    exclude: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Pick online node with highest health_score (hostname tie-break)."""
+    if isinstance(nodes, dict):
+        values = list(nodes.values())
+    else:
+        values = list(nodes or [])
+    candidates = [
+        n for n in values
+        if n.get("online") and n.get("node_id") and n.get("node_id") != exclude
+    ]
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda n: (
+            _node_health_score(n),
+            str(n.get("hostname") or n.get("node_id") or ""),
+        ),
+        reverse=True,
+    )
+    return candidates[0]
+
+
+def _cluster_health_settings() -> dict[str, float]:
+    hysteresis = 20.0
+    min_score = 40.0
+    cooldown = 600.0
+    try:
+        from hermes_cli.config import load_config
+
+        cluster = (load_config() or {}).get("cluster") or {}
+        if cluster.get("health_rebalance_hysteresis") is not None:
+            hysteresis = float(cluster["health_rebalance_hysteresis"])
+        if cluster.get("health_rebalance_min_score") is not None:
+            min_score = float(cluster["health_rebalance_min_score"])
+        if cluster.get("health_rebalance_cooldown_s") is not None:
+            cooldown = float(cluster["health_rebalance_cooldown_s"])
+    except Exception:
+        logger.debug("cluster health settings read failed", exc_info=True)
+    return {
+        "hysteresis": hysteresis,
+        "min_score": min_score,
+        "cooldown_s": cooldown,
+    }
+
+
+def _owner_is_degraded(owner_node: dict[str, Any], *, min_score: float) -> bool:
+    if bool(owner_node.get("health_critical_failed")):
+        return True
+    checks = owner_node.get("health_checks") or {}
+    for name in ("telegram_api", "llm_provider"):
+        row = checks.get(name) or {}
+        if row.get("applicable") is False:
+            continue
+        if row.get("ok") is False:
+            return True
+    return _node_health_score(owner_node) <= float(min_score)
+
+
+def _health_rebalance_cooldown_active(state: dict[str, Any], cooldown_s: float) -> bool:
+    raw = state.get("last_health_rebalance_at")
+    if raw is None:
+        return False
+    try:
+        from datetime import datetime, timezone
+
+        if isinstance(raw, datetime):
+            ts = raw
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - ts).total_seconds()
+            return age < float(cooldown_s)
+        # ISO string
+        text = str(raw).replace("Z", "+00:00")
+        ts = datetime.fromisoformat(text)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - ts).total_seconds()
+        return age < float(cooldown_s)
+    except Exception:
+        return False
+
+
 def _maybe_failover(storage: Any) -> None:
     state = storage.cluster.get_state()
     if (state.get("failover") or "auto") != "auto":
@@ -483,23 +647,137 @@ def _maybe_failover(storage: Any) -> None:
     owner_node = nodes.get(owner)
     if owner_node and owner_node.get("online"):
         return
-    # Owner unhealthy — try next online node (prefer this node if online)
-    candidates = [n for n in nodes.values() if n.get("online") and n["node_id"] != owner]
-    if not candidates:
+    # Owner unhealthy — pick the highest health_score among online peers.
+    target = _pick_best_online_candidate(nodes, exclude=owner)
+    if not target:
         return
-    # Prefer self
-    self_node = nodes.get(storage.node_id)
-    target = self_node if self_node and self_node.get("online") else candidates[0]
-    if target["node_id"] == storage.node_id:
-        logger.warning(
-            "Messaging owner %s unhealthy; initiating failover to %s",
-            owner,
-            target["node_id"],
-        )
-        storage.cluster.set_active(target["node_id"], reason="failover")
-        # Failover uses set_active directly (not HermesStorage.activate), so
-        # kick the local gateway here — otherwise handoff stalls without CB.
-        ensure_local_gateway_service()
+    # Only the chosen best node initiates (single initiator, no race).
+    if target["node_id"] != storage.node_id:
+        return
+    logger.warning(
+        "Messaging owner %s unhealthy; initiating failover to %s (health=%s)",
+        owner,
+        target["node_id"],
+        _node_health_score(target),
+    )
+    # Remember where to return when the preferred/home node wakes up.
+    ensure = getattr(storage.cluster, "ensure_preferred_messaging_node", None)
+    if callable(ensure):
+        try:
+            ensure(owner)
+        except Exception:
+            logger.debug("ensure_preferred_messaging_node failed", exc_info=True)
+    storage.cluster.set_active(target["node_id"], reason="failover")
+    # Failover uses set_active directly (not HermesStorage.activate), so
+    # kick the local gateway here — otherwise handoff stalls without CB.
+    ensure_local_gateway_service()
+
+
+def _maybe_health_rebalance(storage: Any) -> None:
+    """Move lease to a healthier online peer when the owner is degraded.
+
+    Preferred failback still wins when the home node returns; this only
+    reshuffles among temporary owners while preferred is away.
+    """
+    state = storage.cluster.get_state() or {}
+    if (state.get("failover") or "auto") != "auto":
+        return
+    handoff = state.get("handoff_state") or "idle"
+    if handoff not in (None, "idle", "done"):
+        return
+    owner = state.get("messaging_owner")
+    if not owner:
+        return
+    settings = _cluster_health_settings()
+    if _health_rebalance_cooldown_active(state, settings["cooldown_s"]):
+        return
+    nodes = {
+        n["node_id"]: n
+        for n in storage.cluster.list_nodes(online_within_s=45.0)
+    }
+    owner_node = nodes.get(owner) or {}
+    if not owner_node.get("online"):
+        return
+    if int(owner_node.get("active_turns") or 0) > 0:
+        return
+    if not _owner_is_degraded(owner_node, min_score=settings["min_score"]):
+        return
+    best = _pick_best_online_candidate(nodes, exclude=None)
+    if not best or best.get("node_id") == owner:
+        return
+    owner_score = _node_health_score(owner_node)
+    best_score = _node_health_score(best)
+    if best_score < owner_score + settings["hysteresis"]:
+        return
+    # Only the best peer initiates.
+    if best["node_id"] != storage.node_id:
+        return
+    preferred = (state.get("preferred_messaging_node") or "").strip()
+    # Do not steal from preferred while it is online (failback owns that path).
+    if preferred and preferred == owner and owner_node.get("online"):
+        return
+    logger.warning(
+        "Health rebalance: owner %s score=%s degraded; moving to %s score=%s",
+        owner,
+        owner_score,
+        best["node_id"],
+        best_score,
+    )
+    mark = getattr(storage.cluster, "mark_health_rebalance", None)
+    if callable(mark):
+        try:
+            mark()
+        except Exception:
+            logger.debug("mark_health_rebalance failed", exc_info=True)
+    try:
+        storage.cluster.set_active(best["node_id"], reason="health_rebalance")
+    except RuntimeError as exc:
+        logger.info("Health rebalance deferred: %s", exc)
+        return
+    ensure_local_gateway_service()
+
+
+def _maybe_failback(storage: Any) -> None:
+    """Return messaging lease to preferred node once it is online again.
+
+    Only the preferred node initiates (same "prefer self" pattern as failover)
+    so two online agents do not race.
+    """
+    state = storage.cluster.get_state() or {}
+    if (state.get("failover") or "auto") != "auto":
+        return
+    handoff = state.get("handoff_state") or "idle"
+    if handoff not in (None, "idle", "done"):
+        return
+    preferred = (state.get("preferred_messaging_node") or "").strip()
+    if not preferred:
+        return
+    owner = state.get("messaging_owner") or state.get("active_node_id")
+    if not owner or preferred == owner:
+        return
+    if storage.node_id != preferred:
+        return
+    if not _node_is_online(storage, preferred):
+        return
+    # Prefer waiting until current owner is idle (no in-flight turns).
+    nodes = {
+        n.get("node_id"): n
+        for n in (storage.cluster.list_nodes(online_within_s=45.0) or [])
+    }
+    current = nodes.get(owner) or {}
+    if int(current.get("active_turns") or 0) > 0:
+        return
+    logger.info(
+        "Preferred messaging node %s is back online; failback from %s",
+        preferred,
+        owner,
+    )
+    try:
+        storage.cluster.set_active(preferred, reason="failback")
+    except RuntimeError as exc:
+        logger.info("Failback deferred: %s", exc)
+        return
+    ensure_local_gateway_service()
 
 
 def register_messaging_callbacks(

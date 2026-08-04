@@ -416,7 +416,14 @@ class HermesStorage:
         active_turns: int = 0,
         active_session_keys: Optional[list[str]] = None,
     ) -> None:
+        from hermes_storage.agent_health import presence_health_fields
         from hermes_storage.fleet_update import presence_version_fields
+
+        health: dict = {}
+        try:
+            health = presence_health_fields()
+        except Exception:
+            logger.debug("presence health fields failed", exc_info=True)
 
         self.cluster.heartbeat({
             "node_id": self.node_id,
@@ -429,6 +436,7 @@ class HermesStorage:
             "active_turns": max(0, int(active_turns)),
             "active_session_keys": list(active_session_keys or []),
             **presence_version_fields(),
+            **health,
         })
         self.machines.upsert_machine(self.machine_id, {
             "hostname": hostname or socket.gethostname(),

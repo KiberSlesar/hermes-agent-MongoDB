@@ -199,3 +199,170 @@ def test_is_mongo_agent_install_with_bootstrap(tmp_path, monkeypatch):
     assert fu.is_mongo_agent_install() is False
     (tmp_path / "bootstrap.yaml").write_text("profile: default\n", encoding="utf-8")
     assert fu.is_mongo_agent_install() is True
+
+
+def test_heartbeat_tick_does_not_schedule_fleet_update(monkeypatch):
+    """Cluster heartbeat helpers must not auto-apply fleet updates."""
+    from hermes_storage import cluster as cluster_module
+    from hermes_storage import fleet_update as fu
+
+    scheduled = []
+
+    def _schedule(*_a, **_k):
+        scheduled.append(1)
+        return {"scheduled": True}
+
+    monkeypatch.setattr(fu, "maybe_schedule_fleet_update", _schedule)
+
+    class Cluster:
+        def get_state(self):
+            return {
+                "handoff_state": "idle",
+                "messaging_owner": "n1",
+                "failover": "auto",
+            }
+
+        def list_nodes(self, **_kwargs):
+            return [{"node_id": "n1", "online": True}]
+
+        def set_active(self, *_a, **_k):
+            raise AssertionError("unexpected set_active")
+
+    storage = type(
+        "S",
+        (),
+        {
+            "node_id": "n1",
+            "machine_id": "m1",
+            "cluster": Cluster(),
+            "fleet_release": type(
+                "R",
+                (),
+                {"get": lambda self: {"version": "9.9.9", "ref": "main"}},
+            )(),
+        },
+    )()
+
+    monkeypatch.setattr(cluster_module, "_ACQUIRE_CB", None)
+    monkeypatch.setattr(cluster_module, "_RELEASE_CB", None)
+    monkeypatch.setattr(cluster_module, "_NOTIFY_CB", None)
+    monkeypatch.setattr(cluster_module, "_LOCAL_MESSAGING_HELD", True)
+    monkeypatch.setattr(cluster_module, "_GATEWAY_BOOTSTRAPPING", False)
+
+    # Same suite the heartbeat loop calls each tick (no fleet scheduler).
+    cluster_module._maybe_handle_handoff(storage)
+    cluster_module._maybe_reconcile_messaging(storage)
+    cluster_module._maybe_failover(storage)
+    cluster_module._maybe_failback(storage)
+    cluster_module._maybe_health_rebalance(storage)
+
+    assert scheduled == []
+    assert not hasattr(cluster_module, "maybe_schedule_fleet_update")
+
+
+def test_run_cluster_server_update_caches_and_publishes(tmp_path, monkeypatch):
+    from hermes_storage import fleet_update as fu
+
+    monkeypatch.setenv("HERMES_DB_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_CONTROL_DIR", str(tmp_path))
+    monkeypatch.delenv("HERMES_FLEET_VERSION", raising=False)
+
+    def _download(*, repo, ref, dest):
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            content = b'print("ok")\n'
+            info = tarfile.TarInfo(
+                name="repo-sha/deploy/control-plane/scripts/publish_fleet_release.py"
+            )
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+        dest.write_bytes(buf.getvalue())
+        return dest
+
+    published = {}
+
+    class Release:
+        def put(self, **kwargs):
+            published.update(kwargs)
+            return {
+                "version": kwargs["version"],
+                "ref": kwargs["ref"],
+                "repo": kwargs["repo"],
+                "artifact": kwargs.get("artifact"),
+            }
+
+    storage = type("S", (), {"fleet_release": Release()})()
+    monkeypatch.setattr(fu, "download_repo_tarball", _download)
+    monkeypatch.setattr(
+        fu, "restart_control_plane_units_best_effort", lambda: {"restarted": False}
+    )
+
+    result = fu.run_cluster_server_update(
+        version="0.19.5",
+        ref="main",
+        repo="KiberSlesar/hermes-agent-MongoDB",
+        storage=storage,
+    )
+
+    assert result["ok"] is True
+    artifact = Path(result["artifact"])
+    assert artifact.is_file()
+    assert artifact.name == "src.tgz"
+    assert "main" in str(artifact)
+    assert published["version"] == "0.19.5"
+    assert published["ref"] == "main"
+    assert published.get("artifact")
+    assert (tmp_path / "scripts" / "publish_fleet_release.py").is_file()
+    assert "hermes update" in (result.get("next_step") or "")
+
+
+def test_run_mongo_agent_update_cli_check_and_apply_gating(monkeypatch, capsys):
+    from hermes_storage import fleet_update as fu
+
+    desired = {"version": "0.19.5", "ref": "main", "repo": "x/y"}
+    monkeypatch.setattr(fu, "resolve_desired_fleet_release", lambda _s=None: desired)
+    monkeypatch.setattr(fu, "local_agent_version", lambda: "0.19.5")
+    monkeypatch.setattr(fu, "local_install_ref", lambda: "main")
+    monkeypatch.setattr("hermes_storage.is_mongo_mode", lambda: False)
+    monkeypatch.setattr(fu, "apply_fleet_update_sync", lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("must not apply when in sync")
+    ))
+
+    args = type("A", (), {"check": True})()
+    try:
+        fu.run_mongo_agent_update_cli(args)
+        raised = None
+    except SystemExit as exc:
+        raised = exc.code
+    assert raised == 0
+    out = capsys.readouterr().out
+    assert "mongo-fleet" in out
+    assert '"in_sync": true' in out or '"in_sync": True' in out
+
+    # Out of sync + --check → exit 1, no apply
+    monkeypatch.setattr(fu, "local_agent_version", lambda: "0.19.0")
+    applied = {"n": 0}
+
+    def _apply(*_a, **_k):
+        applied["n"] += 1
+        return {"ok": True, "needed": True, "exit_code": 0}
+
+    monkeypatch.setattr(fu, "apply_fleet_update_sync", _apply)
+    try:
+        fu.run_mongo_agent_update_cli(type("A", (), {"check": True})())
+        check_code = None
+    except SystemExit as exc:
+        check_code = exc.code
+    assert check_code == 1
+    assert applied["n"] == 0
+
+    # Apply path when stale
+    try:
+        fu.run_mongo_agent_update_cli(type("A", (), {"check": False})())
+        apply_code = None
+    except SystemExit as exc:
+        apply_code = exc.code
+    assert apply_code == 0
+    assert applied["n"] == 1

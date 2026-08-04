@@ -508,3 +508,468 @@ def test_drop_stale_messaging_when_lease_lost(monkeypatch):
 
     assert released == [True]
     assert cluster_module._LOCAL_MESSAGING_HELD is False
+
+
+def test_acquire_fail_offline_previous_completes_degraded(monkeypatch):
+    """Dead Windows + TG fail on Linux must NOT rollback ownership to dead."""
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def __init__(self):
+            self.state = {
+                "handoff_state": "acquiring",
+                "handoff_from": "win",
+                "handoff_to": "linux",
+                "handoff_session_keys": ["agent:main:telegram:dm:1"],
+            }
+            self.completed = False
+            self.rolled_back = False
+
+        def get_state(self):
+            return dict(self.state)
+
+        def list_nodes(self, **_kwargs):
+            return [
+                {"node_id": "win", "online": False, "hostname": "R2D2"},
+                {"node_id": "linux", "online": True, "hostname": "hermes-mongo"},
+            ]
+
+        def complete_messaging_handoff(self, node_id):
+            self.completed = True
+            self.state = {
+                "handoff_state": "idle",
+                "messaging_owner": node_id,
+                "active_node_id": node_id,
+                "handoff_session_keys": [],
+            }
+
+        def rollback_messaging_handoff(self, *, reason):
+            self.rolled_back = True
+            raise AssertionError(f"must not rollback to dead owner: {reason}")
+
+    notes = []
+    cluster = Cluster()
+    monkeypatch.setattr(cluster_module, "_ACQUIRE_CB", lambda: False)
+    monkeypatch.setattr(
+        cluster_module,
+        "_NOTIFY_CB",
+        lambda msg, keys=None: notes.append((msg, list(keys or []))),
+    )
+    storage = type("Storage", (), {
+        "node_id": "linux",
+        "machine_id": "linux-pc",
+        "cluster": cluster,
+    })()
+
+    cluster_module._run_acquire_for_handoff(storage, "linux")
+
+    assert cluster.completed is True
+    assert cluster.rolled_back is False
+    assert cluster.state["messaging_owner"] == "linux"
+    assert cluster_module._LOCAL_MESSAGING_HELD is False
+    assert notes
+    assert "offline" in notes[0][0].lower() or "degraded" in notes[0][0].lower() or "failed" in notes[0][0].lower()
+    assert notes[0][1] == ["agent:main:telegram:dm:1"]
+
+
+def test_acquire_fail_online_previous_still_rolls_back(monkeypatch):
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def __init__(self):
+            self.state = {
+                "handoff_state": "acquiring",
+                "handoff_from": "win",
+                "handoff_to": "linux",
+                "handoff_session_keys": [],
+            }
+            self.completed = False
+            self.rolled_back = False
+
+        def get_state(self):
+            return dict(self.state)
+
+        def list_nodes(self, **_kwargs):
+            return [
+                {"node_id": "win", "online": True},
+                {"node_id": "linux", "online": True},
+            ]
+
+        def complete_messaging_handoff(self, _node_id):
+            self.completed = True
+
+        def rollback_messaging_handoff(self, *, reason):
+            self.rolled_back = True
+            self.state = {
+                "handoff_state": "idle",
+                "messaging_owner": "win",
+                "active_node_id": "win",
+                "handoff_error": reason,
+            }
+
+    cluster = Cluster()
+    monkeypatch.setattr(cluster_module, "_ACQUIRE_CB", lambda: False)
+    monkeypatch.setattr(cluster_module, "_NOTIFY_CB", None)
+    storage = type("Storage", (), {
+        "node_id": "linux",
+        "machine_id": "linux-pc",
+        "cluster": cluster,
+    })()
+
+    cluster_module._run_acquire_for_handoff(storage, "linux")
+
+    assert cluster.completed is False
+    assert cluster.rolled_back is True
+    assert cluster.state["messaging_owner"] == "win"
+    assert cluster_module._LOCAL_MESSAGING_HELD is False
+
+
+def test_failback_preferred_self_initiates(monkeypatch):
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def __init__(self):
+            self.activated = []
+
+        def get_state(self):
+            return {
+                "handoff_state": "idle",
+                "failover": "auto",
+                "messaging_owner": "linux",
+                "active_node_id": "linux",
+                "preferred_messaging_node": "win",
+            }
+
+        def list_nodes(self, **_kwargs):
+            return [
+                {"node_id": "win", "online": True, "active_turns": 0},
+                {"node_id": "linux", "online": True, "active_turns": 0},
+            ]
+
+        def set_active(self, node_id, *, reason="manual"):
+            self.activated.append((node_id, reason))
+            return self.get_state()
+
+    started = []
+    cluster = Cluster()
+    monkeypatch.setattr(
+        cluster_module,
+        "ensure_local_gateway_service",
+        lambda: started.append("start") or {},
+    )
+    storage = type("Storage", (), {
+        "node_id": "win",
+        "machine_id": "win-pc",
+        "cluster": cluster,
+    })()
+
+    cluster_module._maybe_failback(storage)
+
+    assert cluster.activated == [("win", "failback")]
+    assert started == ["start"]
+
+
+def test_failback_non_preferred_does_not_initiate(monkeypatch):
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def __init__(self):
+            self.activated = []
+
+        def get_state(self):
+            return {
+                "handoff_state": "idle",
+                "failover": "auto",
+                "messaging_owner": "linux",
+                "preferred_messaging_node": "win",
+            }
+
+        def list_nodes(self, **_kwargs):
+            return [
+                {"node_id": "win", "online": True, "active_turns": 0},
+                {"node_id": "linux", "online": True, "active_turns": 0},
+            ]
+
+        def set_active(self, node_id, *, reason="manual"):
+            self.activated.append((node_id, reason))
+
+    storage = type("Storage", (), {
+        "node_id": "linux",
+        "machine_id": "linux-pc",
+        "cluster": Cluster(),
+    })()
+
+    cluster_module._maybe_failback(storage)
+
+    assert storage.cluster.activated == []
+
+
+def test_failover_ensures_preferred_before_switch(monkeypatch):
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def __init__(self):
+            self.preferred = None
+            self.activated = []
+
+        def get_state(self):
+            return {
+                "handoff_state": "idle",
+                "failover": "auto",
+                "messaging_owner": "win",
+                "preferred_messaging_node": None,
+            }
+
+        def list_nodes(self, **_kwargs):
+            return [
+                {"node_id": "win", "online": False},
+                {"node_id": "linux", "online": True},
+            ]
+
+        def ensure_preferred_messaging_node(self, node_id):
+            self.preferred = node_id
+
+        def set_active(self, node_id, *, reason="manual"):
+            self.activated.append((node_id, reason))
+
+    started = []
+    cluster = Cluster()
+    monkeypatch.setattr(
+        cluster_module,
+        "ensure_local_gateway_service",
+        lambda: started.append(1) or {},
+    )
+    storage = type("Storage", (), {
+        "node_id": "linux",
+        "machine_id": "linux-pc",
+        "cluster": cluster,
+    })()
+
+    cluster_module._maybe_failover(storage)
+
+    assert cluster.preferred == "win"
+    assert cluster.activated == [("linux", "failover")]
+    assert started == [1]
+
+
+def test_failover_picks_highest_health_score(monkeypatch):
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def __init__(self):
+            self.activated = []
+
+        def get_state(self):
+            return {
+                "handoff_state": "idle",
+                "failover": "auto",
+                "messaging_owner": "dead",
+            }
+
+        def list_nodes(self, **_kwargs):
+            return [
+                {"node_id": "dead", "online": False, "health_score": 90},
+                {
+                    "node_id": "weak",
+                    "online": True,
+                    "hostname": "a-weak",
+                    "health_score": 20,
+                },
+                {
+                    "node_id": "strong",
+                    "online": True,
+                    "hostname": "b-strong",
+                    "health_score": 95,
+                },
+            ]
+
+        def ensure_preferred_messaging_node(self, _node_id):
+            pass
+
+        def set_active(self, node_id, *, reason="manual"):
+            self.activated.append((node_id, reason))
+
+    monkeypatch.setattr(cluster_module, "ensure_local_gateway_service", lambda: {})
+
+    # Weak node must NOT initiate even if it runs the heartbeat first.
+    weak = type("S", (), {
+        "node_id": "weak",
+        "machine_id": "w",
+        "cluster": Cluster(),
+    })()
+    cluster_module._maybe_failover(weak)
+    assert weak.cluster.activated == []
+
+    strong = type("S", (), {
+        "node_id": "strong",
+        "machine_id": "s",
+        "cluster": Cluster(),
+    })()
+    cluster_module._maybe_failover(strong)
+    assert strong.cluster.activated == [("strong", "failover")]
+
+
+def test_health_rebalance_with_hysteresis(monkeypatch):
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def __init__(self):
+            self.activated = []
+            self.marked = False
+            self.state = {
+                "handoff_state": "idle",
+                "failover": "auto",
+                "messaging_owner": "weak",
+                "preferred_messaging_node": "home",
+            }
+
+        def get_state(self):
+            return dict(self.state)
+
+        def list_nodes(self, **_kwargs):
+            return [
+                {
+                    "node_id": "weak",
+                    "online": True,
+                    "health_score": 25,
+                    "health_critical_failed": True,
+                    "active_turns": 0,
+                    "hostname": "weak",
+                },
+                {
+                    "node_id": "strong",
+                    "online": True,
+                    "health_score": 90,
+                    "active_turns": 0,
+                    "hostname": "strong",
+                },
+                {"node_id": "home", "online": False, "health_score": 99},
+            ]
+
+        def mark_health_rebalance(self):
+            self.marked = True
+
+        def set_active(self, node_id, *, reason="manual"):
+            self.activated.append((node_id, reason))
+
+    monkeypatch.setattr(cluster_module, "ensure_local_gateway_service", lambda: {})
+    monkeypatch.setattr(
+        cluster_module,
+        "_cluster_health_settings",
+        lambda: {"hysteresis": 20.0, "min_score": 40.0, "cooldown_s": 600.0},
+    )
+
+    # Non-best does not initiate
+    weak_storage = type("S", (), {
+        "node_id": "weak",
+        "cluster": Cluster(),
+    })()
+    cluster_module._maybe_health_rebalance(weak_storage)
+    assert weak_storage.cluster.activated == []
+
+    strong_storage = type("S", (), {
+        "node_id": "strong",
+        "cluster": Cluster(),
+    })()
+    cluster_module._maybe_health_rebalance(strong_storage)
+    assert strong_storage.cluster.activated == [("strong", "health_rebalance")]
+    assert strong_storage.cluster.marked is True
+
+
+def test_health_rebalance_skipped_when_owner_healthy(monkeypatch):
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def __init__(self):
+            self.activated = []
+
+        def get_state(self):
+            return {
+                "handoff_state": "idle",
+                "failover": "auto",
+                "messaging_owner": "ok",
+            }
+
+        def list_nodes(self, **_kwargs):
+            return [
+                {
+                    "node_id": "ok",
+                    "online": True,
+                    "health_score": 85,
+                    "health_critical_failed": False,
+                    "health_checks": {
+                        "telegram_api": {"ok": True},
+                        "llm_provider": {"ok": True},
+                    },
+                    "active_turns": 0,
+                },
+                {"node_id": "better", "online": True, "health_score": 99},
+            ]
+
+        def set_active(self, node_id, *, reason="manual"):
+            self.activated.append((node_id, reason))
+
+    monkeypatch.setattr(
+        cluster_module,
+        "_cluster_health_settings",
+        lambda: {"hysteresis": 20.0, "min_score": 40.0, "cooldown_s": 600.0},
+    )
+    storage = type("S", (), {"node_id": "better", "cluster": Cluster()})()
+    cluster_module._maybe_health_rebalance(storage)
+    assert storage.cluster.activated == []
+
+
+def test_health_rebalance_skipped_during_cooldown(monkeypatch):
+    from datetime import datetime, timezone, timedelta
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def __init__(self):
+            self.activated = []
+
+        def get_state(self):
+            return {
+                "handoff_state": "idle",
+                "failover": "auto",
+                "messaging_owner": "weak",
+                "last_health_rebalance_at": datetime.now(timezone.utc)
+                - timedelta(seconds=30),
+            }
+
+        def list_nodes(self, **_kwargs):
+            return [
+                {
+                    "node_id": "weak",
+                    "online": True,
+                    "health_score": 10,
+                    "health_critical_failed": True,
+                    "active_turns": 0,
+                },
+                {"node_id": "strong", "online": True, "health_score": 90},
+            ]
+
+        def set_active(self, node_id, *, reason="manual"):
+            self.activated.append((node_id, reason))
+
+    monkeypatch.setattr(
+        cluster_module,
+        "_cluster_health_settings",
+        lambda: {"hysteresis": 20.0, "min_score": 40.0, "cooldown_s": 600.0},
+    )
+    storage = type("S", (), {"node_id": "strong", "cluster": Cluster()})()
+    cluster_module._maybe_health_rebalance(storage)
+    assert storage.cluster.activated == []
+
+
+def test_pick_best_online_candidate_orders_by_score():
+    from hermes_storage.cluster import _pick_best_online_candidate
+
+    best = _pick_best_online_candidate(
+        [
+            {"node_id": "a", "online": True, "health_score": 40, "hostname": "z"},
+            {"node_id": "b", "online": True, "health_score": 80, "hostname": "a"},
+            {"node_id": "c", "online": False, "health_score": 99, "hostname": "c"},
+        ],
+        exclude="x",
+    )
+    assert best["node_id"] == "b"

@@ -5,7 +5,7 @@
 # hermes_shared.fleet_release. Agents then run: hermes update
 #
 #   HERMES_DB_HOME=~/hermes-db \
-#     ./scripts/cluster-update.sh --version 0.19.5 --ref main
+#     ./scripts/cluster-update.sh --version 0.19.7 --ref main
 #
 set -euo pipefail
 

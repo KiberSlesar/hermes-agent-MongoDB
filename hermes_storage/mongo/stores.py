@@ -473,6 +473,7 @@ class MongoClusterStore(ClusterStore):
                 "_id": self.STATE_ID,
                 "active_node_id": node_id,
                 "messaging_owner": node_id,
+                "preferred_messaging_node": node_id,
                 "handoff_state": "idle",
                 "failover": "auto",
                 "history": [],
@@ -499,6 +500,7 @@ class MongoClusterStore(ClusterStore):
             {"$set": {
                 "active_node_id": node_id,
                 "messaging_owner": node_id,
+                "preferred_messaging_node": node_id,
                 "handoff_state": "idle",
                 "updated_at": utcnow(),
             }},
@@ -566,12 +568,17 @@ class MongoClusterStore(ClusterStore):
         # Do NOT flip active_node_id here — that made cluster_status claim the
         # target was already live while Telegram/tools still ran on the source
         # until release+acquire finished. Only pending_* until complete.
+        fields: dict[str, Any] = {
+            "pending_active_node_id": node_id,
+            "updated_at": utcnow(),
+        }
+        # Manual / CLI activate updates the home node. Failover/failback keep
+        # preferred sticky so ownership can return when Windows wakes up.
+        if reason not in ("failover", "failback", "health_rebalance"):
+            fields["preferred_messaging_node"] = node_id
         self._state.update_one(
             {"_id": self.STATE_ID},
-            {"$set": {
-                "pending_active_node_id": node_id,
-                "updated_at": utcnow(),
-            }},
+            {"$set": fields},
             upsert=True,
         )
         self._append_history({"type": "activate", "node_id": node_id, "reason": reason})
@@ -579,6 +586,38 @@ class MongoClusterStore(ClusterStore):
             node_id,
             from_node_id=current,
             announce_session_keys=announce_session_keys,
+        )
+
+    def ensure_preferred_messaging_node(self, node_id: str) -> None:
+        """Set preferred home node only when unset (used on failover)."""
+        nid = str(node_id or "").strip()
+        if not nid:
+            return
+        self._state.update_one(
+            {
+                "_id": self.STATE_ID,
+                "$or": [
+                    {"preferred_messaging_node": None},
+                    {"preferred_messaging_node": {"$exists": False}},
+                    {"preferred_messaging_node": ""},
+                ],
+            },
+            {"$set": {
+                "preferred_messaging_node": nid,
+                "updated_at": utcnow(),
+            }},
+            upsert=False,
+        )
+
+    def mark_health_rebalance(self) -> None:
+        """Record cooldown timestamp for health-based ownership moves."""
+        self._state.update_one(
+            {"_id": self.STATE_ID},
+            {"$set": {
+                "last_health_rebalance_at": utcnow(),
+                "updated_at": utcnow(),
+            }},
+            upsert=True,
         )
 
     def begin_messaging_handoff(
