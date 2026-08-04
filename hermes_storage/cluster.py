@@ -635,6 +635,12 @@ def _maybe_failover(storage: Any) -> None:
     state = storage.cluster.get_state()
     if (state.get("failover") or "auto") != "auto":
         return
+    # Never steal the lease while a handoff is already driving release/acquire.
+    # Otherwise a briefly-stale heartbeat on the new owner (gateway restart,
+    # SIGTERM flap) immediately rolls a manual activate back to the peer.
+    handoff = state.get("handoff_state") or "idle"
+    if handoff not in (None, "idle", "done", "failed"):
+        return
     # Cool down after a failed acquire so we don't thrash every ~90s.
     if _health_rebalance_cooldown_active(state, 180.0) and state.get("handoff_error"):
         return

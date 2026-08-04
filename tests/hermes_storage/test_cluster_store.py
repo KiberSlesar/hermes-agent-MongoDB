@@ -844,6 +844,45 @@ def test_failover_picks_highest_health_score(monkeypatch):
     assert strong.cluster.activated == [("strong", "failover")]
 
 
+def test_failover_skips_while_handoff_in_progress(monkeypatch):
+    """Manual activate must not be yanked by peer failover mid-release/acquire."""
+    from hermes_storage import cluster as cluster_module
+
+    class Cluster:
+        def __init__(self):
+            self.activated = []
+
+        def get_state(self):
+            return {
+                "handoff_state": "releasing",
+                "failover": "auto",
+                "messaging_owner": "linux",
+                "handoff_from": "win",
+                "handoff_to": "linux",
+            }
+
+        def list_nodes(self, **_kwargs):
+            return [
+                {"node_id": "linux", "online": False, "health_score": 100},
+                {"node_id": "win", "online": True, "health_score": 100},
+            ]
+
+        def ensure_preferred_messaging_node(self, _node_id):
+            raise AssertionError("should not run")
+
+        def set_active(self, *_args, **_kwargs):
+            raise AssertionError("should not run")
+
+    monkeypatch.setattr(cluster_module, "ensure_local_gateway_service", lambda: {})
+    storage = type("S", (), {
+        "node_id": "win",
+        "machine_id": "w",
+        "cluster": Cluster(),
+    })()
+    cluster_module._maybe_failover(storage)
+    assert storage.cluster.activated == []
+
+
 def test_health_rebalance_with_hysteresis(monkeypatch):
     from hermes_storage import cluster as cluster_module
 
