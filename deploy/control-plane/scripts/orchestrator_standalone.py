@@ -88,6 +88,12 @@ def cluster_status() -> dict:
 
 
 def set_active(target: str, reason: str = "manual") -> dict:
+    """Start a messaging handoff toward ``target`` (same semantics as Hermes).
+
+    Must update preferred on manual/agent switches and must NOT instantly flip
+    messaging_owner — that left preferred sticky on the old home node and the
+    next failback tick yanked the lease back.
+    """
     shared = db()
     nodes = list(shared["cluster_nodes"].find())
     match = None
@@ -103,16 +109,45 @@ def set_active(target: str, reason: str = "manual") -> dict:
     if not match:
         raise ValueError(f"No node matched {target!r}")
     node_id = match["node_id"]
+    state = shared["cluster_state"].find_one({"_id": STATE_ID}) or {}
+    current = state.get("messaging_owner") or state.get("active_node_id")
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if current == node_id:
+        # Still refresh preferred on explicit manual/agent preference changes.
+        fields = {"updated_at": now, "last_reason": reason}
+        if reason not in ("failover", "failback", "health_rebalance"):
+            fields["preferred_messaging_node"] = node_id
+        shared["cluster_state"].update_one({"_id": STATE_ID}, {"$set": fields}, upsert=True)
+        return cluster_status()
+
+    fields = {
+        "pending_active_node_id": node_id,
+        "handoff_state": "releasing",
+        "handoff_from": current,
+        "handoff_to": node_id,
+        "handoff_session_keys": [],
+        "handoff_error": None,
+        "updated_at": now,
+        "last_reason": reason,
+    }
+    # Manual / agent / orch switches update home preference. Failover paths keep it sticky.
+    if reason not in ("failover", "failback", "health_rebalance"):
+        fields["preferred_messaging_node"] = node_id
+    shared["cluster_state"].update_one({"_id": STATE_ID}, {"$set": fields}, upsert=True)
+    # History for operators / debugging (match Hermes MongoClusterStore).
     shared["cluster_state"].update_one(
         {"_id": STATE_ID},
-        {"$set": {
-            "active_node_id": node_id,
-            "messaging_owner": node_id,
-            "handoff_state": "idle",
-            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "last_reason": reason,
-        }},
-        upsert=True,
+        {
+            "$push": {
+                "history": {
+                    "$each": [
+                        {"type": "activate", "node_id": node_id, "reason": reason, "at": now},
+                        {"type": "handoff_begin", "from": current, "to": node_id, "at": now},
+                    ],
+                    "$slice": -100,
+                }
+            }
+        },
     )
     return cluster_status()
 
