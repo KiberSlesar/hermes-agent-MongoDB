@@ -30,11 +30,45 @@ _LAST_APPLY_ATTEMPT = 0.0
 _APPLY_BACKOFF_S = 300.0
 
 # LAN / control-plane hosts should stay direct when an egress proxy is set for GitHub.
-_DEFAULT_NO_PROXY = (
-    "127.0.0.1,localhost,::1,"
-    "192.168.88.33,192.168.88.44,"
-    ".local"
-)
+_BASE_NO_PROXY = ("127.0.0.1", "localhost", "::1", ".local")
+
+
+def _hostname_from_url(url: str) -> str:
+    from urllib.parse import urlparse
+
+    host = (urlparse(str(url or "").strip()).hostname or "").strip()
+    return host
+
+
+def resolve_default_no_proxy() -> str:
+    """Build NO_PROXY for fleet downloads (env + bootstrap hosts, no hardcoded fleet IPs)."""
+    parts: list[str] = list(_BASE_NO_PROXY)
+    extra = (os.environ.get("HERMES_NO_PROXY") or "").strip()
+    if extra:
+        parts.extend(p.strip() for p in extra.split(",") if p.strip())
+    try:
+        from hermes_storage.bootstrap import get_bootstrap
+
+        boot = get_bootstrap()
+        if boot is not None:
+            for url in (
+                getattr(boot, "orchestrator_url", None),
+                getattr(boot, "mongo_uri", None),
+            ):
+                host = _hostname_from_url(str(url or ""))
+                if host:
+                    parts.append(host)
+    except Exception:
+        pass
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in parts:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(item)
+    return ",".join(ordered)
 
 
 def ensure_egress_proxy_env(env: Optional[dict[str, str]] = None) -> dict[str, str]:
@@ -52,8 +86,9 @@ def ensure_egress_proxy_env(env: Optional[dict[str, str]] = None) -> dict[str, s
     )
     if existing:
         if not (target.get("NO_PROXY") or target.get("no_proxy") or "").strip():
-            target.setdefault("NO_PROXY", _DEFAULT_NO_PROXY)
-            target.setdefault("no_proxy", _DEFAULT_NO_PROXY)
+            no_proxy = resolve_default_no_proxy()
+            target.setdefault("NO_PROXY", no_proxy)
+            target.setdefault("no_proxy", no_proxy)
         return target
 
     candidates: list[str] = []
@@ -84,8 +119,9 @@ def ensure_egress_proxy_env(env: Optional[dict[str, str]] = None) -> dict[str, s
         target["https_proxy"] = proxy
         target["http_proxy"] = proxy
         if not (target.get("NO_PROXY") or target.get("no_proxy") or "").strip():
-            target["NO_PROXY"] = _DEFAULT_NO_PROXY
-            target["no_proxy"] = _DEFAULT_NO_PROXY
+            no_proxy = resolve_default_no_proxy()
+            target["NO_PROXY"] = no_proxy
+            target["no_proxy"] = no_proxy
         logger.info("Fleet download egress via messaging proxy %s", proxy)
     return target
 
@@ -386,6 +422,8 @@ def _apply_worker(desired: dict[str, Any]) -> None:
             )
             return
 
+        os.environ["HERMES_FLEET_UPDATE"] = "1"
+        gateway_token = _pause_gateways_for_fleet_update()
         code = run_mongo_fork_install(desired)
         if code == 0:
             write_install_stamp(
@@ -394,13 +432,14 @@ def _apply_worker(desired: dict[str, Any]) -> None:
                 repo=str(desired.get("repo") or ""),
             )
             logger.info(
-                "Fleet update applied: %s@%s — restart gateway to load new code",
+                "Fleet update applied: %s@%s",
                 desired.get("version"),
                 desired.get("ref"),
             )
-            _restart_gateway_best_effort()
+            _resume_gateways_after_fleet_update(gateway_token)
         else:
             logger.error("Fleet update failed with exit %s", code)
+            _resume_gateways_after_fleet_update(gateway_token)
     except Exception:
         logger.exception("Fleet update worker crashed")
     finally:
@@ -427,40 +466,36 @@ def run_mongo_fork_install(desired: dict[str, Any]) -> int:
     env["HERMES_MONGO_REF"] = ref
     if desired.get("version"):
         env["HERMES_FLEET_VERSION"] = str(desired["version"])
-
-    # Prefer checkout-bundled installer when running from a source tree.
-    candidates: list[Path] = []
-    try:
-        from hermes_constants import get_hermes_home
-
-        home = get_hermes_home()
-        candidates.append(home / "hermes-agent" / "install" / "install-agent.sh")
-        candidates.append(home / "hermes-agent" / "install" / "install-agent.ps1")
-    except Exception:
-        pass
-    here = Path(__file__).resolve()
-    candidates.append(here.parents[1] / "install" / "install-agent.sh")
-    candidates.append(here.parents[1] / "install" / "install-agent.ps1")
+    if os.environ.get("HERMES_FLEET_UPDATE") == "1":
+        env["HERMES_FLEET_UPDATE"] = "1"
 
     is_windows = platform.system().lower().startswith("win")
+    raw_name = "install-agent.ps1" if is_windows else "install-agent.sh"
+    force_download = os.environ.get("HERMES_FLEET_UPDATE") == "1"
+
     script: Optional[Path] = None
-    for c in candidates:
-        if c.is_file() and (c.suffix == ".ps1") == is_windows:
-            script = c
-            break
-        if c.is_file() and not is_windows and c.suffix == ".sh":
-            script = c
-            break
+    if not force_download:
+        candidates: list[Path] = []
+        try:
+            from hermes_constants import get_hermes_home
+
+            home = get_hermes_home()
+            candidates.append(home / "hermes-agent" / "install" / raw_name)
+        except Exception:
+            pass
+        here = Path(__file__).resolve()
+        candidates.append(here.parents[1] / "install" / raw_name)
+        for c in candidates:
+            if c.is_file():
+                script = c
+                break
 
     if script is None:
-        # Download installer from the desired ref.
-        raw_name = "install-agent.ps1" if is_windows else "install-agent.sh"
         url = f"https://raw.githubusercontent.com/{repo}/{ref}/install/{raw_name}"
         tmp = Path(os.environ.get("TEMP") or os.environ.get("TMPDIR") or "/tmp")
         tmp.mkdir(parents=True, exist_ok=True)
         script = tmp / f"hermes-{raw_name}"
         try:
-            # urllib reads process env; also keep subprocess env in sync.
             ensure_egress_proxy_env()
             ensure_egress_proxy_env(env)
             with urllib.request.urlopen(url, timeout=60) as resp:
@@ -468,6 +503,10 @@ def run_mongo_fork_install(desired: dict[str, Any]) -> int:
         except Exception as exc:
             logger.error("Failed to download install-agent from %s: %s", url, exc)
             return 1
+        if is_windows:
+            pass
+        else:
+            script.chmod(script.stat().st_mode | 0o755)
 
     if is_windows:
         cmd = [
@@ -491,38 +530,132 @@ def run_mongo_fork_install(desired: dict[str, Any]) -> int:
         return 1
 
 
-def _restart_gateway_best_effort() -> None:
-    """Restart/start gateway after fleet apply.
-
-    Prefer ``gateway start``: after install-agent the process is already stopped,
-    and Windows ``restart`` via detached Popen often no-ops silently.
-    """
+def _resolve_hermes_launcher() -> list[str]:
+    """Return argv prefix for ``hermes …`` using the profile-local launcher."""
     import shutil
+    import sys
+
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+        if sys.platform == "win32":
+            for name in ("hermes.cmd", "hermes.exe", "hermes"):
+                candidate = home / "bin" / name
+                if candidate.is_file():
+                    return [str(candidate)]
+        else:
+            candidate = home / "bin" / "hermes"
+            if candidate.is_file():
+                return [str(candidate)]
+    except Exception:
+        pass
+
+    hermes_bin = shutil.which("hermes")
+    if hermes_bin:
+        return [hermes_bin]
+    return [sys.executable, "-m", "hermes_cli.main"]
+
+
+def _pause_gateways_for_fleet_update() -> Any:
+    """Stop running gateways before mutating the checkout (Windows + Linux)."""
+    import sys
+
+    if sys.platform == "win32":
+        try:
+            from hermes_cli import update_cmd
+
+            return update_cmd._pause_windows_gateways_for_update()
+        except Exception as exc:
+            logger.warning("Could not pause Windows gateways before fleet update: %s", exc)
+            return None
+
+    try:
+        from hermes_cli.gateway import get_service_name
+
+        import subprocess
+
+        uid = os.getuid()
+        env = os.environ.copy()
+        env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+        subprocess.run(
+            ["systemctl", "--user", "stop", f"{get_service_name()}.service"],
+            env=env,
+            capture_output=True,
+            timeout=45,
+            check=False,
+        )
+    except Exception as exc:
+        logger.debug("Linux gateway stop before fleet update: %s", exc)
+    return None
+
+
+def _resume_gateways_after_fleet_update(token: Any) -> None:
+    """Bring gateways back after a successful fleet apply."""
+    import sys
+
+    if sys.platform == "win32":
+        try:
+            from hermes_cli import update_cmd
+
+            update_cmd._resume_windows_gateways_after_update(token)
+        except Exception as exc:
+            logger.warning("Could not resume Windows gateways after fleet update: %s", exc)
+        return
+
+    _restart_gateway_best_effort()
+
+
+def _restart_gateway_best_effort() -> None:
+    """Restart/start gateway after fleet apply."""
     import subprocess
     import sys
 
     if sys.platform != "win32":
         try:
-            from hermes_cli.gateway import ensure_systemd_linger_enabled
+            from hermes_cli.gateway import (
+                ensure_systemd_linger_enabled,
+                get_service_name,
+            )
 
             ensure_systemd_linger_enabled(quiet=True)
+            uid = os.getuid()
+            env = os.environ.copy()
+            env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+            svc = f"{get_service_name()}.service"
+            result = subprocess.run(
+                ["systemctl", "--user", "restart", svc],
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+                check=False,
+            )
+            if result.returncode == 0:
+                logger.info("Restarted %s after fleet update", svc)
+                return
+            start = subprocess.run(
+                ["systemctl", "--user", "start", svc],
+                env=env,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            if start.returncode == 0:
+                logger.info("Started %s after fleet update", svc)
+                return
         except Exception as exc:
-            logger.warning("Could not ensure systemd linger before gateway restart: %s", exc)
+            logger.warning("systemctl gateway restart failed, falling back: %s", exc)
 
-    hermes_bin = shutil.which("hermes")
-    # On Windows the launcher is hermes.cmd — prefer explicit start.
-    action = "start"
-    if hermes_bin:
-        cmd = [hermes_bin, "gateway", action]
-    else:
-        cmd = [sys.executable, "-m", "hermes_cli.main", "gateway", action]
+    cmd = _resolve_hermes_launcher() + ["gateway", "start"]
     try:
         kwargs: dict = {
             "stdout": subprocess.DEVNULL,
             "stderr": subprocess.DEVNULL,
         }
         if sys.platform == "win32":
-            # Detach so the updater process can exit without killing the gateway.
             kwargs["creationflags"] = (
                 getattr(subprocess, "DETACHED_PROCESS", 0)
                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -531,7 +664,7 @@ def _restart_gateway_best_effort() -> None:
         else:
             kwargs["start_new_session"] = True
         subprocess.Popen(cmd, **kwargs)
-        logger.info("Requested gateway %s after fleet update: %s", action, cmd)
+        logger.info("Requested gateway start after fleet update: %s", cmd)
     except Exception as exc:
         logger.warning("Could not start gateway after fleet update: %s", exc)
 
@@ -632,6 +765,8 @@ def apply_fleet_update_sync(
             if storage is not None:
                 _set_node_update_status(storage, "error", detail="lock held")
             return result
+        os.environ["HERMES_FLEET_UPDATE"] = "1"
+        gateway_token = _pause_gateways_for_fleet_update()
         code = run_mongo_fork_install(want)
         result["exit_code"] = code
         result["ok"] = code == 0
@@ -643,10 +778,11 @@ def apply_fleet_update_sync(
             )
             result["agent_version"] = local_agent_version()
             result["install_ref"] = local_install_ref()
-            _restart_gateway_best_effort()
+            _resume_gateways_after_fleet_update(gateway_token)
             if storage is not None:
                 _set_node_update_status(storage, "idle", detail="applied")
         else:
+            _resume_gateways_after_fleet_update(gateway_token)
             if storage is not None:
                 _set_node_update_status(storage, "error", detail=f"exit {code}")
     except Exception as exc:

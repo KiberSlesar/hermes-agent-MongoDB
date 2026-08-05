@@ -37,8 +37,13 @@ if [[ -z "${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}" ]]; th
   unset _msg_proxy
 fi
 if [[ -n "${HTTPS_PROXY:-${HTTP_PROXY:-}}" && -z "${NO_PROXY:-${no_proxy:-}}" ]]; then
-  export NO_PROXY="127.0.0.1,localhost,::1,192.168.88.33,192.168.88.44,.local"
+  _no_proxy="127.0.0.1,localhost,::1,.local"
+  if [[ -n "${HERMES_NO_PROXY:-}" ]]; then
+    _no_proxy="${_no_proxy},${HERMES_NO_PROXY}"
+  fi
+  export NO_PROXY="$_no_proxy"
   export no_proxy="$NO_PROXY"
+  unset _no_proxy
 fi
 
 REPO="${HERMES_MONGO_REPO:-KiberSlesar/hermes-agent-MongoDB}"
@@ -91,6 +96,29 @@ ask() {
   printf -v "$__var" '%s' "$__ans"
 }
 
+stop_hermes_runtime_locks() {
+  local agent_dir="$1"
+  if command -v systemctl >/dev/null 2>&1; then
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    systemctl --user stop hermes-gateway.service 2>/dev/null || true
+  fi
+  if command -v hermes >/dev/null 2>&1; then
+    timeout 10 hermes gateway stop 2>/dev/null || true
+  fi
+  if command -v pgrep >/dev/null 2>&1; then
+    local pid
+    while read -r pid; do
+      [[ -n "$pid" ]] || continue
+      kill -TERM "$pid" 2>/dev/null || true
+    done < <(pgrep -f "$agent_dir" 2>/dev/null || true)
+    sleep 2
+    while read -r pid; do
+      [[ -n "$pid" ]] || continue
+      kill -KILL "$pid" 2>/dev/null || true
+    done < <(pgrep -f "$agent_dir" 2>/dev/null || true)
+  fi
+}
+
 confirm_replace_existing_installation() {
   local existing=""
   existing="$(command -v hermes 2>/dev/null || true)"
@@ -115,7 +143,10 @@ confirm_replace_existing_installation() {
     die "Existing Hermes found. Re-run interactively, or set HERMES_YES=1 / pass --yes."
   fi
 
-  [[ -d "$AGENT_DIR" ]] && rm -rf "$AGENT_DIR"
+  if [[ -d "$AGENT_DIR" ]]; then
+    stop_hermes_runtime_locks "$AGENT_DIR"
+    rm -rf "$AGENT_DIR"
+  fi
   if [[ -n "$existing" && -e "$existing" ]]; then
     if [[ -w "$(dirname "$existing")" ]]; then
       rm -f "$existing"

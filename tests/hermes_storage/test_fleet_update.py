@@ -201,6 +201,41 @@ def test_is_mongo_agent_install_with_bootstrap(tmp_path, monkeypatch):
     assert fu.is_mongo_agent_install() is True
 
 
+def test_resolve_default_no_proxy_uses_env_and_bootstrap(monkeypatch):
+    from hermes_storage.fleet_update import resolve_default_no_proxy
+
+    class Boot:
+        orchestrator_url = "https://db.example:8744"
+        mongo_uri = "mongodb://mongo.example:27017/?replicaSet=rs0"
+
+    monkeypatch.delenv("HERMES_NO_PROXY", raising=False)
+    monkeypatch.setattr("hermes_storage.bootstrap.get_bootstrap", lambda: Boot())
+    value = resolve_default_no_proxy()
+    assert "127.0.0.1" in value
+    assert "db.example" in value
+    assert "mongo.example" in value
+    assert "192.168.88.44" not in value
+
+    monkeypatch.setenv("HERMES_NO_PROXY", "lan.local,10.0.0.5")
+    value = resolve_default_no_proxy()
+    assert "lan.local" in value
+    assert "10.0.0.5" in value
+
+
+def test_resolve_hermes_launcher_prefers_home_bin(tmp_path, monkeypatch):
+    import sys
+
+    from hermes_storage.fleet_update import _resolve_hermes_launcher
+
+    home = tmp_path / ".hermes"
+    launcher = home / "bin" / "hermes"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert _resolve_hermes_launcher() == [str(launcher)]
+
+
 def test_heartbeat_tick_does_not_schedule_fleet_update(monkeypatch):
     """Cluster heartbeat helpers must not auto-apply fleet updates."""
     from hermes_storage import cluster as cluster_module

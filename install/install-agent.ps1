@@ -36,8 +36,13 @@ if (-not ($env:HTTPS_PROXY -or $env:HTTP_PROXY -or $env:https_proxy -or $env:htt
     }
 }
 if (($env:HTTPS_PROXY -or $env:HTTP_PROXY) -and -not ($env:NO_PROXY -or $env:no_proxy)) {
-    $env:NO_PROXY = "127.0.0.1,localhost,::1,192.168.88.33,192.168.88.44,.local"
+    $noProxy = "127.0.0.1,localhost,::1,.local"
+    if ($env:HERMES_NO_PROXY) {
+        $noProxy = "$noProxy,$($env:HERMES_NO_PROXY)"
+    }
+    $env:NO_PROXY = $noProxy
     $env:no_proxy = $env:NO_PROXY
+}
 }
 
 function Get-AuthHeaders {
@@ -197,18 +202,8 @@ function Stop-HermesRuntimeLocks {
     )
 
     # Gateway / CLI keep .venv\Scripts\python.exe locked on Windows.
-    # Prefer process kill below — `hermes gateway stop` itself needs a healthy
-    # venv (imports yaml) and often fails mid-broken-upgrade.
-    $launcher = Get-Command hermes -ErrorAction SilentlyContinue
-    if ($launcher) {
-        try {
-            Write-Host "Stopping hermes gateway (if running)…"
-            & $launcher.Source gateway stop 2>$null | Out-Null
-        } catch {
-            Write-Host "gateway stop skipped (runtime may be broken); killing locked processes…"
-        }
-    }
-
+    # Force-kill checkout processes first — `hermes gateway stop` needs a healthy
+    # venv, can block 30s+ on drain, and often hangs mid-broken-upgrade.
     $agentFull = [System.IO.Path]::GetFullPath($AgentDir)
     $killed = @()
     foreach ($proc in Get-CimInstance Win32_Process -ErrorAction SilentlyContinue) {
@@ -226,6 +221,25 @@ function Stop-HermesRuntimeLocks {
     if ($killed.Count -gt 0) {
         Write-Host ("Stopped locked Hermes process(es): {0}" -f ($killed -join ", "))
         Start-Sleep -Seconds 2
+    }
+
+    $launcher = Get-Command hermes -ErrorAction SilentlyContinue
+    if (-not $launcher) { return }
+
+    try {
+        Write-Host "Stopping hermes gateway (if still running)…"
+        $job = Start-Job -ScriptBlock {
+            param($LauncherPath)
+            & $LauncherPath gateway stop 2>&1 | Out-Null
+        } -ArgumentList $launcher.Source
+        $completed = Wait-Job -Job $job -Timeout 10
+        if (-not $completed) {
+            Stop-Job -Job $job -Force -ErrorAction SilentlyContinue
+            Write-Host "gateway stop timed out after 10s; continuing install…"
+        }
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Host "gateway stop skipped (runtime may be broken); continuing install…"
     }
 }
 
