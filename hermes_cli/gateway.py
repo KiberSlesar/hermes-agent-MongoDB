@@ -1950,43 +1950,25 @@ def _preflight_user_systemd(*, auto_enable_linger: bool = True) -> None:
             ),
         )
 
-    if auto_enable_linger and shutil.which("loginctl"):
-        try:
-            result = subprocess.run(
-                ["loginctl", "enable-linger", username],
-                capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
-                check=False,
-                timeout=30,
-            )
-        except Exception as exc:
+    if auto_enable_linger:
+        if ensure_systemd_linger_enabled(quiet=True):
+            if _wait_for_user_dbus_socket(timeout=5.0):
+                print(f"✓ Enabled linger for {username} — user D-Bus now available")
+                return
+            # Linger is on but socket still missing — unusual; fall through.
             _raise_user_systemd_unavailable(
                 username,
-                reason=f"loginctl enable-linger failed ({exc}).",
-                fix_hint=f"  sudo loginctl enable-linger {username}",
+                reason="Linger was enabled, but the user D-Bus socket did not appear.",
+                fix_hint=(
+                    "  Log out and log back in, then re-run the command.\n"
+                    f"  Or reboot and run: systemctl --user start {get_service_name()}"
+                ),
             )
-        else:
-            if result.returncode == 0:
-                if _wait_for_user_dbus_socket(timeout=5.0):
-                    print(f"✓ Enabled linger for {username} — user D-Bus now available")
-                    return
-                # enable-linger succeeded but the socket never appeared.
-                _raise_user_systemd_unavailable(
-                    username,
-                    reason="Linger was enabled, but the user D-Bus socket did not appear.",
-                    fix_hint=(
-                        "  Log out and log back in, then re-run the command.\n"
-                        f"  Or reboot and run: systemctl --user start {get_service_name()}"
-                    ),
-                )
-            detail = (
-                result.stderr or result.stdout or f"exit {result.returncode}"
-            ).strip()
-            _raise_user_systemd_unavailable(
-                username,
-                reason=f"loginctl enable-linger was denied: {detail}",
-                fix_hint=f"  sudo loginctl enable-linger {username}",
-            )
+        _raise_user_systemd_unavailable(
+            username,
+            reason="Could not enable systemd linger automatically.",
+            fix_hint=f"  sudo loginctl enable-linger {username}",
+        )
 
     _raise_user_systemd_unavailable(
         username,
@@ -3088,47 +3070,109 @@ def _print_linger_enable_warning(username: str, detail: str | None = None) -> No
     print()
 
 
-def _ensure_linger_enabled() -> None:
-    """Enable linger when possible so the user gateway survives logout."""
+def _systemd_linger_is_enabled(username: str) -> bool:
+    """Return True when linger is enabled for ``username``."""
+    if Path(f"/var/lib/systemd/linger/{username}").exists():
+        return True
+    linger_enabled, _ = get_systemd_linger_status()
+    return linger_enabled is True
+
+
+def _run_loginctl_enable_linger(
+    username: str, *, use_sudo: bool = False, non_interactive_sudo: bool = False
+) -> subprocess.CompletedProcess:
+    """Run ``loginctl enable-linger`` directly or via sudo."""
+    base_cmd = ["loginctl", "enable-linger", username]
+    if not use_sudo:
+        return subprocess.run(
+            base_cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=30,
+        )
+
+    sudo = shutil.which("sudo")
+    if not sudo:
+        return subprocess.CompletedProcess(
+            args=base_cmd,
+            returncode=127,
+            stdout="",
+            stderr="sudo not found",
+        )
+
+    sudo_prefix: list[str] = [sudo]
+    if non_interactive_sudo:
+        sudo_prefix.append("-n")
+    return subprocess.run(
+        sudo_prefix + base_cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=30,
+    )
+
+
+def ensure_systemd_linger_enabled(*, quiet: bool = False) -> bool:
+    """Enable systemd linger for the current user when it is missing.
+
+    Tries direct ``loginctl``, then ``sudo -n``, then interactive ``sudo``.
+    Returns True when linger is enabled (already was, or just enabled).
+    """
     if is_termux() or not is_linux():
-        return
+        return True
 
     import getpass
 
     username = getpass.getuser()
-    linger_file = Path(f"/var/lib/systemd/linger/{username}")
-    if linger_file.exists():
-        print("✓ Systemd linger is enabled (service survives logout)")
-        return
-
-    linger_enabled, linger_detail = get_systemd_linger_status()
-    if linger_enabled is True:
-        print("✓ Systemd linger is enabled (service survives logout)")
-        return
+    if _systemd_linger_is_enabled(username):
+        if not quiet:
+            print("✓ Systemd linger is enabled (service survives logout)")
+        return True
 
     if not shutil.which("loginctl"):
-        _print_linger_enable_warning(username, linger_detail or "loginctl not found")
-        return
+        linger_detail = get_systemd_linger_status()[1]
+        if not quiet:
+            _print_linger_enable_warning(username, linger_detail or "loginctl not found")
+        return False
 
-    print("Enabling linger so the gateway survives SSH logout...")
-    try:
-        result = subprocess.run(
-            ["loginctl", "enable-linger", username],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            check=False,
-            timeout=30,
-        )
-    except Exception as e:
-        _print_linger_enable_warning(username, str(e))
-        return
+    if not quiet:
+        print("Enabling linger so the gateway survives SSH logout/reboot…")
 
-    if result.returncode == 0:
-        print("✓ Linger enabled — gateway will persist after logout")
-        return
+    attempts: list[tuple[bool, bool]] = [(False, False), (True, True), (True, False)]
+    last_detail = ""
+    for use_sudo, non_interactive_sudo in attempts:
+        try:
+            result = _run_loginctl_enable_linger(
+                username,
+                use_sudo=use_sudo,
+                non_interactive_sudo=non_interactive_sudo,
+            )
+        except Exception as exc:
+            last_detail = str(exc)
+            continue
 
-    detail = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
-    _print_linger_enable_warning(username, detail or linger_detail)
+        if result.returncode == 0 and _systemd_linger_is_enabled(username):
+            if not quiet:
+                print("✓ Linger enabled — gateway will persist after logout")
+            return True
+
+        last_detail = (
+            result.stderr or result.stdout or f"exit {result.returncode}"
+        ).strip()
+
+    if not quiet:
+        _print_linger_enable_warning(username, last_detail)
+    return False
+
+
+def _ensure_linger_enabled() -> None:
+    """Enable linger when possible so the user gateway survives logout."""
+    ensure_systemd_linger_enabled()
 
 
 def _select_systemd_scope(system: bool = False) -> bool:
@@ -3238,9 +3282,11 @@ def systemd_install(
             if enable_on_startup:
                 _run_systemctl(["enable", get_service_name()], system=system, check=True, timeout=30)
             print(f"✓ {_service_scope_label(system).capitalize()} service definition updated")
-            return
-        print(f"Service already installed at: {unit_path}")
-        print("Use --force to reinstall")
+        else:
+            print(f"Service already installed at: {unit_path}")
+            print("Use --force to reinstall")
+        if not system:
+            _ensure_linger_enabled()
         return
 
     unit_path.parent.mkdir(parents=True, exist_ok=True)

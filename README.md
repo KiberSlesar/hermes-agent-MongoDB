@@ -138,6 +138,12 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/KiberSlesar/hermes-agent-MongoDB/main/install/install-agent.ps1 | iex
 ```
 
+**Linux gateway (systemd user service):** install-agent и `hermes gateway install`
+автоматически включают `loginctl enable-linger` — без этого
+`hermes-gateway.service` убивает сессию при logout/reboot и Telegram
+отваливается. Если что-то пропустили: `sudo loginctl enable-linger $USER`
+или `hermes doctor --fix`.
+
 Подключение кодом с DB-сервера:
 
 ```bash
@@ -173,8 +179,8 @@ hermes cluster status
 
 ```bash
 # на DB (нужен hermes + Mongo bootstrap / доступ к hermes_shared)
-export HERMES_FLEET_VERSION=0.19.15   # или --version
-hermes cluster update --version 0.19.15 --ref main
+export HERMES_FLEET_VERSION=0.19.16   # или --version
+hermes cluster update --version 0.19.16 --ref main
 ```
 
 Полный reinstall control plane по-прежнему через `installDB.sh` при необходимости;

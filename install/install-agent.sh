@@ -362,6 +362,36 @@ fi
 
 say "Verified: hermes db connect + hermes mongo status"
 
+ensure_systemd_linger() {
+  command -v loginctl >/dev/null 2>&1 || return 0
+  local user
+  user="$(id -un)"
+  if loginctl show-user "$user" --property=Linger --value 2>/dev/null | grep -qi '^yes$'; then
+    say "Systemd linger already enabled for $user"
+    return 0
+  fi
+  say "Enabling systemd linger for $user (keeps gateway alive after logout/reboot)…"
+  if loginctl enable-linger "$user" 2>/dev/null; then
+    say "Systemd linger enabled for $user"
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1 && sudo -n loginctl enable-linger "$user" 2>/dev/null; then
+    say "Systemd linger enabled for $user (via sudo)"
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1 && sudo loginctl enable-linger "$user" 2>/dev/null; then
+    say "Systemd linger enabled for $user (via sudo)"
+    return 0
+  fi
+  warn "Could not enable systemd linger automatically."
+  warn "Run: sudo loginctl enable-linger $user"
+  warn "Without linger, hermes-gateway.service dies when the user session ends."
+}
+
+if [[ "$(uname -s)" == "Linux" ]] && command -v systemctl >/dev/null 2>&1; then
+  ensure_systemd_linger
+fi
+
 # Stamp version/ref for fleet auto-update compare.
 VER="$($PY -c "from hermes_cli import __version__; print(__version__)" 2>/dev/null || true)"
 mkdir -p "$HERMES_HOME_DIR"

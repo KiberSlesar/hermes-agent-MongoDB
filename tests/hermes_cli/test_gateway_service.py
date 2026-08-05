@@ -903,15 +903,10 @@ class TestPreflightUserSystemd:
         monkeypatch.setattr(
             gateway_cli, "get_systemd_linger_status", lambda: (False, ""),
         )
-        monkeypatch.setattr(gateway_cli.shutil, "which", lambda _: "/usr/bin/loginctl")
-
-        class _Result:
-            returncode = 1
-            stdout = ""
-            stderr = "Interactive authentication required."
-
         monkeypatch.setattr(
-            gateway_cli.subprocess, "run", lambda *a, **kw: _Result(),
+            gateway_cli,
+            "ensure_systemd_linger_enabled",
+            lambda **kwargs: False,
         )
 
         with pytest.raises(gateway_cli.UserSystemdUnavailableError) as exc_info:
@@ -920,7 +915,6 @@ class TestPreflightUserSystemd:
         msg = str(exc_info.value)
         assert "sudo loginctl enable-linger" in msg
         assert "hermes gateway run" in msg  # foreground fallback mentioned
-        assert "Interactive authentication required" in msg
 
 
 
@@ -937,15 +931,10 @@ class TestPreflightUserSystemd:
         monkeypatch.setattr(
             gateway_cli, "get_systemd_linger_status", lambda: (False, ""),
         )
-        monkeypatch.setattr(gateway_cli.shutil, "which", lambda _: "/usr/bin/loginctl")
-
-        class _OkResult:
-            returncode = 0
-            stdout = ""
-            stderr = ""
-
         monkeypatch.setattr(
-            gateway_cli.subprocess, "run", lambda *a, **kw: _OkResult(),
+            gateway_cli,
+            "ensure_systemd_linger_enabled",
+            lambda **kwargs: True,
         )
         monkeypatch.setattr(
             gateway_cli, "_wait_for_user_dbus_socket",

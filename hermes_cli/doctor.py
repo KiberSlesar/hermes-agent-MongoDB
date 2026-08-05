@@ -538,16 +538,19 @@ def check_certificates(should_fix: bool = False, issues: "list | None" = None) -
             )
 
 
-def _check_gateway_service_linger(issues: list[str]) -> None:
-    """Warn when a systemd user gateway service will stop after logout.
+def _check_gateway_service_linger(issues: list[str], *, should_fix: bool = False) -> int:
+    """Warn or auto-fix when a systemd user gateway service will stop after logout.
 
     Skipped inside a container running under s6 — the linger concept
     (user-systemd surviving SSH logout) doesn't apply there, and the
     s6 supervision state is surfaced separately by
     ``_check_s6_supervision``.
+
+    Returns the number of issues auto-fixed (0 or 1).
     """
     try:
         from hermes_cli.gateway import (
+            ensure_systemd_linger_enabled,
             get_systemd_linger_status,
             get_systemd_unit_path,
             is_linux,
@@ -555,31 +558,42 @@ def _check_gateway_service_linger(issues: list[str]) -> None:
         from hermes_cli.service_manager import detect_service_manager
     except Exception as e:
         check_warn("Gateway service linger", f"(could not import gateway helpers: {e})")
-        return
+        return 0
 
     if not is_linux():
-        return
+        return 0
 
     # Inside a container under our s6 /init, _check_s6_supervision
     # reports the live supervision state; the linger warning would be
     # confusing here (no systemd, no logout, no "lingering" concept).
     if detect_service_manager() == "s6":
-        return
+        return 0
 
     unit_path = get_systemd_unit_path()
     if not unit_path.exists():
-        return
+        return 0
 
     _section("Gateway Service")
     linger_enabled, linger_detail = get_systemd_linger_status()
     if linger_enabled is True:
         check_ok("Systemd linger enabled", "(gateway service survives logout)")
-    elif linger_enabled is False:
+        return 0
+
+    if should_fix:
+        if ensure_systemd_linger_enabled(quiet=True):
+            check_ok("Systemd linger enabled", "(auto-fixed)")
+            return 1
+        check_fail("Could not enable systemd linger automatically", f"({linger_detail})")
+        issues.append("Enable linger for the gateway user service: sudo loginctl enable-linger $USER")
+        return 0
+
+    if linger_enabled is False:
         check_warn("Systemd linger disabled", "(gateway may stop after logout)")
         check_info("Run: sudo loginctl enable-linger $USER")
         issues.append("Enable linger for the gateway user service: sudo loginctl enable-linger $USER")
     else:
         check_warn("Could not verify systemd linger", f"({linger_detail})")
+    return 0
 
 
 _APIKEY_PROVIDERS_CACHE: list | None = None
@@ -1615,7 +1629,7 @@ def run_doctor(args):
         except Exception:
             pass
 
-    _check_gateway_service_linger(issues)
+    fixed_count += _check_gateway_service_linger(issues, should_fix=should_fix)
     _check_s6_supervision(issues)
 
     if sys.platform != "win32":

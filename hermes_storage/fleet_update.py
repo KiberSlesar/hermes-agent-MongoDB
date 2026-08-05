@@ -501,6 +501,14 @@ def _restart_gateway_best_effort() -> None:
     import subprocess
     import sys
 
+    if sys.platform != "win32":
+        try:
+            from hermes_cli.gateway import ensure_systemd_linger_enabled
+
+            ensure_systemd_linger_enabled(quiet=True)
+        except Exception as exc:
+            logger.warning("Could not ensure systemd linger before gateway restart: %s", exc)
+
     hermes_bin = shutil.which("hermes")
     # On Windows the launcher is hermes.cmd — prefer explicit start.
     action = "start"
