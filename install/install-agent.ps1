@@ -295,7 +295,14 @@ function Confirm-ReplaceExistingInstallation {
     # arbitrary directories or user profile data discovered through PATH.
     if ($hasExistingCheckout) {
         Stop-HermesRuntimeLocks -AgentDir $AgentDir
-        Remove-TreeWithRetry -Path $AgentDir
+        $backup = Join-Path (Split-Path $AgentDir -Parent) (
+            "hermes-agent.bak." + (Get-Date -Format 'yyyyMMddHHmmss')
+        )
+        try {
+            Move-Item -LiteralPath $AgentDir -Destination $backup -Force -ErrorAction Stop
+        } catch {
+            Remove-TreeWithRetry -Path $AgentDir
+        }
     }
     if ($existingCommand -and
         $existingCommand.CommandType -eq "Application" -and

@@ -480,6 +480,40 @@ def _fetch_install_script_from_tarball(
     tmp_tgz.unlink(missing_ok=True)
 
 
+def _run_windows_fleet_install_detached(script: Path, env: dict[str, str]) -> int:
+    """Spawn fleet install outside the current hermes process to release checkout locks."""
+    import subprocess
+    import sys
+
+    wrapper = script.parent / "hermes-fleet-install.cmd"
+    gateway_argv = _resolve_hermes_launcher() + ["gateway", "start"]
+    gateway_line = subprocess.list2cmdline(gateway_argv)
+    wrapper.write_text(
+        "@echo off\r\n"
+        "timeout /t 3 /nobreak >nul\r\n"
+        f"powershell -NoProfile -ExecutionPolicy Bypass -File \"{script}\"\r\n"
+        "if errorlevel 1 exit /b %errorlevel%\r\n"
+        f"{gateway_line}\r\n",
+        encoding="ascii",
+    )
+    subprocess.Popen(
+        ["cmd.exe", "/c", str(wrapper)],
+        env=env,
+        cwd=str(script.parent),
+        creationflags=(
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        ),
+        close_fds=True,
+    )
+    print(
+        "Windows fleet update continuing in a detached installer "
+        "(releasing file locks; gateway will restart when done)…"
+    )
+    logger.info("Detached Windows fleet install: %s", wrapper)
+    return 0
+
+
 def run_mongo_fork_install(desired: dict[str, Any]) -> int:
     """Run install-agent style upgrade (subprocess). Returns exit code."""
     import shutil
@@ -550,6 +584,8 @@ def run_mongo_fork_install(desired: dict[str, Any]) -> int:
 
     logger.info("Running fleet install: %s (repo=%s ref=%s)", cmd, repo, ref)
     try:
+        if is_windows and os.environ.get("HERMES_FLEET_UPDATE") == "1":
+            return _run_windows_fleet_install_detached(script, env)
         proc = subprocess.run(cmd, env=env, check=False)
         return int(proc.returncode)
     except Exception as exc:
@@ -805,16 +841,27 @@ def apply_fleet_update_sync(
         result["exit_code"] = code
         result["ok"] = code == 0
         if code == 0:
-            write_install_stamp(
-                version=str(want.get("version") or local_agent_version()),
-                ref=str(want.get("ref") or ""),
-                repo=str(want.get("repo") or ""),
-            )
-            result["agent_version"] = local_agent_version()
-            result["install_ref"] = local_install_ref()
-            _resume_gateways_after_fleet_update(gateway_token)
+            detached = os.name == "nt" and os.environ.get("HERMES_FLEET_UPDATE") == "1"
+            if not detached:
+                write_install_stamp(
+                    version=str(want.get("version") or local_agent_version()),
+                    ref=str(want.get("ref") or ""),
+                    repo=str(want.get("repo") or ""),
+                )
+                result["agent_version"] = local_agent_version()
+                result["install_ref"] = local_install_ref()
+                _resume_gateways_after_fleet_update(gateway_token)
+            else:
+                result["pending"] = True
+                result["message"] = (
+                    "detached Windows install scheduled; gateway will restart when complete"
+                )
             if storage is not None:
-                _set_node_update_status(storage, "idle", detail="applied")
+                _set_node_update_status(
+                    storage,
+                    "applying" if detached else "idle",
+                    detail="detached install" if detached else "applied",
+                )
         else:
             _resume_gateways_after_fleet_update(gateway_token)
             if storage is not None:
