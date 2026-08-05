@@ -179,8 +179,8 @@ hermes cluster status
 
 ```bash
 # на DB (нужен hermes + Mongo bootstrap / доступ к hermes_shared)
-export HERMES_FLEET_VERSION=0.19.17   # или --version
-hermes cluster update --version 0.19.17 --ref main
+export HERMES_FLEET_VERSION=0.19.18   # или --version
+hermes cluster update --version 0.19.18 --ref main
 ```
 
 Полный reinstall control plane по-прежнему через `installDB.sh` при необходимости;

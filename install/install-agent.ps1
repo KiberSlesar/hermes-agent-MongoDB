@@ -43,7 +43,6 @@ if (($env:HTTPS_PROXY -or $env:HTTP_PROXY) -and -not ($env:NO_PROXY -or $env:no_
     $env:NO_PROXY = $noProxy
     $env:no_proxy = $env:NO_PROXY
 }
-}
 
 function Get-AuthHeaders {
     $h = @{}
