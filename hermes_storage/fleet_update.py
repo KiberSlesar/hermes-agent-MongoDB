@@ -450,12 +450,41 @@ def _apply_worker(desired: dict[str, Any]) -> None:
                 pass
 
 
+def _fetch_install_script_from_tarball(
+    *,
+    repo: str,
+    ref: str,
+    raw_name: str,
+    dest: Path,
+) -> None:
+    """Extract ``install/<raw_name>`` from the fleet tarball (avoids stale raw.githubusercontent.com caches)."""
+    import tarfile
+
+    tmp_tgz = dest.parent / "fleet-install-src.tgz"
+    download_repo_tarball(repo=repo, ref=ref, dest=tmp_tgz)
+    with tarfile.open(tmp_tgz, "r:gz") as tar:
+        member = next(
+            (
+                m
+                for m in tar.getmembers()
+                if m.isfile() and m.name.endswith(f"/install/{raw_name}")
+            ),
+            None,
+        )
+        if member is None:
+            raise RuntimeError(f"install/{raw_name} not found in {repo}@{ref} tarball")
+        extracted = tar.extractfile(member)
+        if extracted is None:
+            raise RuntimeError(f"could not extract install/{raw_name} from tarball")
+        dest.write_bytes(extracted.read())
+    tmp_tgz.unlink(missing_ok=True)
+
+
 def run_mongo_fork_install(desired: dict[str, Any]) -> int:
     """Run install-agent style upgrade (subprocess). Returns exit code."""
     import shutil
     import subprocess
     import sys
-    import urllib.request
 
     repo = str(desired.get("repo") or DEFAULT_REPO)
     ref = str(desired.get("ref") or DEFAULT_REF)
@@ -490,22 +519,20 @@ def run_mongo_fork_install(desired: dict[str, Any]) -> int:
                 script = c
                 break
 
+    tmp = Path(os.environ.get("TEMP") or os.environ.get("TMPDIR") or "/tmp")
+    tmp.mkdir(parents=True, exist_ok=True)
     if script is None:
-        url = f"https://raw.githubusercontent.com/{repo}/{ref}/install/{raw_name}"
-        tmp = Path(os.environ.get("TEMP") or os.environ.get("TMPDIR") or "/tmp")
-        tmp.mkdir(parents=True, exist_ok=True)
         script = tmp / f"hermes-{raw_name}"
         try:
-            ensure_egress_proxy_env()
-            ensure_egress_proxy_env(env)
-            with urllib.request.urlopen(url, timeout=60) as resp:
-                script.write_bytes(resp.read())
+            _fetch_install_script_from_tarball(
+                repo=repo, ref=ref, raw_name=raw_name, dest=script
+            )
         except Exception as exc:
-            logger.error("Failed to download install-agent from %s: %s", url, exc)
+            logger.error(
+                "Failed to fetch install-agent from %s@%s tarball: %s", repo, ref, exc
+            )
             return 1
-        if is_windows:
-            pass
-        else:
+        if not is_windows:
             script.chmod(script.stat().st_mode | 0o755)
 
     if is_windows:
@@ -623,6 +650,13 @@ def _restart_gateway_best_effort() -> None:
             env = os.environ.copy()
             env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
             svc = f"{get_service_name()}.service"
+            subprocess.run(
+                ["systemctl", "--user", "reset-failed", svc],
+                env=env,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
             result = subprocess.run(
                 ["systemctl", "--user", "restart", svc],
                 env=env,
