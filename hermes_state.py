@@ -2532,6 +2532,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 data["system_prompt"] = resolved
         return data
 
+    def __new__(cls, db_path: Path = None, read_only: bool = False):
+        # Mongo mode must never silently fall back to local SQLite state.db.
+        if cls is SessionDB and db_path is None:
+            from hermes_storage import is_mongo_mode
+            if is_mongo_mode():
+                try:
+                    from hermes_storage.session_bridge import MongoSessionAdapter
+                    inst = object.__new__(MongoSessionAdapter)
+                    MongoSessionAdapter.__init__(inst, read_only=read_only)
+                    return inst
+                except Exception as exc:
+                    from hermes_storage.errors import raise_mongo_unavailable
+                    raise_mongo_unavailable(
+                        f"SessionDB Mongo bridge failed: {exc}", cause=exc
+                    )
+        return object.__new__(cls)
+
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or _default_db_path()
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context

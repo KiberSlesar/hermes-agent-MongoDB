@@ -700,6 +700,27 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
         )
+
+    # Mongo-only fork: classic durable HERMES_HOME paths are not the source of
+    # truth. Refuse writes that would look persisted locally while Mongo remains
+    # unchanged.
+    try:
+        from hermes_storage import classic_allowed, is_mongo_mode
+        from hermes_storage.mongo_only import (
+            durable_write_blocked_message,
+            is_classic_durable_path,
+        )
+
+        if is_mongo_mode() and not classic_allowed():
+            for candidate in (resolved, normalized):
+                try:
+                    candidate_path = Path(candidate)
+                except Exception:
+                    continue
+                if is_classic_durable_path(candidate_path):
+                    return durable_write_blocked_message(candidate_path)
+    except Exception:
+        pass
     return None
 
 

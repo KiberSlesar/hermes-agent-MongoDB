@@ -1319,6 +1319,24 @@ def load_gateway_config() -> GatewayConfig:
     _home = get_hermes_home()
     gw_data: dict = {}
 
+    # Mongo mode is authoritative for gateway/platform configuration.
+    # Do not fall back to local config.yaml when the shared store is enabled.
+    try:
+        from hermes_storage import is_mongo_mode, require_storage
+        if is_mongo_mode():
+            effective = require_storage().load_effective_config({}) or {}
+            if isinstance(effective, dict):
+                gw_data = dict(effective)
+                gateway_section = effective.get("gateway")
+                if isinstance(gateway_section, dict):
+                    gw_data.update(gateway_section)
+                # Keep the platform map at the top level for GatewayConfig.
+                if isinstance(effective.get("platforms"), dict):
+                    gw_data["platforms"] = effective["platforms"]
+                return GatewayConfig.from_dict(gw_data)
+    except Exception:
+        raise
+
     # Legacy fallback: gateway.json provides the base layer.
     # config.yaml keys always win when both specify the same setting.
     gateway_json_path = _home / "gateway.json"
