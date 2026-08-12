@@ -250,6 +250,11 @@ _LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
 _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
+# Mongo mode: durable config lives in the DB, but leftover local config.yaml
+# still has an mtime. Caching on that mtime would serve stale Mongo merges
+# after overlay/profile writes that do not touch the yaml. Bumped by
+# ``_invalidate_load_config_cache`` on every Mongo config writer.
+_MONGO_CONFIG_CACHE_GEN: int = 0
 # Serializes all config read/write paths. libyaml's C extension is not
 # thread-safe for concurrent safe_load() on the same file, and multiple
 # tool threads (approval.py, browser_tool.py, setup flows) hit
@@ -316,14 +321,6 @@ _EXTRA_ENV_KEYS = frozenset({
     "LANGFUSE_PUBLIC_KEY",
     "LANGFUSE_SECRET_KEY",
     "LANGFUSE_BASE_URL",
-    # ACP (Agent Client Protocol) keys — profile-isolable so different
-    # profiles can use different ACP backends without cross-leak.
-    "HERMES_ACP_AUTH_METHOD",
-    "HERMES_ACP_AUTO_APPROVE",
-    "HERMES_COPILOT_ACP_COMMAND",
-    "HERMES_COPILOT_ACP_ARGS",
-    "COPILOT_CLI_PATH",
-    "COPILOT_ACP_BASE_URL",
 })
 import yaml
 
@@ -902,14 +899,56 @@ def ensure_hermes_home():
     else:
         home.mkdir(parents=True, exist_ok=True)
         _secure_dir(home)
-        for subdir in (
-            "cron", "sessions", "logs", "logs/curator", "memories",
-            "pairing", "hooks", "image_cache", "audio_cache", "skills",
-        ):
-            d = home / subdir
-            d.mkdir(parents=True, exist_ok=True)
-            _secure_dir(d)
-        _ensure_default_soul_md(home)
+        try:
+            from hermes_storage import is_mongo_mode
+
+            _mongo = is_mongo_mode()
+        except Exception:
+            _mongo = False
+        if _mongo:
+            # Durable state lives in Mongo. Local dirs are runtime-only:
+            # logs, caches, and TLS material (certs created by enroll).
+            for subdir in (
+                "logs", "logs/curator", "cache", "cache/skills",
+                "image_cache", "audio_cache", "certs",
+            ):
+                d = home / subdir
+                d.mkdir(parents=True, exist_ok=True)
+                _secure_dir(d)
+            # Soul is stored in Mongo — seed there if empty, never write SOUL.md.
+            try:
+                from hermes_storage import require_storage
+
+                st = require_storage()
+                if not (st.load_soul() or "").strip():
+                    st.save_soul(DEFAULT_SOUL_MD)
+            except Exception:
+                pass
+        else:
+            # Pre-bootstrap (enroll) or test classic: never create classic
+            # durable trees in product mode without Mongo.
+            try:
+                from hermes_storage import classic_allowed
+                _classic = classic_allowed()
+            except Exception:
+                _classic = False
+            if _classic:
+                for subdir in (
+                    "cron", "sessions", "logs", "logs/curator", "memories",
+                    "pairing", "hooks", "image_cache", "audio_cache", "skills",
+                ):
+                    d = home / subdir
+                    d.mkdir(parents=True, exist_ok=True)
+                    _secure_dir(d)
+                _ensure_default_soul_md(home)
+            else:
+                for subdir in (
+                    "logs", "logs/curator", "cache", "cache/skills",
+                    "image_cache", "audio_cache", "certs",
+                ):
+                    d = home / subdir
+                    d.mkdir(parents=True, exist_ok=True)
+                    _secure_dir(d)
 
     _HERMES_HOME_ENSURED.add(key)
 
@@ -1167,7 +1206,7 @@ def _is_env_config_key(key: str) -> bool:
     ]
     return (
         key_upper in api_keys
-        or key_upper.endswith(('_API_KEY', '_TOKEN', '_SECRET'))
+        or key_upper.endswith(('_API_KEY', '_TOKEN'))
         or key_upper.startswith('TERMINAL_SSH')
     )
 
@@ -1686,9 +1725,7 @@ def get_custom_provider_extra_headers(
         entry_url = normalize_route_base_url(entry.get("base_url"))
         if not entry_url or entry_url != target_url:
             continue
-        headers = normalize_extra_headers(entry.get("extra_headers"))
-        if headers:
-            return headers
+        return normalize_extra_headers(entry.get("extra_headers"))
     return {}
 
 
@@ -1863,7 +1900,6 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     "smart_model_routing",   # written by the setup wizard (hermes_cli/setup.py)
     "platform_toolsets",     # written by the setup wizard (hermes_cli/setup.py)
     "known_plugin_toolsets", # written/read by hermes_cli/tools_config.py toolset-save flow
-    "known_builtin_toolsets",  # ditto — which builtin toolsets a platform's checklist has offered
     "session_reset",         # top-level form read by gateway/config.py + setup
     "group_sessions_per_user",   # top-level form bridged by gateway/config.py
     "thread_sessions_per_user",  # top-level form bridged by gateway/config.py
@@ -2929,54 +2965,36 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
     return node
 
 
-# Back-compat alias — canonical set lives in hermes_cli.personality.
-from hermes_cli.personality import NEUTRAL_PERSONALITY_NAMES as _NEUTRAL_PERSONALITY_NAMES  # noqa: F401
-
-
-def _prompt_text(value: Any) -> str:
-    """Normalize config prompt values from YAML before handing them to AIAgent.
-
-    Delegates to :mod:`hermes_cli.personality` — the single owner of
-    personality/overlay semantics. Kept as a re-export for existing importers.
-    """
-    from hermes_cli.personality import prompt_text
-
-    return prompt_text(value)
-
-
-def render_personality_prompt(value: Any) -> str:
-    """Render a string or structured personality definition to a prompt."""
-    from hermes_cli.personality import render_personality_prompt as _render
-
-    return _render(value)
-
-
-def resolve_ephemeral_system_prompt_from_config(cfg: Optional[Dict[str, Any]]) -> str:
-    """Resolve the session overlay from config.yaml.
-
-    ``display.personality`` is the selected named personality and wins when set.
-    Otherwise fall back to the user-owned ``agent.system_prompt``. Callers should
-    still prefer ``HERMES_EPHEMERAL_SYSTEM_PROMPT`` when that env var is set.
-
-    Delegates to :mod:`hermes_cli.personality` (single owner).
-    """
-    from hermes_cli.personality import resolve_ephemeral_system_prompt
-
-    return resolve_ephemeral_system_prompt(cfg)
-
 
 def read_raw_config() -> Dict[str, Any]:
-    """Read ~/.hermes/config.yaml as-is, without merging defaults or migrating.
+    """Read profile config without merging DEFAULT_CONFIG.
 
-    Returns the raw YAML dict, or ``{}`` if the file doesn't exist or can't
-    be parsed.  Use this for lightweight config reads where you just need a
-    single value and don't want the overhead of ``load_config()``'s deep-merge
-    + migration pipeline.
+    Mongo mode: profile config from the DB (source of truth).
+    Otherwise: ``~/.hermes/config.yaml`` as-is (mtime-cached).
 
-    Cached on the config file's (mtime_ns, size) — same strategy as
-    ``load_config()``. Returns a deepcopy on every call since some callers
-    mutate the result before passing to ``save_config()``.
+    Returns the raw dict, or ``{}`` if missing/unparseable (classic only).
+    Cached on the config file's (mtime_ns, size) in classic mode. Returns a
+    deepcopy on every call since some callers mutate the result before
+    passing to ``save_config()``.
     """
+    try:
+        from hermes_storage import is_mongo_mode, require_storage
+
+        if is_mongo_mode():
+            return copy.deepcopy(require_storage().load_profile_config() or {})
+    except Exception as exc:
+        try:
+            from hermes_storage import is_mongo_mode as _mongo_on
+
+            if _mongo_on():
+                raise RuntimeError(
+                    f"Failed to read profile config from Mongo: {exc}"
+                ) from exc
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
     with _CONFIG_LOCK:
         try:
             config_path = get_config_path()
@@ -3001,6 +3019,54 @@ def read_raw_config() -> Dict[str, Any]:
             data = {}
         _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], copy.deepcopy(data))
         return data
+
+
+def load_user_config_for_gateway(
+    config_home: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """User config dict for messaging-gateway loaders.
+
+    Mongo mode: ``shared ⊕ profile ⊕ machine overlay`` — fleet-shared
+    ``gateway`` / ``platforms`` settings with per-PC overlay (e.g. api_server
+    bind). Fail hard on Mongo errors (no local yaml fallback).
+
+    Classic mode: raw ``config.yaml`` under *config_home* (or HERMES_HOME).
+    """
+    try:
+        from hermes_storage import is_mongo_mode, require_storage
+
+        if is_mongo_mode():
+            data = require_storage().load_effective_config({}) or {}
+            return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        try:
+            from hermes_storage import is_mongo_mode as _mongo_on
+
+            if _mongo_on():
+                raise RuntimeError(
+                    f"Failed to load gateway config from Mongo: {exc}"
+                ) from exc
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+    home = Path(config_home) if config_home is not None else get_hermes_home()
+    config_path = home / "config.yaml"
+    try:
+        if config_path == get_config_path():
+            return read_raw_config()
+    except Exception:
+        pass
+
+    try:
+        if config_path.exists():
+            with open(config_path, encoding="utf-8") as f:
+                data = fast_safe_load(f) or {}
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        _warn_config_parse_failure(config_path, e)
+    return {}
 
 
 def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
@@ -3041,8 +3107,29 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
     ``config_path`` defaults to :func:`get_config_path` (profile-aware).
     Pass an explicit path when the caller resolves its own home (gateway
     ``_hermes_home``, tui profile override, multi-profile probes).
+
+    Mongo mode (default path only): returns the profile config document from
+    the DB — there is no durable local ``config.yaml``.
     """
     if config_path is None:
+        try:
+            from hermes_storage import is_mongo_mode, require_storage
+
+            if is_mongo_mode():
+                data = require_storage().load_profile_config() or {}
+                return copy.deepcopy(data) if isinstance(data, dict) else {}
+        except Exception as exc:
+            try:
+                from hermes_storage import is_mongo_mode as _mongo_on
+
+                if _mongo_on():
+                    raise RuntimeError(
+                        f"Failed to read profile config from Mongo: {exc}"
+                    ) from exc
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
         config_path = get_config_path()
     try:
         with open(config_path, encoding="utf-8") as f:
@@ -3066,7 +3153,28 @@ def read_raw_config_readonly() -> Dict[str, Any]:
 
     Same (mtime_ns, size) freshness key as ``read_raw_config()`` — an edited
     config.yaml is picked up on the next call.
+
+    Mongo mode: returns the profile config document (same as ``read_raw_config``).
     """
+    try:
+        from hermes_storage import is_mongo_mode, require_storage
+
+        if is_mongo_mode():
+            data = require_storage().load_profile_config() or {}
+            return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        try:
+            from hermes_storage import is_mongo_mode as _mongo_on
+
+            if _mongo_on():
+                raise RuntimeError(
+                    f"Failed to read profile config from Mongo: {exc}"
+                ) from exc
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
     with _CONFIG_LOCK:
         try:
             config_path = get_config_path()
@@ -3147,6 +3255,20 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     atomic_yaml_write(config_path, data, **kwargs)
 
 
+def _invalidate_load_config_cache() -> None:
+    """Drop in-process config caches after a durable config write.
+
+    Classic mode writers usually rely on yaml mtime; Mongo writers and any
+    path that mutates profile/overlay without touching leftover yaml MUST
+    call this so the next ``load_config()`` re-merges from the DB.
+    """
+    global _MONGO_CONFIG_CACHE_GEN
+    with _CONFIG_LOCK:
+        _MONGO_CONFIG_CACHE_GEN += 1
+        _LOAD_CONFIG_CACHE.clear()
+        _RAW_CONFIG_CACHE.clear()
+
+
 def load_config() -> Dict[str, Any]:
     """Load configuration from ~/.hermes/config.yaml.
 
@@ -3156,6 +3278,10 @@ def load_config() -> Dict[str, Any]:
     The cache is keyed on ``str(config_path)`` so profile switches
     (which change ``HERMES_HOME`` and therefore ``get_config_path()``)
     don't collide.
+
+    In Mongo mode the cache is keyed on an explicit generation counter
+    (not leftover ``config.yaml`` mtime) so profile/overlay writes invalidate
+    correctly.
 
     Read-only callers should use ``load_config_readonly()`` to skip the
     defensive deepcopy — that path matters in agent-loop hot spots like
@@ -3218,7 +3344,6 @@ def write_platform_config_field(
 TERMINAL_CONFIG_ENV_MAP = {
     "backend": "TERMINAL_ENV",
     "modal_mode": "TERMINAL_MODAL_MODE",
-    "degraded_mode": "TERMINAL_DEGRADED_MODE",
     "cwd": "TERMINAL_CWD",
     "timeout": "TERMINAL_TIMEOUT",
     "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
@@ -3241,7 +3366,6 @@ TERMINAL_CONFIG_ENV_MAP = {
     "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
     "docker_network": "TERMINAL_DOCKER_NETWORK",
     "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
-    "docker_shm_size": "TERMINAL_DOCKER_SHM_SIZE",
     "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
     "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
     "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
@@ -3264,18 +3388,6 @@ def terminal_config_env_var_for_key(key: str) -> Optional[str]:
     return TERMINAL_CONFIG_ENV_MAP.get(key[len(prefix):])
 
 
-def _is_ssh_remote_tilde_cwd(backend: str, cwd: str) -> bool:
-    """Return whether the remote SSH shell must expand *cwd* itself.
-
-    Expanding ``~`` on the Hermes host rewrites it to the host or container
-    home before SSH sees it. Preserve ``~`` and ``~/...`` so they follow the
-    user selected by the SSH connection.
-    """
-    if (backend or "").strip().lower() != "ssh":
-        return False
-    return cwd == "~" or cwd.startswith("~/")
-
-
 def apply_terminal_config_to_env(
     *,
     env: Optional[Dict[str, str]] = None,
@@ -3289,38 +3401,20 @@ def apply_terminal_config_to_env(
     gives those child-process launch paths the same config bridge as classic
     CLI without importing ``cli.py`` and paying for its startup side effects.
 
-    Explicit keys in the user config's ``terminal`` section are authoritative
-    and override their matching env values.  Merged defaults only backfill
-    missing env vars; they never replace unrelated exported/.env values.
+    When the user config contains a ``terminal`` section, config.yaml is
+    authoritative and overrides existing env values.  Otherwise defaults only
+    backfill missing env vars so exported/.env values keep working.
     """
     target = os.environ if env is None else env
 
     raw_config = read_raw_config()
-    raw_terminal_cfg = raw_config.get("terminal")
-    file_has_terminal_config = isinstance(raw_terminal_cfg, dict)
-    if not file_has_terminal_config:
-        raw_terminal_cfg = {}
+    file_has_terminal_config = isinstance(raw_config.get("terminal"), dict)
     should_override = file_has_terminal_config if override is None else override
 
     cfg = config if config is not None else load_config_readonly()
     terminal_cfg = cfg.get("terminal", {}) if isinstance(cfg, dict) else {}
     if not isinstance(terminal_cfg, dict):
         return target
-
-    # A caller-supplied config is its own source of explicit keys.  For the
-    # normal merged-config path, only keys present in raw config.yaml may
-    # override existing env values; keys inherited from DEFAULT_CONFIG are
-    # backfill-only.
-    explicit_keys = terminal_cfg.keys() if config is not None else raw_terminal_cfg.keys()
-    backend_is_explicit = config is not None or "backend" in raw_terminal_cfg
-    if backend_is_explicit:
-        terminal_backend = str(
-            terminal_cfg.get("backend") or target.get("TERMINAL_ENV") or ""
-        )
-    else:
-        terminal_backend = str(
-            target.get("TERMINAL_ENV") or terminal_cfg.get("backend") or ""
-        )
 
     for cfg_key, env_var in TERMINAL_CONFIG_ENV_MAP.items():
         if cfg_key not in terminal_cfg:
@@ -3330,11 +3424,9 @@ def apply_terminal_config_to_env(
             raw_cwd = str(value or "").strip()
             if raw_cwd in {".", "auto", "cwd"}:
                 continue
-            if isinstance(value, str) and not _is_ssh_remote_tilde_cwd(
-                terminal_backend, raw_cwd
-            ):
+            if isinstance(value, str):
                 value = os.path.expanduser(value)
-        if (should_override and cfg_key in explicit_keys) or env_var not in target:
+        if should_override or env_var not in target:
             target[env_var] = _terminal_env_value(value)
     return target
 
@@ -3364,10 +3456,30 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         except OSError:
             managed_sig = (0, 0)
 
+        # Mongo mode: skip local config.yaml merge — durable settings come from
+        # load_effective_config below. A leftover/stale yaml must not seed the
+        # merge base (would reintroduce deleted keys / unexpanded ${VAR}).
+        _mongo_load = False
+        try:
+            from hermes_storage import is_mongo_mode as _is_mongo_load
+
+            _mongo_load = bool(_is_mongo_load())
+        except Exception:
+            _mongo_load = False
+
         # Combined cache signature: user file + managed file. None only when the
         # user config is absent AND no managed file exists (nothing to cache on).
-        if user_sig is not None:
+        # Mongo mode must NOT key on leftover config.yaml mtime — writers update
+        # the DB without touching that file.
+        if _mongo_load:
             cache_sig: Optional[Tuple[int, int, int, int]] = (
+                _MONGO_CONFIG_CACHE_GEN,
+                0,
+                managed_sig[0],
+                managed_sig[1],
+            )
+        elif user_sig is not None:
+            cache_sig = (
                 user_sig[0],
                 user_sig[1],
                 managed_sig[0],
@@ -3391,7 +3503,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
         config = copy.deepcopy(DEFAULT_CONFIG)
 
-        if user_sig is not None:
+        if user_sig is not None and not _mongo_load:
             try:
                 with open(config_path, encoding="utf-8") as f:
                     user_config = fast_safe_load(f) or {}
@@ -3456,6 +3568,17 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         if managed_config:
             managed_expanded = _expand_env_vars(managed_config)
             expanded = _deep_merge(expanded, managed_expanded)
+        # Mongo remote config: shared settings ⊕ profile config ⊕ machine overlay
+        # win over local yaml when bootstrap/URI is present. Fail hard — no local
+        # durable fallback while Mongo mode is on (fleet split-brain).
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            from hermes_storage import require_storage
+            storage = require_storage()
+            # Mongo may reintroduce raw ``${VAR}`` templates from profile/shared
+            # config. Re-expand after merge so api_key does not stay a literal
+            # placeholder (→ provider 401) while the env var is already set.
+            expanded = _expand_env_vars(storage.load_effective_config(expanded))
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``
@@ -3607,6 +3730,14 @@ def save_config(
         ensure_hermes_home()
         config_path = get_config_path()
         require_readable_config_before_write(config_path)
+        # Persist to Mongo when remote storage is enabled. Fail hard on error —
+        # do not leave a local-only write that diverges from the fleet brain.
+        # Write only the *normalized* document (below) — never the pre-strip
+        # caller payload, or env-ref templates / defaults get corrupted.
+        from hermes_storage import ensure_mongo_durable, is_mongo_mode
+
+        ensure_mongo_durable(surface="config")
+        _mongo_save = is_mongo_mode()
         # Compute explicit user paths BEFORE any normalisation --------
         # _normalize_max_turns_config may inject agent.max_turns from
         # DEFAULT_CONFIG; using the raw dict preserves which paths the
@@ -3651,6 +3782,16 @@ def save_config(
                 DEFAULT_CONFIG,
                 preserve_keys=effective_preserve_keys,
             )
+
+        # Mongo mode: durable config is the DB only — do not write config.yaml.
+        if _mongo_save:
+            from hermes_storage import require_storage
+            storage = require_storage()
+            storage.save_profile_config(normalized)
+            storage.save_machine_overlay_from_config(normalized)
+            _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+            _invalidate_load_config_cache()
+            return
 
         # Build optional commented-out sections for features that are off by
         # default or only relevant when explicitly configured.
@@ -3701,20 +3842,32 @@ def _parse_env_value(raw_value: str) -> str:
 
 
 def load_env() -> Dict[str, str]:
-    """Load environment variables from ~/.hermes/.env.
+    """Load secrets for credential UIs / get_env_value.
 
-    Normalizes line endings before parsing while treating each assignment's
-    value as opaque data for boundary discovery.
-
-    The parsed dict is memoised keyed on the .env file mtime, because
-    ``get_env_value()`` is called dozens-to-hundreds of times per
-    interactive menu render (`hermes tools`, `hermes setup`, status
-    panels). Sanitisation is O(lines), so re-parsing the
-    same file on every call was burning ~300ms of CPU per `hermes tools`
-    menu paint on top of the OAuth-refresh slowness. The mtime check
-    invalidates the cache when the user edits .env mid-process.
+    Mongo mode: profile secrets from the DB (source of truth).
+    Otherwise: parse ``~/.hermes/.env`` (mtime-memoised).
     """
     global _env_cache
+
+    try:
+        from hermes_storage import is_mongo_mode, get_storage
+
+        _mongo_env = is_mongo_mode()
+    except Exception:
+        _mongo_env = False
+
+    if _mongo_env:
+        # Fail hard — never silently fall through to a leftover local .env
+        # (fleet split-brain / stale keys after migrate).
+        from hermes_storage import require_storage
+
+        raw = require_storage().get_effective_secrets()
+        return {
+            str(k): str(v)
+            for k, v in raw.items()
+            if v is not None and not str(k).startswith("__")
+        }
+
     env_path = get_env_path()
 
     try:
@@ -3896,6 +4049,7 @@ def _quote_env_value(value: str) -> str:
     # internal runs that strip() would leave alone.
     needs_quoting = (
         "#" in value
+        or "$" in value  # prevent dotenv ${} / $VAR expansion if interpolate slips on
         or '"' in value
         or "'" in value
         or value != value.strip()
@@ -3922,7 +4076,12 @@ def _env_line_defines_key(line: str, key: str) -> bool:
 
 
 def save_env_value(key: str, value: str):
-    """Save or update a value in ~/.hermes/.env."""
+    """Save or update a secret.
+
+    In Mongo mode the durable store is profile ``secrets`` in the DB — local
+    ``.env`` is not written (avoids split-brain / 401 from stale placeholders).
+    Without Mongo, behaviour is unchanged: atomic write to ``~/.hermes/.env``.
+    """
     if is_managed():
         managed_error(f"set {key}")
         return
@@ -3946,6 +4105,65 @@ def save_env_value(key: str, value: str):
     # API keys / tokens must be ASCII — strip non-ASCII with a warning.
     value = _check_non_ascii_credential(key, value)
     ensure_hermes_home()
+
+    from hermes_storage import ensure_mongo_durable, is_mongo_mode, require_storage
+
+    ensure_mongo_durable(surface="secrets")
+    _mongo = is_mongo_mode()
+
+    if _mongo:
+        try:
+            require_storage().set_secret(key, value)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to save {key} to Mongo secrets (Mongo mode is on; "
+                f"local .env is not used as durable store): {exc}"
+            ) from exc
+        os.environ[key] = value
+        invalidate_env_cache()
+        # Drop stale local copy so prefer-dotenv / hand-edits can't win.
+        _drop_local_env_key(key)
+        return
+
+    _write_local_env_value(key, value)
+    os.environ[key] = value
+    invalidate_env_cache()
+
+
+def _drop_local_env_key(key: str) -> None:
+    """Best-effort remove a key from local .env (Mongo mode cleanup)."""
+    env_path = get_env_path()
+    if not env_path.exists():
+        return
+    try:
+        read_kw = {"encoding": "utf-8-sig", "errors": "replace"}
+        write_kw = {"encoding": "utf-8"}
+        with open(env_path, **read_kw) as f:
+            lines = _sanitize_env_lines(f.readlines())
+        new_lines = [line for line in lines if not _env_line_defines_key(line, key)]
+        if len(new_lines) == len(lines):
+            return
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(env_path.parent), suffix=".tmp", prefix=".env_"
+        )
+        try:
+            with os.fdopen(fd, "w", **write_kw) as f:
+                f.writelines(new_lines)
+                f.flush()
+                os.fsync(f.fileno())
+            atomic_replace(tmp_path, env_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        pass
+
+
+def _write_local_env_value(key: str, value: str) -> None:
+    """Atomic write of KEY=value into ~/.hermes/.env (non-Mongo path)."""
     env_path = get_env_path()
 
     # On Windows, open() defaults to the system locale (cp1252) which can
@@ -3980,7 +4198,7 @@ def save_env_value(key: str, value: str):
         if lines and not lines[-1].endswith("\n"):
             lines[-1] += "\n"
         lines.append(f"{key}={serialized_value}\n")
-    
+
     fd, tmp_path = tempfile.mkstemp(dir=str(env_path.parent), suffix='.tmp', prefix='.env_')
     # Preserve original permissions so Docker volume mounts aren't clobbered.
     original_mode = None
@@ -4011,9 +4229,6 @@ def save_env_value(key: str, value: str):
             pass
         raise
 
-    os.environ[key] = value
-    invalidate_env_cache()
-
 
 def custom_endpoint_key_env(identity: str) -> str:
     """Env var name holding a custom endpoint's API key.
@@ -4035,7 +4250,10 @@ def custom_endpoint_key_env(identity: str) -> str:
 
 
 def remove_env_value(key: str) -> bool:
-    """Remove a key from ~/.hermes/.env and os.environ.
+    """Remove a key from the durable secrets store and os.environ.
+
+    Mongo mode: delete from profile secrets (and scrub local .env if present).
+    Otherwise: remove from ~/.hermes/.env.
 
     Returns True if the key was found and removed, False otherwise.
     """
@@ -4056,6 +4274,25 @@ def remove_env_value(key: str) -> bool:
         return False
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
+
+    from hermes_storage import ensure_mongo_durable, is_mongo_mode, require_storage
+
+    ensure_mongo_durable(surface="secrets")
+    _mongo = is_mongo_mode()
+
+    if _mongo:
+        try:
+            storage = require_storage()
+            found = storage.remove_secret(key)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to remove {key} from Mongo secrets: {exc}"
+            ) from exc
+        os.environ.pop(key, None)
+        invalidate_env_cache()
+        _drop_local_env_key(key)
+        return found
+
     env_path = get_env_path()
     if not env_path.exists():
         os.environ.pop(key, None)
@@ -4166,38 +4403,28 @@ def reload_env() -> int:
 
 
 def get_env_value(key: str) -> Optional[str]:
-    """Get a value from ``os.environ`` or ``~/.hermes/.env``, scope-aware.
+    """Get a value from ~/.hermes/.env or environment.
 
-    The ``os.environ`` read routes through ``agent.secret_scope.get_secret``
-    so that, under an active profile scope (multiplexed gateway turn), this
-    is scope-checked rather than leaking another profile's raw ``os.environ``
-    value. ``get_secret`` encodes the whole policy: global vars pass through;
-    scope is authoritative under multiplexing (miss -> None, no environ
-    fallthrough); when multiplexing is off it behaves exactly like the
-    legacy ``os.environ`` read. Its siblings ``get_env_value_prefer_dotenv``
-    and ``gateway.config._getenv`` already work this way — this was the last
-    scope-blind reader of the trio (#67027).
+    In Mongo mode the durable secrets store is the DB — prefer ``load_env()``
+    over ``os.environ`` so a rotated Mongo secret is not shadowed by a stale
+    process env left over from an earlier ``save_env_value`` / shell export.
+    Runtime-only keys that exist solely in ``os.environ`` still resolve.
     """
     try:
-        from agent.secret_scope import (
-            UnscopedSecretError,
-            get_secret as _get_secret,
-        )
-    except Exception:
-        if key in os.environ:
-            return os.environ[key]
-        return load_env().get(key)
+        from hermes_storage import is_mongo_mode
 
-    try:
-        val = _get_secret(key)
-    except UnscopedSecretError:
-        raise
+        if is_mongo_mode():
+            env_vars = load_env()
+            if key in env_vars:
+                return env_vars[key]
+            return os.environ.get(key)
     except Exception:
-        val = os.environ.get(key)
-    if val is not None:
-        return val
+        pass
 
-    # Then check .env file
+    # Classic: process env first (matches historical behaviour), then .env.
+    if key in os.environ:
+        return os.environ[key]
+
     env_vars = load_env()
     return env_vars.get(key)
 
@@ -4393,13 +4620,7 @@ def show_config():
     print()
     print(color("◆ Display", Colors.CYAN, Colors.BOLD))
     display = config.get('display', {})
-    try:
-        from hermes_cli.personality import active_personality_name
-
-        _active_personality = active_personality_name(config) or 'none'
-    except Exception:
-        _active_personality = display.get('personality') or 'none'
-    print(f"  Personality:  {_active_personality}")
+    print(f"  Personality:  {display.get('personality') or 'none'}")
     print(f"  Reasoning:    {'on' if display.get('show_reasoning', True) else 'off'}")
     print(f"  Bell:         {'on' if display.get('bell_on_complete', False) else 'off'}")
     ump = display.get('user_message_preview', {}) if isinstance(display.get('user_message_preview', {}), dict) else {}
@@ -4892,12 +5113,8 @@ def set_config_value(key: str, value: str, force: bool = False):
         key: Dotted config path (e.g. ``terminal.backend``).
         value: String value (auto-coerced to bool/int/float when matching).
         force: When True, skip the unknown-key warning — useful for scripted
-            writes of keys the running version doesn't recognize yet — AND
-            authorize destructive replacement of a mapping section by a
-            scalar (e.g. ``--force model gpt-x`` replaces the whole ``model:``
-            mapping). Without --force, scalar writes over mapping sections are
-            refused (bare ``model`` is redirected to ``model.default``). The
-            CLI exposes this via ``hermes config set --force``.
+            writes of keys the running version doesn't recognize yet. The CLI
+            exposes this via ``hermes config set --force``.
     """
     if is_managed():
         managed_error("set configuration values")
@@ -4925,6 +5142,14 @@ def set_config_value(key: str, value: str, force: bool = False):
         from hermes_cli.credential_lifecycle import save_provider_env_credential
 
         save_provider_env_credential(key.upper(), value)
+        try:
+            from hermes_storage import is_mongo_mode as _mongo_env_set
+
+            if _mongo_env_set():
+                print(f"✓ Set {key} in Mongo profile secrets")
+                return
+        except Exception:
+            pass
         print(f"✓ Set {key} in {get_env_path()}")
         return
 
@@ -4937,25 +5162,14 @@ def set_config_value(key: str, value: str, force: bool = False):
     # "did you mean" hint, without blocking legitimate unknown keys.
     is_known, suggestion = _validate_config_key(key)
 
-    # Otherwise it goes to config.yaml
+    # Otherwise it goes to config.yaml (or Mongo profile config).
     # Read the raw user config (not merged with defaults) to avoid
     # dumping all default values back to the file
     config_path = get_config_path()
     require_readable_config_before_write(config_path)
-    user_config = {}
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                user_config = fast_safe_load(f) or {}
-        except Exception as exc:
-            print(
-                f"✗ Cannot parse {config_path}: {exc}\n"
-                f"  The file contains a YAML syntax error. Fix the error\n"
-                f"  in your config file first, then retry.\n"
-                f"  (hermes config edit will open it in your editor.)",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+    user_config = read_raw_config()
+    if not isinstance(user_config, dict):
+        user_config = {}
     
     # Handle nested keys (e.g., "tts.provider") including numeric list
     # indices (e.g., "custom_providers.0.api_key").  Delegates to
@@ -4977,73 +5191,6 @@ def set_config_value(key: str, value: str, force: bool = False):
             coerced_value = float(value)
 
     value = coerced_value
-    # Normalize a scalar ``model`` key before writing sub-keys so that
-    # ``hermes config set model.provider openai`` doesn't silently
-    # destroy the model id when ``model`` is a bare string shorthand
-    # (e.g. ``model: gpt-4o``).  Without this _set_nested replaces the
-    # scalar with an empty dict, dropping the model id permanently.
-    _model_key = key.strip().lower()
-    if _model_key.startswith("model."):
-        _model_val = user_config.get("model")
-        if isinstance(_model_val, str) and _model_val:
-            user_config["model"] = {"default": _model_val}
-    # Guard against #74995: a single-segment key that names an existing
-    # mapping would silently overwrite the entire section with a scalar
-    # (e.g. ``hermes config set model gpt-5.6-sol`` when model already
-    # contains default/provider/context_length).  Bare ``model`` is a
-    # documented shorthand — redirect to ``model.default`` and preserve
-    # siblings.  All other mapping sections are rejected unless --force.
-    if "." not in key:
-        _existing = user_config.get(key)
-        if isinstance(_existing, dict):
-            if key == "model":
-                if force:
-                    # --force: allow destructive section overwrite.
-                    print(
-                        f"⚠ Replacing entire 'model' section with a scalar "
-                        f"(discarding {len(_existing)} existing sub-key(s))"
-                    )
-                else:
-                    # Redirect bare-model shorthand to model.default while
-                    # keeping every sibling mapping key intact.
-                    key = "model.default"
-                    print(
-                        f"✓ Redirecting bare 'model' to 'model.default' "
-                        f"(preserving {len(_existing)} existing model sub-key(s))"
-                    )
-                    # value was already coerced above; proceed to _set_nested
-            elif not force:
-                _sub = [k for k in _existing if isinstance(k, str)]
-                print(
-                    f"✗ Cannot set '{key}' to a scalar — '{key}' is a "
-                    f"configuration section with {len(_sub)} sub-key(s).",
-                    file=sys.stderr,
-                )
-                if _sub:
-                    _sub_list = ", ".join(_sub[:8])
-                    print(f"  Sub-keys: {_sub_list}", file=sys.stderr)
-                    if len(_sub) > 8:
-                        print(
-                            f"  ... and {len(_sub) - 8} more",
-                            file=sys.stderr,
-                        )
-                print(
-                    "  Use a dotted path to set a specific leaf key:",
-                    file=sys.stderr,
-                )
-                print(
-                    f"    hermes config set {key}.<sub-key> <value>",
-                    file=sys.stderr,
-                )
-                print(
-                    "  Or use --force to replace the entire section:",
-                    file=sys.stderr,
-                )
-                print(
-                    f"    hermes config set --force {key} {value!r}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
     _set_nested(user_config, key, value)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
@@ -5056,8 +5203,21 @@ def set_config_value(key: str, value: str, force: bool = False):
         print("  (note: 'api_base' is an alias — saved as model.base_url)")
     # Write only user config back (not the full merged defaults)
     ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    try:
+        from hermes_storage import is_mongo_mode as _mongo_cfg_set
+
+        _mongo_set = bool(_mongo_cfg_set())
+    except Exception:
+        _mongo_set = False
+    if _mongo_set:
+        from hermes_storage import require_storage
+
+        require_storage().save_profile_config(user_config)
+        _LAST_EXPANDED_CONFIG_BY_PATH.pop(str(config_path), None)
+        _invalidate_load_config_cache()
+    else:
+        from utils import atomic_yaml_write
+        atomic_yaml_write(config_path, user_config, sort_keys=False)
     
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
@@ -5088,7 +5248,10 @@ def set_config_value(key: str, value: str, force: bool = False):
         _display_value = mask_secret(value)
     else:
         _display_value = value
-    print(f"✓ Set {key} = {_display_value} in {config_path}")
+    print(
+        f"✓ Set {key} = {_display_value} in "
+        f"{'Mongo profile config' if _mongo_set else config_path}"
+    )
     warn_unpinned_cron_jobs_after_model_config_change(key, value, user_config)
 
     # Post-write unknown-key notice (#34067): value IS saved, but tell the
@@ -5162,15 +5325,8 @@ def unset_config_value(key: str):
         try:
             with open(config_path, encoding="utf-8") as f:
                 user_config = fast_safe_load(f) or {}
-        except Exception as exc:
-            print(
-                f"✗ Cannot parse {config_path}: {exc}\n"
-                f"  The file contains a YAML syntax error. Fix the error\n"
-                f"  in your config file first, then retry.\n"
-                f"  (hermes config edit will open it in your editor.)",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        except Exception:
+            user_config = {}
 
     removed = _unset_nested(user_config, key)
 
@@ -5227,8 +5383,7 @@ def config_command(args):
             print("  hermes config set terminal.backend docker")
             print("  hermes config set OPENROUTER_API_KEY sk-or-...")
             print()
-            print("  --force: skip the unknown-key notice for unrecognized keys,")
-            print("           and allow a scalar to replace a whole mapping section")
+            print("  --force: skip the unknown-key notice for unrecognized keys")
             sys.exit(1)
         set_config_value(key, value, force=force)
 
