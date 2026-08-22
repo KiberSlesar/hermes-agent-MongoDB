@@ -2476,15 +2476,25 @@ class GatewaySlashCommandsMixin:
 
             if all_sessions:
                 # Clear every session's model override so all sessions fall
-                # back to the just-persisted global default.
+                # back to the just-persisted global default, and also update
+                # the displayed per-session model so /status shows the new
+                # model on every platform.
                 try:
                     _store = getattr(self, "async_session_store", None)
+                    _sess_db2 = getattr(self, "_session_db", None)
                     if _store is not None:
                         for _entry in await _store.list_sessions():
                             try:
                                 await _store.set_model_override(_entry.session_key, None)
                             except Exception:
                                 pass
+                            if _sess_db2 is not None:
+                                try:
+                                    await _sess_db2.update_session_model(
+                                        _entry.session_id, result.new_model
+                                    )
+                                except Exception:
+                                    pass
                 except Exception as _all_exc:
                     logger.warning("Failed to clear all session model overrides: %s", _all_exc)
                 _ov = getattr(self, "_session_model_overrides", None)
