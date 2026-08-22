@@ -1750,27 +1750,7 @@ class GatewaySlashCommandsMixin:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
-    def _read_persist_base_config(config_path):
-    """Base document for model-switch write-back round-trips.
-
-    In Mongo mode the durable config lives in the profile DB; reading the
-    raw config.yaml (empty or missing there) and saving it back would wipe
-    the whole fleet profile config. Fall back to the on-disk raw file only
-    outside Mongo mode.
-    """
-    try:
-        from hermes_storage import is_mongo_mode, require_storage
-        if is_mongo_mode():
-            cfg = require_storage().load_profile_config()
-            if isinstance(cfg, dict):
-                return dict(cfg)
-    except Exception:
-        pass
-    from hermes_cli.config import read_user_config_raw
-    return read_user_config_raw(config_path)
-
-
-async def _handle_model_command(self, event: MessageEvent, force_all_sessions: bool = False) -> Optional[str]:
+    async def _handle_model_command(self, event: MessageEvent, force_all_sessions: bool = False) -> Optional[str]:
         """Handle /model command — switch model.
 
         Supports:
@@ -5667,3 +5647,23 @@ async def _handle_model_command(self, event: MessageEvent, force_all_sessions: b
 
         self._schedule_update_notification_watch()
         return t("gateway.update.starting")
+
+
+def _read_persist_base_config(config_path):
+    """Base document for model-switch write-back round-trips.
+
+    In Mongo mode the durable config lives in the profile DB; reading the
+    raw config.yaml (empty or missing there) and saving it back would wipe
+    the whole fleet profile config. Fall back to the on-disk raw file only
+    outside Mongo mode.
+    """
+    try:
+        from hermes_storage import is_mongo_mode, require_storage
+        if is_mongo_mode():
+            cfg = require_storage().load_profile_config()
+            if isinstance(cfg, dict):
+                return dict(cfg)
+    except Exception:
+        pass
+    from hermes_cli.config import read_user_config_raw
+    return read_user_config_raw(config_path)
