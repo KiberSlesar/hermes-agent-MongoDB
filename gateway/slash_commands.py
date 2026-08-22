@@ -1750,7 +1750,27 @@ class GatewaySlashCommandsMixin:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
-    async def _handle_model_command(self, event: MessageEvent, force_all_sessions: bool = False) -> Optional[str]:
+    def _read_persist_base_config(config_path):
+    """Base document for model-switch write-back round-trips.
+
+    In Mongo mode the durable config lives in the profile DB; reading the
+    raw config.yaml (empty or missing there) and saving it back would wipe
+    the whole fleet profile config. Fall back to the on-disk raw file only
+    outside Mongo mode.
+    """
+    try:
+        from hermes_storage import is_mongo_mode, require_storage
+        if is_mongo_mode():
+            cfg = require_storage().load_profile_config()
+            if isinstance(cfg, dict):
+                return dict(cfg)
+    except Exception:
+        pass
+    from hermes_cli.config import read_user_config_raw
+    return read_user_config_raw(config_path)
+
+
+async def _handle_model_command(self, event: MessageEvent, force_all_sessions: bool = False) -> Optional[str]:
         """Handle /model command — switch model.
 
         Supports:
@@ -2039,8 +2059,7 @@ class GatewaySlashCommandsMixin:
                             try:
                                 # Write-back round-trip: raw read is correct
                                 # (merged defaults must not be persisted).
-                                from hermes_cli.config import read_user_config_raw
-                                _persist_cfg = read_user_config_raw(config_path)
+                                _persist_cfg = _read_persist_base_config(config_path)
                                 _raw_model = _persist_cfg.get("model")
                                 if isinstance(_raw_model, dict):
                                     _persist_model_cfg = _raw_model
@@ -2066,7 +2085,11 @@ class GatewaySlashCommandsMixin:
                                 except Exception:
                                     _persist_model_cfg.pop("context_length", None)
                                 _persist_model_cfg["default"] = result.new_model
-                                _persist_model_cfg["provider"] = result.target_provider
+                                _persist_model_cfg["provider"] = (
+                                    "custom"
+                                    if str(result.target_provider or "").strip().lower().startswith("custom:")
+                                    else result.target_provider
+                                )
                                 # Named providers always resolve base_url/api_mode fresh,
                                 # so any leftover is cleared unconditionally below. Custom
                                 # providers have no registry entry to re-derive from, so
@@ -2074,7 +2097,10 @@ class GatewaySlashCommandsMixin:
                                 # lone `if result.base_url:` left a stale base_url behind
                                 # when switching to a custom provider whose resolver
                                 # returned an empty base_url (#25107).
-                                _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"
+                                _is_custom_target = (
+                                    str(result.target_provider or "").strip().lower() == "custom"
+                                    or str(result.target_provider or "").strip().lower().startswith("custom:")
+                                )
                                 if result.base_url:
                                     _persist_model_cfg["base_url"] = result.base_url
                                 elif _is_custom_target:
@@ -2392,8 +2418,7 @@ class GatewaySlashCommandsMixin:
                 try:
                     # Write-back round-trip: raw read is correct (merged
                     # defaults must not be persisted back to the user's file).
-                    from hermes_cli.config import read_user_config_raw
-                    cfg = read_user_config_raw(config_path)
+                    cfg = _read_persist_base_config(config_path)
                     # Coerce scalar/None ``model:`` into a dict before mutation —
                     # otherwise ``cfg.setdefault("model", {})`` returns the existing
                     # scalar and the next assignment raises
@@ -2424,10 +2449,17 @@ class GatewaySlashCommandsMixin:
                     except Exception:
                         model_cfg.pop("context_length", None)
                     model_cfg["default"] = result.new_model
-                    model_cfg["provider"] = result.target_provider
+                    model_cfg["provider"] = (
+                        "custom"
+                        if str(result.target_provider or "").strip().lower().startswith("custom:")
+                        else result.target_provider
+                    )
                     # See the picker handler above for why custom providers need an
                     # explicit set-or-clear instead of the old lone truthy check (#25107).
-                    _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"
+                    _is_custom_target = (
+                        str(result.target_provider or "").strip().lower() == "custom"
+                        or str(result.target_provider or "").strip().lower().startswith("custom:")
+                    )
                     if result.base_url:
                         model_cfg["base_url"] = result.base_url
                     elif _is_custom_target:
