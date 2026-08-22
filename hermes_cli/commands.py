@@ -198,6 +198,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("model", "Switch model (session-scoped; --global to persist)", "Configuration",
                args_hint="[model] [--provider name] [--global|--session] [--refresh]",
                busy_policy="reject", busy_handler="model"),
+    CommandDef("modelall", "Switch model across all sessions at once (opens picker)", "Configuration",
+               busy_policy="reject", busy_handler="model"),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]",
@@ -1544,7 +1546,7 @@ class SlashCommandCompleter(Completer):
     # These should NOT receive a trailing space in completions because:
     # - The TUI's submit handler applies completions on Enter if input differs
     # - Adding space makes "/model" → "/model " which blocks picker execution
-    _PICKER_COMMANDS = frozenset({"model", "skin", "personality"})
+    _PICKER_COMMANDS = frozenset({"model", "modelall", "skin", "personality"})
 
     @staticmethod
     def _completion_text(cmd_name: str, word: str) -> str:

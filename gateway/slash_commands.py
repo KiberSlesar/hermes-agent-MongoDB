@@ -1750,7 +1750,7 @@ class GatewaySlashCommandsMixin:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
-    async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
+    async def _handle_model_command(self, event: MessageEvent, force_all_sessions: bool = False) -> Optional[str]:
         """Handle /model command — switch model.
 
         Supports:
@@ -1788,7 +1788,7 @@ class GatewaySlashCommandsMixin:
         force_refresh = request.force_refresh
         is_session = request.is_session
         one_turn = request.is_once
-        all_sessions = request.is_all_sessions
+        all_sessions = request.is_all_sessions or force_all_sessions
         if request.errors:
             # Gateway decoration: "❌ " prefix over the canonical error copy.
             return f"❌ {request.error_messages()[0]}"
