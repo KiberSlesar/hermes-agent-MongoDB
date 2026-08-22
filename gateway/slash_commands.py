@@ -2139,6 +2139,38 @@ class GatewaySlashCommandsMixin:
                             lines.append(t("gateway.model.saved_global"))
                         else:
                             lines.append(t("gateway.model.session_only_hint"))
+
+                        if all_sessions:
+                            try:
+                                _store = getattr(_self, "async_session_store", None)
+                                _sess_db2 = getattr(_self, "_session_db", None)
+                                if _store is not None:
+                                    for _entry in await _store.list_sessions():
+                                        try:
+                                            await _store.set_model_override(_entry.session_key, None)
+                                        except Exception:
+                                            pass
+                                        if _sess_db2 is not None:
+                                            try:
+                                                await _sess_db2.update_session_model(
+                                                    _entry.session_id, result.new_model
+                                                )
+                                            except Exception:
+                                                pass
+                            except Exception as _all_exc:
+                                logger.warning("Failed to clear all session model overrides: %s", _all_exc)
+                            _ov = getattr(_self, "_session_model_overrides", None)
+                            if isinstance(_ov, dict):
+                                _ov.clear()
+                            _cache = getattr(_self, "_agent_cache", None)
+                            if _cache is not None:
+                                for _key in list(_cache.keys()):
+                                    try:
+                                        _self._evict_cached_agent(_key)
+                                    except Exception:
+                                        pass
+                            lines.append("    (applied to all sessions)")
+
                         return "\n".join(lines)
 
                     async def _on_model_selected(
