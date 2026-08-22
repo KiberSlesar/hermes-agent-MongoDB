@@ -257,6 +257,21 @@ class MongoSessionAdapter:
     def append_message(self, session_id: str, role: str, content=None, **kwargs) -> int:
         return self._store.append_message(session_id, role, content, **kwargs)
 
+    def append_messages_batch(self, session_id: str, messages: List[Dict[str, Any]], compression_lock_holder: Optional[str] = None, chunk_rows: Optional[int] = None) -> int:
+        """Mongo implementation of the SessionDB batch-write contract."""
+        if not messages:
+            return 0
+        inserted = 0
+        for message in messages:
+            data = dict(message or {})
+            role = data.pop("role", "assistant") or "assistant"
+            content = data.pop("content", None)
+            for key in ("id", "_row_id", "message_index"):
+                data.pop(key, None)
+            self._store.append_message(session_id, role, content, **data)
+            inserted += 1
+        return inserted
+
     def get_messages(self, session_id: str, include_inactive: bool = False, **kwargs):
         messages = []
         for raw in self._store.get_messages(

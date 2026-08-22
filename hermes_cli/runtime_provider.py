@@ -52,14 +52,15 @@ from utils import base_url_host_matches, base_url_hostname, env_int
 
 
 def _getenv(name: str, default: str = "") -> str:
-    """Profile-scoped replacement for ``os.getenv`` on credential/provider reads.
-
-    Routes through the secret scope (Workstream A): identical to ``os.getenv``
-    when multiplexing is off, scope-aware (and fail-closed on an unscoped read)
-    when on. Genuinely-global vars are handled inside ``get_secret`` and still
-    read ``os.environ``. Keeps the ``(name, default) -> str`` contract every
-    call site here already relies on.
-    """
+    """Read provider credentials from the active scope or Mongo profile."""
+    try:
+        from hermes_storage import is_mongo_mode, require_storage
+        if is_mongo_mode():
+            mongo_val = (require_storage().get_effective_secrets() or {}).get(name)
+            if mongo_val is not None and str(mongo_val).strip():
+                return str(mongo_val)
+    except Exception:
+        logger.debug("Mongo secret lookup failed for %s", name, exc_info=True)
     val = _get_secret(name, default)
     return val if val is not None else default
 
@@ -1085,6 +1086,7 @@ def _resolve_named_custom_runtime(
             # Gate env key fallbacks on authoritative hosts (#28660)
             (_getenv("OPENAI_API_KEY", "").strip()     if _da_is_openai_url else ""),
             (_getenv("OPENROUTER_API_KEY", "").strip() if _da_is_openrouter  else ""),
+            (_getenv("HERMES_CUSTOM_CODEX_SALE_API_KEY", "").strip()),
             # Bonus (#28660): derive `<VENDOR>_API_KEY` from the host so users
             # who set DEEPSEEK_API_KEY / GROQ_API_KEY / MISTRAL_API_KEY get the
             # intuitive match without configuring `custom_providers` first.
@@ -1274,6 +1276,7 @@ def _resolve_openrouter_runtime(
             (_getenv("OLLAMA_API_KEY")     if _is_ollama_url                       else ""),
             (_getenv("OPENAI_API_KEY")     if (_is_openai_url or _is_openai_azure) else ""),
             (_getenv("OPENROUTER_API_KEY") if _is_openrouter_url                   else ""),
+            (_getenv("HERMES_CUSTOM_CODEX_SALE_API_KEY") if requested_norm == "custom" else ""),
             # Bonus (#28660): derive `<VENDOR>_API_KEY` from the host so users
             # who set DEEPSEEK_API_KEY / GROQ_API_KEY / MISTRAL_API_KEY get the
             # intuitive match. Helper returns "" for IPs/loopback and for env

@@ -1539,6 +1539,35 @@ def _maybe_debounced_sync_push(skill_name: str) -> None:
         _sync_push_timer.start()
 
 
+def _persist_skill_to_mongo(name: str, action: str) -> Optional[str]:
+    """Persist skill mutations to canonical Mongo storage in Mongo mode."""
+    try:
+        from hermes_storage import is_mongo_mode, require_storage
+        if not is_mongo_mode():
+            return None
+        storage = require_storage()
+        if action == "delete":
+            storage.skills.delete_skill(name)
+            return None
+        existing = _find_skill(name)
+        if not existing:
+            return f"Mongo persistence failed: cache for skill '{name}' is missing"
+        skill_dir = existing["path"]
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.is_file():
+            return f"Mongo persistence failed: SKILL.md for skill '{name}' is missing"
+        files: Dict[str, bytes] = {}
+        for path in skill_dir.rglob("*"):
+            if path.is_file() and path.name not in {".mongo_updated_at", ".mongo_content_hash"}:
+                files[str(path.relative_to(skill_dir)).replace("\\", "/")] = path.read_bytes()
+        meta = dict(storage.skills.get_skill(name) or {})
+        meta.update({"name": name, "path": str(skill_dir.relative_to(_skills_dir())).replace("\\", "/"), "skill_md": skill_md.read_text(encoding="utf-8"), "status": "ready"})
+        storage.skills.put_skill(meta, files=files)
+        return None
+    except Exception as exc:
+        return f"Mongo persistence failed for skill '{name}': {exc}"
+
+
 def skill_manage(
     action: str,
     name: str,
@@ -1611,6 +1640,10 @@ def skill_manage(
         result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
 
     if result.get("success"):
+        mongo_error = _persist_skill_to_mongo(name, action)
+        if mongo_error:
+            result = {"success": False, "error": mongo_error}
+            return json.dumps(result, ensure_ascii=False)
         try:
             from agent.prompt_builder import clear_skills_system_prompt_cache
             clear_skills_system_prompt_cache(clear_snapshot=True)

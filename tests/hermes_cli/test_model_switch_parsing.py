@@ -41,6 +41,27 @@ def test_provider_flag_and_scopes():
     assert parse_model_switch_args("--refresh").force_refresh is True
 
 
+def test_all_sessions_flag():
+    req = parse_model_switch_args("gpt-5.6-luna --all-sessions")
+    assert req.target == "gpt-5.6-luna"
+    assert req.is_all_sessions is True
+    assert req.is_global is False  # scope is derived separately
+
+    req2 = parse_model_switch_args("claude-sonnet-4-6 --provider codex-sale --all-sessions")
+    assert req2.target == "claude-sonnet-4-6"
+    assert req2.explicit_provider == "codex-sale"
+    assert req2.is_all_sessions is True
+
+    # Bare --all alias
+    assert parse_model_switch_args("gpt-5.6-sol --all").is_all_sessions is True
+
+    # Unicode em dash normalization (mobile clients)
+    assert parse_model_switch_args("—all-sessions gpt-5.6-terra").is_all_sessions is True
+
+    # Without the flag, parsing is unchanged
+    assert parse_model_switch_args("gpt-5.6-sol").is_all_sessions is False
+
+
 def test_once_with_global_conflict():
     req = parse_model_switch_args("sonnet --once --global")
     assert MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL in req.errors

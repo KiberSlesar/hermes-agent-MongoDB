@@ -4984,6 +4984,25 @@ def validate_requested_model(
     normalized = normalize_provider(provider)
     if normalized == "openrouter" and base_url and "openrouter.ai" not in base_url:
         normalized = "custom"
+
+    # Mongo-mode stores provider credentials outside os.environ.  The model
+    # validation probe must use the same runtime resolver as actual requests;
+    # otherwise a stale local CUSTOM_API_KEY can make a healthy /v1/models
+    # endpoint look unreachable and emit a misleading base-URL warning.
+    if normalized == "custom":
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            _runtime_probe = resolve_runtime_provider(
+                requested="custom", explicit_base_url=base_url
+            )
+            if _runtime_probe.get("base_url"):
+                base_url = _runtime_probe["base_url"]
+            if _runtime_probe.get("api_key"):
+                api_key = _runtime_probe["api_key"]
+            if _runtime_probe.get("api_mode"):
+                api_mode = _runtime_probe["api_mode"]
+        except Exception:
+            pass
     requested_for_lookup = requested
     if normalized == "copilot":
         requested_for_lookup = normalize_copilot_model_id(

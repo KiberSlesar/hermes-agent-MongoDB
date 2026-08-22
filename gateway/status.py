@@ -278,7 +278,18 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
 
 
 def _scope_hash(identity: str) -> str:
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    """Hash identity together with the active profile name so that two
+    profiles using the same bot token get independent lock files.  Falls back
+    to the raw identity hash when no profile context is available (backwards
+    compatible with single-profile installs)."""
+    profile = os.environ.get("HERMES_PROFILE") or ""
+    if not profile:
+        # Derive from HERMES_HOME path: .../profiles/<name>
+        home = os.environ.get("HERMES_HOME", "")
+        if "/profiles/" in home:
+            profile = home.rstrip("/").rsplit("/profiles/", 1)[-1]
+    combined = f"{profile}:{identity}" if profile else identity
+    return hashlib.sha256(combined.encode("utf-8")).hexdigest()[:16]
 
 
 def _get_scope_lock_path(scope: str, identity: str) -> Path:

@@ -78,6 +78,24 @@ def _transaction() -> Iterator[sqlite3.Connection]:
             conn.close()
 
 
+def _mongo_ledgers():
+    try:
+        from hermes_storage.ledgers import mongo_ledger_enabled
+        if mongo_ledger_enabled():
+            from hermes_storage import require_storage
+            return require_storage().ledgers
+    except Exception:
+        raise
+    return None
+
+
+def _mongo_notes(job_id: str) -> list[dict[str, Any]]:
+    ledgers = _mongo_ledgers()
+    if ledgers is None:
+        return []
+    return ledgers.find("cron_notepad", {"job_id": str(job_id)}, limit=10_000, sort=[("key", 1)])
+
+
 def _validate(job_id: str, key: str, value: str) -> None:
     if not str(job_id):
         raise ValueError("job_id must be non-empty")
@@ -96,6 +114,14 @@ def set_note(job_id: str, key: str, value: str) -> Dict[str, Any]:
     job_id, key, value = str(job_id), str(key), str(value)
     _validate(job_id, key, value)
     now = _hermes_now().isoformat()
+    ledgers = _mongo_ledgers()
+    if ledgers is not None:
+        other_bytes = sum(len(str(n["key"]).encode("utf-8")) + len(str(n["value"]).encode("utf-8")) for n in _mongo_notes(job_id) if n.get("key") != key)
+        entry_bytes = len(key.encode("utf-8")) + len(value.encode("utf-8"))
+        if other_bytes + entry_bytes > MAX_JOB_TOTAL_BYTES:
+            raise ValueError(f"notepad full: job '{job_id}' would exceed {MAX_JOB_TOTAL_BYTES} bytes total; delete unused keys first")
+        ledgers.replace_one("cron_notepad", {"job_id": job_id, "key": key}, {"job_id": job_id, "key": key, "value": value, "updated_at": now})
+        return {"job_id": job_id, "key": key, "value": value, "updated_at": now}
     with _transaction() as conn:
         row = conn.execute(
             """SELECT COALESCE(SUM(LENGTH(CAST(key AS BLOB))
@@ -121,6 +147,10 @@ def set_note(job_id: str, key: str, value: str) -> Dict[str, Any]:
 
 
 def get_note(job_id: str, key: str) -> Optional[str]:
+    ledgers = _mongo_ledgers()
+    if ledgers is not None:
+        rows = ledgers.find("cron_notepad", {"job_id": str(job_id), "key": str(key)}, limit=1)
+        return None if not rows else str(rows[0].get("value", ""))
     with _transaction() as conn:
         row = conn.execute(
             "SELECT value FROM cron_notepad WHERE job_id=? AND key=?",
@@ -130,6 +160,9 @@ def get_note(job_id: str, key: str) -> Optional[str]:
 
 
 def delete_note(job_id: str, key: str) -> bool:
+    ledgers = _mongo_ledgers()
+    if ledgers is not None:
+        return bool(ledgers.delete("cron_notepad", {"job_id": str(job_id), "key": str(key)}))
     with _transaction() as conn:
         cur = conn.execute(
             "DELETE FROM cron_notepad WHERE job_id=? AND key=?",
@@ -140,6 +173,9 @@ def delete_note(job_id: str, key: str) -> bool:
 
 def list_notes(job_id: str) -> List[Dict[str, Any]]:
     """All entries for one job, sorted by key."""
+    ledgers = _mongo_ledgers()
+    if ledgers is not None:
+        return _mongo_notes(str(job_id))
     with _transaction() as conn:
         rows = conn.execute(
             "SELECT job_id, key, value, updated_at FROM cron_notepad "
@@ -155,6 +191,9 @@ def clear_notepad(job_id: str) -> int:
     Called from ``cron.jobs.remove_job`` so deleted jobs don't orphan their
     rows. No-ops without creating the DB when no notepad file exists yet.
     """
+    ledgers = _mongo_ledgers()
+    if ledgers is not None:
+        return ledgers.delete("cron_notepad", {"job_id": str(job_id)})
     if not NOTEPAD_FILE.exists():
         return 0
     with _transaction() as conn:

@@ -1331,9 +1331,40 @@ def load_gateway_config() -> GatewayConfig:
                 if isinstance(gateway_section, dict):
                     gw_data.update(gateway_section)
                 # Keep the platform map at the top level for GatewayConfig.
-                if isinstance(effective.get("platforms"), dict):
-                    gw_data["platforms"] = effective["platforms"]
-                return GatewayConfig.from_dict(gw_data)
+                # Mongo profiles commonly store gateway adapters under
+                # ``gateway.platforms``; honor that layout before allowing the
+                # top-level ``platforms`` map to take precedence.
+                nested_platforms = (
+                    gateway_section.get("platforms", {})
+                    if isinstance(gateway_section, dict) else {}
+                )
+                top_level_platforms = effective.get("platforms", {})
+                # Merge instead of replacing: Mongo stores the legacy adapters
+                # at top level but plugin adapters (such as A2A) under gateway.
+                # The top-level map retains precedence for matching names.
+                if isinstance(nested_platforms, dict) or isinstance(top_level_platforms, dict):
+                    gw_data["platforms"] = {
+                        **(nested_platforms if isinstance(nested_platforms, dict) else {}),
+                        **(top_level_platforms if isinstance(top_level_platforms, dict) else {}),
+                    }
+                # Runtime provider resolution reads environment-backed secrets;
+                # in Mongo mode bridge the effective profile secret bag first.
+                import os as _os
+                for _key, _value in (require_storage().get_effective_secrets() or {}).items():
+                    if _value is not None and not str(_key).startswith("__"):
+                        _os.environ[str(_key)] = str(_value)
+                # Register enabled plugin platforms before parsing the map;
+                # otherwise dynamic Platform("a2a") is rejected in Mongo mode.
+                from hermes_cli.plugins import discover_plugins
+                discover_plugins()
+                # Mongo secrets are bridged into the environment above, but
+                # the early Mongo return must still apply env overrides.
+                # Without this, Telegram/provider credentials remain empty
+                # in GatewayConfig despite existing in canonical Mongo.
+                cfg = GatewayConfig.from_dict(gw_data)
+                _apply_env_overrides(cfg)
+                _validate_gateway_config(cfg)
+                return cfg
     except Exception:
         raise
 

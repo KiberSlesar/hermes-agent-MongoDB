@@ -2113,12 +2113,26 @@ def _truncate_content(
 
 
 def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
-    """Load SOUL.md from HERMES_HOME and return its content, or None.
+    """Load the primary identity from Mongo or HERMES_HOME/SOUL.md.
 
-    Used as the agent identity (slot #1 in the system prompt).  When this
-    returns content, ``build_context_files_prompt`` should be called with
-    ``skip_soul=True`` so SOUL.md isn't injected twice.
+    Mongo-backed profiles keep their canonical SOUL in shared storage, not in
+    a per-machine file.  Loading it first ensures identity survives new
+    machines, sessions, and model switches.  A local SOUL.md remains the
+    fallback for local profiles or temporary Mongo failures.
     """
+    try:
+        from hermes_storage import is_mongo_mode, require_storage
+        if is_mongo_mode():
+            content = (require_storage().load_soul() or "").strip()
+            if content:
+                content = _scan_context_content(content, "Mongo SOUL")
+                return _truncate_content(
+                    content, "Mongo SOUL", context_length=context_length,
+                    read_path="Mongo profile soul",
+                )
+    except Exception as e:
+        logger.warning("Could not load Mongo SOUL: %s", e)
+
     try:
         from hermes_cli.config import ensure_hermes_home
         ensure_hermes_home()
@@ -2133,11 +2147,10 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
         if not content:
             return None
         content = _scan_context_content(content, "SOUL.md")
-        content = _truncate_content(
+        return _truncate_content(
             content, "SOUL.md", context_length=context_length,
             read_path=str(soul_path),
         )
-        return content
     except Exception as e:
         logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
         return None

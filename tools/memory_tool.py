@@ -201,7 +201,7 @@ class MemoryStore:
         }
 
     def load_from_disk(self):
-        """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
+        """Load entries from Mongo in Mongo mode, otherwise MEMORY.md/USER.md.
 
         The frozen snapshot is what enters the system prompt. We scan each
         entry for injection/promptware patterns at snapshot-build time —
@@ -217,11 +217,15 @@ class MemoryStore:
         Scanning is deterministic from disk bytes, so the snapshot remains
         stable for the entire session (prefix-cache invariant holds).
         """
-        mem_dir = get_memory_dir()
-        mem_dir.mkdir(parents=True, exist_ok=True)
-
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
+        storage = self._mongo_storage()
+        if storage is not None:
+            self.memory_entries = self._parse_entries(storage.memories.load("memory") or "")
+            self.user_entries = self._parse_entries(storage.memories.load("user") or "")
+        else:
+            mem_dir = get_memory_dir()
+            mem_dir.mkdir(parents=True, exist_ok=True)
+            self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
+            self.user_entries = self._read_file(mem_dir / "USER.md")
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
@@ -319,8 +323,25 @@ class MemoryStore:
             return mem_dir / "USER.md"
         return mem_dir / "MEMORY.md"
 
+    def _mongo_storage(self):
+        """Return canonical Mongo storage in Mongo mode, else None."""
+        try:
+            from hermes_storage import is_mongo_mode, require_storage
+            return require_storage() if is_mongo_mode() else None
+        except Exception:
+            return None
+
+    @contextmanager
+    def _target_lock(self, target: str):
+        """Mongo serializes durable writes; files need the legacy lock."""
+        if self._mongo_storage() is not None:
+            yield
+        else:
+            with self._file_lock(self._path_for(target)):
+                yield
+
     def _reload_target(self, target: str, *, skip_drift: bool = False):
-        """Re-read entries from disk into in-memory state.
+        """Re-read entries from Mongo or disk into in-memory state.
 
         Called under file lock to get the latest state before mutating.
         Returns the backup path if external drift was detected (the on-disk
@@ -342,6 +363,12 @@ class MemoryStore:
         bypassed.  Used by the ``add`` action which appends without
         rewriting, so existing content is never clobbered.
         """
+        storage = self._mongo_storage()
+        if storage is not None:
+            raw = storage.memories.load(target) or ""
+            fresh = list(dict.fromkeys(self._parse_entries(raw)))
+            self._set_entries(target, fresh)
+            return None
         path = self._path_for(target)
         raw, read_ok = self._read_raw_checked(path)
         if not read_ok:
@@ -361,7 +388,12 @@ class MemoryStore:
         return bak
 
     def save_to_disk(self, target: str):
-        """Persist entries to the appropriate file. Called after every mutation."""
+        """Persist to canonical Mongo in Mongo mode, otherwise legacy file."""
+        content = ENTRY_DELIMITER.join(self._entries_for(target))
+        storage = self._mongo_storage()
+        if storage is not None:
+            storage.save_memory_entry(target, content)
+            return
         get_memory_dir().mkdir(parents=True, exist_ok=True)
         self._write_file(self._path_for(target), self._entries_for(target))
 
@@ -398,7 +430,7 @@ class MemoryStore:
         if scan_error:
             return {"success": False, "error": scan_error}
 
-        with self._file_lock(self._path_for(target)):
+        with self._target_lock(target):
             # Re-read from disk under lock to pick up writes from other sessions.
             # For add (append-only), we skip the drift guard — appending never
             # clobbers existing content, so round-trip mismatches from prior
@@ -460,7 +492,7 @@ class MemoryStore:
         if scan_error:
             return {"success": False, "error": scan_error}
 
-        with self._file_lock(self._path_for(target)):
+        with self._target_lock(target):
             bak = self._reload_target(target)
             if bak is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
@@ -523,7 +555,7 @@ class MemoryStore:
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
 
-        with self._file_lock(self._path_for(target)):
+        with self._target_lock(target):
             bak = self._reload_target(target)
             if bak is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
@@ -585,7 +617,7 @@ class MemoryStore:
                 if scan_error:
                     return {"success": False, "error": f"Operation {i + 1}: {scan_error}"}
 
-        with self._file_lock(self._path_for(target)):
+        with self._target_lock(target):
             bak = self._reload_target(target)
             if bak is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))

@@ -1076,7 +1076,22 @@ def _parse_jobs_file(jobs_file: Path) -> Tuple[Any, bool]:
 
 
 def load_jobs() -> List[Dict[str, Any]]:
-    """Load all jobs from storage."""
+    """Load all jobs from canonical Mongo ledger or legacy file storage."""
+    try:
+        from hermes_storage.ledgers import load_cron_jobs, mongo_ledger_enabled
+        if mongo_ledger_enabled():
+            data = load_cron_jobs()
+            if data is None:
+                return []
+            if isinstance(data, dict):
+                jobs = data.get("jobs", [])
+            else:
+                jobs = data
+            if not isinstance(jobs, list):
+                raise RuntimeError("Mongo cron ledger corrupted: expected jobs list")
+            return jobs
+    except ImportError:
+        pass
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Stamp BEFORE reading (fail-safe direction — see _record_load_stamp):
@@ -1258,6 +1273,13 @@ def _save_jobs_unlocked(
     ``replace=True`` skips the shrink-merge guard (tests / disaster recovery
     that mean to rewrite the store wholesale).
     """
+    try:
+        from hermes_storage.ledgers import mongo_ledger_enabled, save_cron_jobs
+        if mongo_ledger_enabled():
+            save_cron_jobs({"jobs": jobs, "updated_at": _hermes_now().isoformat()})
+            return
+    except ImportError:
+        pass
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Snapshot the current owner BEFORE the atomic replace so a privileged

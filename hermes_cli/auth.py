@@ -1252,6 +1252,34 @@ def _auth_store_lock(
 
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
+    # Mongo-only profiles keep the Hermes-owned auth store in the secret store.
+    # An explicit path remains a compatibility path for external credentials
+    # (for example ~/.codex/auth.json), never an alternate profile authority.
+    _mongo_auth = auth_file == _auth_file_path()
+    if _mongo_auth:
+        try:
+            from hermes_storage import is_mongo_mode, require_storage
+            if is_mongo_mode():
+                raw_text = require_storage().get_effective_secrets().get("__auth_json__", "")
+                if not raw_text:
+                    return {"version": AUTH_STORE_VERSION, "providers": {}}
+                raw = json.loads(raw_text)
+            else:
+                raw = None
+        except Exception:
+            if _mongo_auth:
+                raise
+            raw = None
+        if raw is not None:
+            if isinstance(raw, dict) and (isinstance(raw.get("providers"), dict) or isinstance(raw.get("credential_pool"), dict)):
+                raw.setdefault("providers", {})
+                if isinstance(raw.get("providers"), dict):
+                    _migrate_stale_nous_portal_url(raw["providers"])
+                return raw
+            if isinstance(raw, dict) and isinstance(raw.get("systems"), dict):
+                systems = raw["systems"]; providers = {"nous": systems["nous_portal"]} if "nous_portal" in systems else {}
+                return {"version": AUTH_STORE_VERSION, "providers": providers, "active_provider": "nous" if providers else None}
+            return {"version": AUTH_STORE_VERSION, "providers": {}}
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
@@ -1326,6 +1354,16 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # OAuth grants (#43589) — reusing this function's atomic O_EXCL + 0o600
     # write so the root auth.json gets the same TOCTOU-safe treatment.
     auth_file = target_path if target_path is not None else _auth_file_path()
+    if target_path is None:
+        try:
+            from hermes_storage import is_mongo_mode, require_storage
+            if is_mongo_mode():
+                auth_store["version"] = AUTH_STORE_VERSION
+                auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
+                require_storage().set_secret("__auth_json__", json.dumps(auth_store))
+                return Path("<mongo-auth-store>")
+        except Exception:
+            raise
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
     # No-op on Windows (POSIX mode bits not enforced); ignore failures.

@@ -1788,6 +1788,7 @@ class GatewaySlashCommandsMixin:
         force_refresh = request.force_refresh
         is_session = request.is_session
         one_turn = request.is_once
+        all_sessions = request.is_all_sessions
         if request.errors:
             # Gateway decoration: "❌ " prefix over the canonical error copy.
             return f"❌ {request.error_messages()[0]}"
@@ -1797,6 +1798,10 @@ class GatewaySlashCommandsMixin:
             is_once=one_turn,
             explicit_provider=explicit_provider,
         )
+        if all_sessions:
+            # --all-sessions implies a global persist: every session must end
+            # up on this model, including sessions created later.
+            persist_global = True
 
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:
@@ -2468,6 +2473,31 @@ class GatewaySlashCommandsMixin:
                 lines.append("    (next turn only — restores after one response)")
             else:
                 lines.append(t("gateway.model.session_only_hint"))
+
+            if all_sessions:
+                # Clear every session's model override so all sessions fall
+                # back to the just-persisted global default.
+                try:
+                    _store = getattr(self, "async_session_store", None)
+                    if _store is not None:
+                        for _entry in await _store.list_sessions():
+                            try:
+                                await _store.set_model_override(_entry.session_key, None)
+                            except Exception:
+                                pass
+                except Exception as _all_exc:
+                    logger.warning("Failed to clear all session model overrides: %s", _all_exc)
+                _ov = getattr(self, "_session_model_overrides", None)
+                if isinstance(_ov, dict):
+                    _ov.clear()
+                _cache = getattr(self, "_agent_cache", None)
+                if _cache is not None:
+                    for _key in list(_cache.keys()):
+                        try:
+                            self._evict_cached_agent(_key)
+                        except Exception:
+                            pass
+                lines.append("    (applied to all sessions)")
 
             return "\n".join(lines)
 

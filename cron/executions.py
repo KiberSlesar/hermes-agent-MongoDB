@@ -99,6 +99,22 @@ def _emit_execution_state(
         pass
 
 
+def _mongo_ledgers():
+    try:
+        from hermes_storage.ledgers import mongo_ledger_enabled
+        if mongo_ledger_enabled():
+            from hermes_storage import require_storage
+            return require_storage().ledgers
+    except Exception:
+        raise
+    return None
+
+
+def _mongo_find_one(ledgers, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    rows = ledgers.find("cron_executions", query, limit=1)
+    return rows[0] if rows else None
+
+
 def _process_start_time(pid: int) -> Optional[int]:
     try:
         from gateway.status import get_process_start_time
@@ -137,6 +153,12 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
+    ledgers = _mongo_ledgers()
+    if ledgers is not None:
+        record = {"id": execution_id, "job_id": str(job_id), "source": str(source), "process_id": _PROCESS_ID, "pid": pid, "process_started_at": _process_start_time(pid), "status": "claimed", "claimed_at": now, "started_at": None, "finished_at": None, "error": None}
+        ledgers.insert("cron_executions", record)
+        _emit_execution_state(record)
+        return record
     with _transaction() as conn:
         conn.execute(
             """INSERT INTO executions
@@ -157,6 +179,13 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
 def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
     """Transition one claimed attempt to running exactly once."""
     now = _hermes_now().isoformat()
+    ledgers = _mongo_ledgers()
+    if ledgers is not None:
+        if ledgers.update("cron_executions", {"id": execution_id, "status": "claimed"}, {"status": "running", "started_at": now}) != 1:
+            return None
+        record = _mongo_find_one(ledgers, {"id": execution_id})
+        _emit_execution_state(record)
+        return record
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions SET status='running', started_at=?
@@ -180,6 +209,13 @@ def finish_execution(
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
+    ledgers = _mongo_ledgers()
+    if ledgers is not None:
+        if ledgers.update("cron_executions", {"id": execution_id, "status": {"$in": ["claimed", "running"]}}, {"status": status, "finished_at": now, "error": detail}) != 1:
+            return None
+        record = _mongo_find_one(ledgers, {"id": execution_id})
+        _emit_execution_state(record, delivery_outcome=delivery_outcome)
+        return record
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions SET status=?, finished_at=?, error=?
@@ -201,6 +237,23 @@ def recover_interrupted_executions() -> int:
     now = _hermes_now().isoformat()
     changed = 0
     recovered: List[Dict[str, Any]] = []
+    ledgers = _mongo_ledgers()
+    if ledgers is not None:
+        rows = ledgers.find("cron_executions", {"status": {"$in": ["claimed", "running"]}}, limit=10_000)
+        for row in rows:
+            if row.get("process_id") == _PROCESS_ID:
+                continue
+            if _owner_is_live(int(row.get("pid") or 0), row.get("process_started_at")):
+                continue
+            detail = "Scheduler restarted after this execution's owner exited before a durable terminal state; whether side effects ran is unknown."
+            if ledgers.update("cron_executions", {"id": row["id"], "status": {"$in": ["claimed", "running"]}}, {"status": "unknown", "finished_at": now, "error": detail}) == 1:
+                changed += 1
+                record = _mongo_find_one(ledgers, {"id": row["id"]})
+                if record is not None:
+                    recovered.append(record)
+        for record in recovered:
+            _emit_execution_state(record)
+        return changed
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT id, process_id, pid, process_started_at FROM executions
@@ -238,6 +291,12 @@ def list_executions(
     before_claimed_at: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return indexed, newest-first execution history with cursor pagination."""
+    ledgers = _mongo_ledgers()
+    if ledgers is not None:
+        query: Dict[str, Any] = {}
+        if job_id is not None: query["job_id"] = str(job_id)
+        if before_claimed_at is not None: query["claimed_at"] = {"$lt": str(before_claimed_at)}
+        return ledgers.find("cron_executions", query, limit=max(1, min(int(limit), 500)), sort=[("claimed_at", -1), ("id", -1)])
     clauses: List[str] = []
     params: List[Any] = []
     if job_id is not None:
@@ -267,6 +326,13 @@ def latest_executions(job_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     clean = [str(job_id) for job_id in dict.fromkeys(job_ids) if job_id]
     if not clean:
         return {}
+    ledgers = _mongo_ledgers()
+    if ledgers is not None:
+        rows = ledgers.find("cron_executions", {"job_id": {"$in": clean}}, limit=10_000, sort=[("claimed_at", -1), ("id", -1)])
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            out.setdefault(str(row["job_id"]), row)
+        return out
     placeholders = ",".join("?" for _ in clean)
     with _transaction() as conn:
         rows = conn.execute(

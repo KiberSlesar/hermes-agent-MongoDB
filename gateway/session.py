@@ -1306,7 +1306,13 @@ class SessionStore:
         # written by an older gateway after a downgrade). Only fills keys the
         # DB didn't provide — DB entries win.
         sessions_file = self.sessions_dir / "sessions.json"
-        if sessions_file.exists():
+        _allow_legacy_json_import = True
+        try:
+            from hermes_storage import is_mongo_mode
+            _allow_legacy_json_import = not is_mongo_mode()
+        except Exception:
+            pass
+        if _allow_legacy_json_import and sessions_file.exists():
             try:
                 with open(sessions_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
